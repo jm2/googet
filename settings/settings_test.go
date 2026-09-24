@@ -16,7 +16,7 @@ func TestInitialize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error creating conf file: %v", err)
 	}
-	content := []byte("archs: [noarch, x86_64, arm64]\ncachelife: 10m\nlockfilemaxage: 1x\nallowunsafeurl: true")
+	content := []byte("archs: [noarch, x86_64, arm64]\ncachelife: 10m\nlockfilemaxage: 1x\nallowunsafeurl: true\nnoprogress: true")
 	if _, err := f.Write(content); err != nil {
 		t.Fatalf("error writing conf file: %v", err)
 	}
@@ -55,6 +55,12 @@ func TestInitialize(t *testing.T) {
 		wantAllowUnsafeURL := true
 		if got := settings.AllowUnsafeURL; got != wantAllowUnsafeURL {
 			t.Errorf("settings.AllowUnsafeURL got: %v, want: %v", got, wantAllowUnsafeURL)
+		}
+	})
+
+	t.Run("Parsing NoProgress", func(t *testing.T) {
+		if got, want := settings.NoProgress, true; got != want {
+			t.Errorf("settings.NoProgress got: %v, want: %v", got, want)
 		}
 	})
 }
