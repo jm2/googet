@@ -20,6 +20,9 @@ limitations under the License.
 package relation
 
 import (
+	"cmp"
+	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/google/googet/v2/goolib"
@@ -105,4 +108,28 @@ func (r Requirement) SatisfiedBy(p Provide) (bool, error) {
 		return false, nil
 	}
 	return r.Satisfies(p.Ver)
+}
+
+// Resolve returns every spec in installed that r names at r's minimum version
+// or later, using MinInstalled, ordered by name and then arch. Nil specs are
+// skipped, and a spec listed more than once is returned once. It returns an
+// error if a version can't be compared.
+func Resolve(r Requirement, installed []*goolib.PkgSpec) ([]*goolib.PkgSpec, error) {
+	var out []*goolib.PkgSpec
+	for _, ps := range installed {
+		if ps == nil {
+			continue
+		}
+		ok, err := r.MinInstalled(ps.Name, ps.Arch, ps.Version)
+		if err != nil {
+			return nil, fmt.Errorf("checking %s against %s: %v", ps, r.PackageInfo(), err)
+		}
+		if ok && !slices.ContainsFunc(out, func(o *goolib.PkgSpec) bool { return o.Name == ps.Name && o.Arch == ps.Arch }) {
+			out = append(out, ps)
+		}
+	}
+	slices.SortFunc(out, func(a, b *goolib.PkgSpec) int {
+		return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.Arch, b.Arch))
+	})
+	return out, nil
 }

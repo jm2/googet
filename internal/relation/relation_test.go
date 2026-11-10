@@ -14,6 +14,7 @@ limitations under the License.
 package relation
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -227,4 +228,43 @@ func FuzzSatisfiedBy(f *testing.F) {
 		}
 	}
 	f.Fuzz(checkSatisfiedBy)
+}
+
+func TestResolve(t *testing.T) {
+	spec := func(name, arch, ver string) *goolib.PkgSpec {
+		return &goolib.PkgSpec{Name: name, Arch: arch, Version: ver}
+	}
+	installed := []*goolib.PkgSpec{
+		spec("foo", "x86_64", "1"),
+		nil,
+		spec("bar", "noarch", "1"),
+		spec("foo", "noarch", "3"),
+		spec("foo", "noarch", "3"),
+	}
+	for _, tc := range []struct {
+		rel     string
+		want    []string
+		wantErr bool
+	}{
+		{rel: "foo", want: []string{"foo.noarch.3", "foo.x86_64.1"}},
+		{rel: "foo.x86_64", want: []string{"foo.x86_64.1"}},
+		{rel: "foo.noarch.2", want: []string{"foo.noarch.3"}},
+		{rel: "foo..2", want: []string{"foo.noarch.3"}},
+		{rel: "foo.noarch.4"},
+		{rel: "baz"},
+		{rel: "foo.noarch.x", wantErr: true},
+	} {
+		got, err := Resolve(ParseRelation(tc.rel), installed)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("Resolve(%q) error = %v, want error: %t", tc.rel, err, tc.wantErr)
+			continue
+		}
+		var names []string
+		for _, ps := range got {
+			names = append(names, ps.String())
+		}
+		if !slices.Equal(names, tc.want) {
+			t.Errorf("Resolve(%q) = %v, want %v", tc.rel, names, tc.want)
+		}
+	}
 }
