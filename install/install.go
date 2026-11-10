@@ -278,14 +278,26 @@ func FromDisk(pkgPath, cache string, dbOnly, force, shouldReinstall bool, db *go
 		}
 		return fmt.Errorf("package dependency %s %s (min version %s) not installed and not provided", pi.Name, pi.Arch, ver)
 	}
-	for _, pkg := range zs.Replaces {
-		r := relation.ParseRelation(pkg)
-		ins, err := minInstalled(r, db)
+	if len(zs.Replaces) > 0 {
+		state, err := db.FetchPkgs("")
 		if err != nil {
 			return err
 		}
-		if ins {
-			return fmt.Errorf("cannot install, replaces installed package, remove first then try installation again: %s", r.PackageInfo())
+		var installed []*goolib.PkgSpec
+		for _, ps := range state {
+			installed = append(installed, ps.PackageSpec)
+		}
+		// Refuse if any installed arch of a replaced package qualifies, not
+		// just the row that minInstalled would check.
+		for _, pkg := range zs.Replaces {
+			r := relation.ParseRelation(pkg)
+			rows, err := relation.Resolve(r, installed)
+			if err != nil {
+				return err
+			}
+			if len(rows) > 0 {
+				return fmt.Errorf("cannot install, replaces installed package, remove first then try installation again: %s (installed: %s)", r.PackageInfo(), rows[0])
+			}
 		}
 	}
 
