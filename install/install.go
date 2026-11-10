@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -130,7 +131,10 @@ func resolveReplacements(ctx context.Context, ps *goolib.PkgSpec, dbOnly bool, d
 	return nil
 }
 
-func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB) error {
+// installDeps installs the dependencies of ps and then removes the packages it
+// replaces. chain lists the packages, as name.arch, whose dependencies are
+// being installed further up the call stack.
+func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB, chain []string) error {
 	logger.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
 	if err := resolveConflicts(ps, db); err != nil {
 		return err
@@ -159,7 +163,7 @@ func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm clien
 		}
 
 		logger.Infof("Dependency found: %s.%s %s (provides %s) is available", spec.Name, spec.Arch, spec.Version, pi.Name)
-		if err := FromRepo(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, cache, rm, archs, dbOnly, force, downloader, db); err != nil {
+		if err := fromRepo(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, cache, rm, archs, dbOnly, force, downloader, db, chain); err != nil {
 			return err
 		}
 	}
@@ -168,6 +172,13 @@ func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm clien
 
 // FromRepo installs a package and all dependencies from a repository.
 func FromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB) error {
+	return fromRepo(ctx, pi, repo, cache, rm, archs, dbOnly, force, downloader, db, nil)
+}
+
+// fromRepo is FromRepo for a package that is a dependency of the packages in
+// chain. A package that is already in chain depends on itself through a
+// cycle, which is an error: installing it would recurse forever.
+func fromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB, chain []string) error {
 	logger.Infof("Starting install of %s.%s.%s", pi.Name, pi.Arch, pi.Ver)
 	fmt.Printf("Installing %s.%s.%s and dependencies...\n", pi.Name, pi.Arch, pi.Ver)
 	// When a specific version is requested, look for an exact match in the repository.
@@ -194,7 +205,11 @@ func FromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm
 	if err != nil {
 		return err
 	}
-	if err := installDeps(ctx, rs.PackageSpec, cache, rm, archs, dbOnly, force, downloader, db); err != nil {
+	key := rs.PackageSpec.Name + "." + rs.PackageSpec.Arch
+	if i := slices.Index(chain, key); i >= 0 {
+		return fmt.Errorf("cannot install %s: dependency cycle %s", chain[0], strings.Join(append(slices.Clone(chain[i:]), key), " -> "))
+	}
+	if err := installDeps(ctx, rs.PackageSpec, cache, rm, archs, dbOnly, force, downloader, db, append(slices.Clone(chain), key)); err != nil {
 		return err
 	}
 
@@ -774,6 +789,10 @@ func installPkgInner(pkg string, ps *goolib.PkgSpec, dbOnly, force bool, db *goo
 }
 
 func listDeps(pi goolib.PackageInfo, rm client.RepoMap, repo string, dl []goolib.PackageInfo, archs []string, db *googetdb.GooDB) ([]goolib.PackageInfo, error) {
+	// List each package once, which also ends a dependency cycle.
+	if slices.ContainsFunc(dl, func(d goolib.PackageInfo) bool { return d.Name == pi.Name && d.Arch == pi.Arch }) {
+		return dl, nil
+	}
 	rs, err := client.FindRepoSpec(pi, rm[repo])
 	if err != nil {
 		return nil, err

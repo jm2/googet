@@ -1085,7 +1085,7 @@ func TestFromRepo_SatisfiedByProvider(t *testing.T) {
 
 	// We pass empty repo map and downloader because we expect it NOT to try downloading deps
 	// since they are satisfied.
-	err = installDeps(t.Context(), ps, "", nil, nil, false, false, nil, db)
+	err = installDeps(t.Context(), ps, "", nil, nil, false, false, nil, db, nil)
 	if err != nil {
 		t.Errorf("installDeps failed: %v", err)
 	}
@@ -1127,7 +1127,7 @@ func TestFromRepo_SatisfiedByUninstalledProvider(t *testing.T) {
 	// Verify that dependency resolution succeeds (finding provider_pkg); the download
 	// is expected to fail due to an invalid repository URL.
 	downloader, _ := client.NewDownloader("")
-	err = installDeps(t.Context(), ps, "", rm, []string{"noarch"}, false, false, downloader, db)
+	err = installDeps(t.Context(), ps, "", rm, []string{"noarch"}, false, false, downloader, db, nil)
 
 	// We expect an error because download will fail (invalid URL/Source).
 	if err == nil {
@@ -1286,7 +1286,7 @@ func TestInstallDeps_SelfDependency(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDownloader: %v", err)
 			}
-			err = installDeps(t.Context(), tc.pkgs[0], t.TempDir(), rm, []string{"x86_64", "x86_32", "noarch"}, false, false, downloader, db)
+			err = installDeps(t.Context(), tc.pkgs[0], t.TempDir(), rm, []string{"x86_64", "x86_32", "noarch"}, false, false, downloader, db, nil)
 			const selfErr = "resolves to the package itself"
 			if gotSelf := err != nil && strings.Contains(err.Error(), selfErr); gotSelf != tc.wantSelf {
 				t.Errorf("installDeps = %v; want an error containing %q: %v", err, selfErr, tc.wantSelf)
