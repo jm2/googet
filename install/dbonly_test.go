@@ -24,7 +24,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
-	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/verify"
 )
 
@@ -41,7 +40,7 @@ func installDBOnly(t *testing.T, f *relFixture, name string, contents, files map
 	goo := filepath.Join(f.cache, name+".noarch.1.goo")
 	writeGoo(t, goo, contents)
 	ps := &goolib.PkgSpec{Name: name, Arch: "noarch", Version: "1", Files: files}
-	installed, err := installPkg(goo, ps, true, false, f.db, func(insFiles map[string]string) error {
+	installed, err := installPkg(goo, ps, true, policy{}, f.db, func(insFiles map[string]string) error {
 		return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
 	})
 	if err != nil {
@@ -89,12 +88,10 @@ func TestDBOnlyFilesSeenByConflictCheck(t *testing.T) {
 			shared := filepath.Join(f.dst, "shared")
 			installDBOnly(t, f, "A", map[string]string{"shared": "from A"}, map[string]string{"shared": shared})
 
-			settings.StrictConflicts = tc.strict
-			t.Cleanup(func() { settings.StrictConflicts = false })
 			goo := filepath.Join(f.cache, "B.noarch.1.goo")
 			writeGoo(t, goo, map[string]string{"shared": "from B"})
 			ps := &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Files: map[string]string{"shared": shared}}
-			_, err := installPkg(goo, ps, false, tc.force, f.db, nil)
+			_, err := installPkg(goo, ps, false, policy{strictConflicts: tc.strict, force: tc.force}, f.db, nil)
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Fatalf("installPkg(B) = %v, want error: %t", err, tc.wantErr)
 			}

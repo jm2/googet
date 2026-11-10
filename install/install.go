@@ -102,7 +102,37 @@ func resolveConflicts(ps *goolib.PkgSpec, db *googetdb.GooDB) error {
 	return nil
 }
 
-func resolveReplacements(ctx context.Context, ps *goolib.PkgSpec, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
+// policy holds the user-configurable choices that change how files are
+// installed.
+type policy struct {
+	// strictConflicts makes installing a file that another package owns an
+	// error, unless force is set.
+	strictConflicts bool
+	// force overwrites files that another package owns.
+	force bool
+}
+
+// newPolicy returns the policy for an install run with the given -force
+// flag. Every exported entry point builds its policy this way.
+func newPolicy(force bool) policy {
+	return policy{strictConflicts: settings.StrictConflicts, force: force}
+}
+
+// installer installs packages from a set of repos.
+type installer struct {
+	cache      string
+	rm         client.RepoMap
+	archs      []string
+	dbOnly     bool
+	policy     policy
+	downloader *client.Downloader
+	db         *googetdb.GooDB
+}
+
+// resolveReplacements removes the installed packages that ps replaces, along
+// with the packages that depend on them.
+func (i *installer) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec) error {
+	db := i.db
 	// Check for and remove any package this replaces.
 	// TODO(ajackura): Make sure no replacements are listed as
 	// dependencies or subdependancies.
@@ -121,7 +151,7 @@ func resolveReplacements(ctx context.Context, ps *goolib.PkgSpec, dbOnly bool, d
 			return err
 		}
 		logger.Infof("%s replaces %s, removing", ps, pi)
-		if err := remove.All(ctx, pi, deps, dbOnly, downloader, db); err != nil {
+		if err := remove.All(ctx, pi, deps, i.dbOnly, i.downloader, db); err != nil {
 			return err
 		}
 	}
@@ -131,7 +161,8 @@ func resolveReplacements(ctx context.Context, ps *goolib.PkgSpec, dbOnly bool, d
 // installDeps installs the dependencies of ps and then removes the packages it
 // replaces. chain lists the packages, as name.arch, whose dependencies are
 // being installed further up the call stack.
-func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB, chain []string) error {
+func (i *installer) installDeps(ctx context.Context, ps *goolib.PkgSpec, chain []string) error {
+	db := i.db
 	logger.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
 	if err := resolveConflicts(ps, db); err != nil {
 		return err
@@ -151,7 +182,7 @@ func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm clien
 		if err != nil {
 			logger.Infof("Error fetching installed package state: %v, proceeding without lock", err)
 		}
-		spec, repo, _, err := client.FindRepoLatest(goolib.PackageInfo{Name: pi.Name, Arch: pi.Arch, Ver: ver}, rm, archs, installedArch, isLocked)
+		spec, repo, _, err := client.FindRepoLatest(goolib.PackageInfo{Name: pi.Name, Arch: pi.Arch, Ver: ver}, i.rm, i.archs, installedArch, isLocked)
 		if err != nil {
 			return err
 		}
@@ -160,22 +191,24 @@ func installDeps(ctx context.Context, ps *goolib.PkgSpec, cache string, rm clien
 		}
 
 		logger.Infof("Dependency found: %s.%s %s (provides %s) is available", spec.Name, spec.Arch, spec.Version, pi.Name)
-		if err := fromRepo(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, cache, rm, archs, dbOnly, force, downloader, db, chain); err != nil {
+		if err := i.fromRepo(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, chain); err != nil {
 			return err
 		}
 	}
-	return resolveReplacements(ctx, ps, dbOnly, downloader, db)
+	return i.resolveReplacements(ctx, ps)
 }
 
 // FromRepo installs a package and all dependencies from a repository.
 func FromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB) error {
-	return fromRepo(ctx, pi, repo, cache, rm, archs, dbOnly, force, downloader, db, nil)
+	i := &installer{cache: cache, rm: rm, archs: archs, dbOnly: dbOnly, policy: newPolicy(force), downloader: downloader, db: db}
+	return i.fromRepo(ctx, pi, repo, nil)
 }
 
 // fromRepo is FromRepo for a package that is a dependency of the packages in
 // chain. A package that is already in chain depends on itself through a
 // cycle, which is an error: installing it would recurse forever.
-func fromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB, chain []string) error {
+func (i *installer) fromRepo(ctx context.Context, pi goolib.PackageInfo, repo string, chain []string) error {
+	db, rm := i.db, i.rm
 	logger.Infof("Starting install of %s.%s.%s", pi.Name, pi.Arch, pi.Ver)
 	fmt.Printf("Installing %s.%s.%s and dependencies...\n", pi.Name, pi.Arch, pi.Ver)
 	// When a specific version is requested, look for an exact match in the repository.
@@ -187,7 +220,7 @@ func fromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm
 		if err != nil {
 			logger.Infof("Error fetching installed package state: %v, proceeding without lock", err)
 		}
-		spec, repoURL, _, err := client.FindRepoLatest(pi, rm, archs, installedArch, isLocked)
+		spec, repoURL, _, err := client.FindRepoLatest(pi, rm, i.archs, installedArch, isLocked)
 		if err != nil {
 			return err
 		}
@@ -203,14 +236,14 @@ func fromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm
 		return err
 	}
 	key := rs.PackageSpec.Name + "." + rs.PackageSpec.Arch
-	if i := slices.Index(chain, key); i >= 0 {
-		return fmt.Errorf("cannot install %s: dependency cycle %s", chain[0], strings.Join(append(slices.Clone(chain[i:]), key), " -> "))
+	if at := slices.Index(chain, key); at >= 0 {
+		return fmt.Errorf("cannot install %s: dependency cycle %s", chain[0], strings.Join(append(slices.Clone(chain[at:]), key), " -> "))
 	}
-	if err := installDeps(ctx, rs.PackageSpec, cache, rm, archs, dbOnly, force, downloader, db, append(slices.Clone(chain), key)); err != nil {
+	if err := i.installDeps(ctx, rs.PackageSpec, append(slices.Clone(chain), key)); err != nil {
 		return err
 	}
 
-	dst, pkgURL, err := download.FromRepo(ctx, rs, repo, cache, downloader)
+	dst, pkgURL, err := download.FromRepo(ctx, rs, repo, i.cache, i.downloader)
 	if err != nil {
 		return err
 	}
@@ -221,7 +254,7 @@ func fromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm
 	if err != nil {
 		return err
 	}
-	insFiles, err := installPkg(dst, rs.PackageSpec, dbOnly, force, db, func(insFiles map[string]string) error {
+	insFiles, err := installPkg(dst, rs.PackageSpec, i.dbOnly, i.policy, db, func(insFiles map[string]string) error {
 		return addPkg(db, client.PackageState{
 			SourceRepo:     repo,
 			DownloadURL:    pkgURL,
@@ -238,7 +271,7 @@ func fromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm
 	logger.Infof("Installation of %s.%s.%s completed", pi.Name, pi.Arch, pi.Ver)
 	fmt.Printf("Installation of %s.%s.%s and all dependencies completed\n", pi.Name, pi.Arch, pi.Ver)
 	// The old version is cleaned up only once the new one is recorded.
-	cleanOld(old, insFiles, dbOnly)
+	cleanOld(old, insFiles, i.dbOnly)
 	return nil
 }
 
@@ -306,7 +339,7 @@ func FromDisk(pkgPath, cache string, dbOnly, force, shouldReinstall bool, db *go
 		return err
 	}
 
-	if _, err := installPkg(dst, zs, dbOnly, force, db, func(insFiles map[string]string) error {
+	if _, err := installPkg(dst, zs, dbOnly, newPolicy(force), db, func(insFiles map[string]string) error {
 		return addPkg(db, client.PackageState{
 			LocalPath:      dst,
 			PackageSpec:    zs,
@@ -366,7 +399,7 @@ func Reinstall(ctx context.Context, ps client.PackageState, rd, force bool, down
 		}
 	}
 
-	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, false, force, db, nil); err != nil {
+	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, false, newPolicy(force), db, nil); err != nil {
 		return fmt.Errorf("error reinstalling package: %v", err)
 	}
 
@@ -434,7 +467,7 @@ func extractSpec(pkgPath string) (*goolib.PkgSpec, error) {
 	return goolib.ExtractPkgSpec(f)
 }
 
-func makeInstallFunction(src, dst string, insFiles map[string]string, dbOnly, force bool, conflictMap map[string]string, u *undo) func(string, os.FileInfo, error) error {
+func makeInstallFunction(src, dst string, insFiles map[string]string, dbOnly bool, pol policy, conflictMap map[string]string, u *undo) func(string, os.FileInfo, error) error {
 	return func(path string, fi os.FileInfo, err error) (outerr error) {
 		if err != nil {
 			return err
@@ -442,10 +475,10 @@ func makeInstallFunction(src, dst string, insFiles map[string]string, dbOnly, fo
 		outPath := filepath.Join(dst, strings.TrimPrefix(path, src))
 
 		if owner, ok := conflictMap[outPath]; ok && !fi.IsDir() {
-			if settings.StrictConflicts && !force {
+			if pol.strictConflicts && !pol.force {
 				return fmt.Errorf("file conflict: %s is already owned by package %s", outPath, owner)
 			}
-			if force {
+			if pol.force {
 				logger.Infof("Warning: file conflict: %s is already owned by package %s, overwriting due to force flag", outPath, owner)
 			} else {
 				logger.Infof("Warning: file conflict: %s is already owned by package %s, overwriting because `StrictConflicts` is not set", outPath, owner)
@@ -590,14 +623,14 @@ var addPkg = (*googetdb.GooDB).AddPkg
 // placed and the installer has succeeded. If it fails or panics, the placed
 // files are rolled back, but changes made by the installer are not. The
 // backups of overwritten files are kept until record succeeds.
-func installPkg(pkg string, ps *goolib.PkgSpec, dbOnly, force bool, db *googetdb.GooDB, record func(insFiles map[string]string) error) (insFiles map[string]string, err error) {
+func installPkg(pkg string, ps *goolib.PkgSpec, dbOnly bool, pol policy, db *googetdb.GooDB, record func(insFiles map[string]string) error) (insFiles map[string]string, err error) {
 	sp := progress.NewSpinner(fmt.Sprintf("Installing %s.%s.%s", ps.Name, ps.Arch, ps.Version))
 	// The spinner is stopped by a deferred call so that no exit path leaves it
 	// redrawing. A normal return overwrites err before the deferred call runs;
 	// a panic leaves errInstallInterrupted in place, so it renders "failed".
 	err = errInstallInterrupted
 	defer func() { sp.Stop(err) }()
-	return installPkgInner(pkg, ps, dbOnly, force, db, record)
+	return installPkgInner(pkg, ps, dbOnly, pol, db, record)
 }
 
 // backupInfix marks the backup of a file that an install overwrites.
@@ -738,7 +771,7 @@ func (u *undo) commit() {
 // installPkgInner implements installPkg. It owns the journal of the
 // filesystem changes: if any step, including record, fails or panics, the
 // files it placed are removed and the files it overwrote are restored.
-func installPkgInner(pkg string, ps *goolib.PkgSpec, dbOnly, force bool, db *googetdb.GooDB, record func(insFiles map[string]string) error) (map[string]string, error) {
+func installPkgInner(pkg string, ps *goolib.PkgSpec, dbOnly bool, pol policy, db *googetdb.GooDB, record func(insFiles map[string]string) error) (map[string]string, error) {
 	dir, err := download.ExtractPkg(pkg)
 	if err != nil {
 		return nil, err
@@ -767,7 +800,7 @@ func installPkgInner(pkg string, ps *goolib.PkgSpec, dbOnly, force bool, db *goo
 	for src, dst := range ps.Files {
 		dst = resolveDst(dst)
 		src = filepath.Join(dir, src)
-		if err := oswrap.Walk(src, makeInstallFunction(src, dst, insFiles, dbOnly, force, conflictMap, u)); err != nil {
+		if err := oswrap.Walk(src, makeInstallFunction(src, dst, insFiles, dbOnly, pol, conflictMap, u)); err != nil {
 			return nil, err
 		}
 	}
