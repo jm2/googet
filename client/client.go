@@ -34,6 +34,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/logger"
@@ -526,22 +527,23 @@ func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installed
 }
 
 func satisfiesVersion(pkgVer, reqVer string) bool {
-	if reqVer == "" || pkgVer == "" {
-		return true
-	}
-	c, err := goolib.Compare(pkgVer, reqVer)
+	ok, err := relation.Requirement{Ver: reqVer}.Satisfies(pkgVer)
 	if err != nil {
 		logger.Errorf("Error comparing versions %s vs %s: %v", pkgVer, reqVer, err)
 		return false
 	}
-	return c >= 0
+	return ok
 }
 
 // SatisfiesProvider checks if a provider string satisfies a requirement.
 func SatisfiesProvider(prov, reqName, reqVer string) bool {
-	pName, pVer, _ := strings.Cut(prov, "=")
-
-	return pName == reqName && satisfiesVersion(pVer, reqVer)
+	p := relation.ParseProvide(prov)
+	ok, err := relation.Requirement{Name: reqName, Ver: reqVer}.SatisfiedBy(p)
+	if err != nil {
+		logger.Errorf("Error comparing versions %s vs %s: %v", p.Ver, reqVer, err)
+		return false
+	}
+	return ok
 }
 
 // WhatRepo returns what repo a package is in.
