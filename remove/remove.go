@@ -27,6 +27,7 @@ import (
 	"github.com/google/googet/v2/download"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/system"
 	"github.com/google/logger"
@@ -140,8 +141,7 @@ func (deps DepMap) build(name, arch string, state client.GooGetState) {
 			continue
 		}
 		for d := range p.PackageSpec.PkgDependencies {
-			di := goolib.PkgNameSplit(d)
-			if di.Name == name && (di.Arch == arch || di.Arch == "") {
+			if relation.ParseDependency(d, "").SameIdentity(name, arch) {
 				n, a := p.PackageSpec.Name, p.PackageSpec.Arch
 				if dep := n + "." + a; !slices.Contains(deps[key], dep) {
 					deps[key] = append(deps[key], dep)
