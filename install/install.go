@@ -84,19 +84,136 @@ func isSatisfied(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
 	return false, nil
 }
 
-func resolveConflicts(ps *goolib.PkgSpec, db *googetdb.GooDB) error {
+// pkgKey returns the database identity key (name.arch) for ps.
+func pkgKey(ps *goolib.PkgSpec) string {
+	return ps.Name + "." + ps.Arch
+}
+
+// exclusions identifies installed packages, keyed as name.arch, that a forward
+// conflict check skips because installing the incoming package overwrites them.
+type exclusions struct {
+	// self is the incoming package's own name.arch key.
+	self string
+}
+
+// selfExclusion returns an exclusion set containing only ps itself.
+func selfExclusion(ps *goolib.PkgSpec) exclusions {
+	return exclusions{self: pkgKey(ps)}
+}
+
+// has reports whether key is excluded from conflict checks.
+func (e exclusions) has(key string) bool {
+	return key != "" && key == e.self
+}
+
+// installedSpecs returns the non-nil package specs currently recorded in db.
+func installedSpecs(db *googetdb.GooDB) ([]*goolib.PkgSpec, error) {
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		return nil, err
+	}
+	specs := make([]*goolib.PkgSpec, 0, len(state))
+	for _, st := range state {
+		if st.PackageSpec != nil {
+			specs = append(specs, st.PackageSpec)
+		}
+	}
+	return specs, nil
+}
+
+// nonExcluded returns the non-nil specs in installed whose name.arch key is
+// not in ex.
+func nonExcluded(installed []*goolib.PkgSpec, ex exclusions) []*goolib.PkgSpec {
+	out := make([]*goolib.PkgSpec, 0, len(installed))
+	for _, ps := range installed {
+		if ps != nil && !ex.has(pkgKey(ps)) {
+			out = append(out, ps)
+		}
+	}
+	return out
+}
+
+// providesRequirement reports whether ps declares a Provides entry that
+// satisfies r.
+func providesRequirement(ps *goolib.PkgSpec, r relation.Requirement) bool {
+	for _, prov := range ps.Provides {
+		if client.SatisfiesProvider(prov, r.Name, r.Ver) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkForwardConflict evaluates a single Conflicts requirement r against the
+// primary FetchPkg candidate pick and the full installed package list under ex.
+// It returns whether an unexcluded conflict exists and any excluded rows that
+// matched r.
+func checkForwardConflict(r relation.Requirement, pick *goolib.PkgSpec, installed []*goolib.PkgSpec, ex exclusions) (hit bool, exempted []*goolib.PkgSpec, err error) {
+	if pick != nil {
+		ok, err := r.MinInstalled(pick.Name, pick.Arch, pick.Version)
+		if err != nil {
+			return false, nil, err
+		}
+		if ok {
+			if !ex.has(pkgKey(pick)) {
+				return true, nil, nil
+			}
+			exempted = append(exempted, pick)
+			others, err := relation.Resolve(r, nonExcluded(installed, ex))
+			if err != nil {
+				return false, nil, err
+			}
+			if len(others) > 0 {
+				return true, exempted, nil
+			}
+		}
+	}
+	for _, inst := range installed {
+		if inst == nil || !providesRequirement(inst, r) {
+			continue
+		}
+		if !ex.has(pkgKey(inst)) {
+			return true, exempted, nil
+		}
+		exempted = append(exempted, inst)
+	}
+	return false, exempted, nil
+}
+
+// resolveConflicts fails if any of ps.Conflicts matches an installed row not
+// excluded by ex.
+func resolveConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) error {
+	if len(ps.Conflicts) == 0 {
+		return nil
+	}
 	// Check for any conflicting packages.
 	// TODO(ajackura): Make sure no conflicting packages are listed as
 	// dependencies or subdependancies.
+	installed, err := installedSpecs(db)
+	if err != nil {
+		return err
+	}
+	logged := make(map[string]bool)
 	for _, pkg := range ps.Conflicts {
 		r := relation.ParseRelation(pkg)
-		// Check if the conflicting package or a provider of it is installed.
-		sat, err := isSatisfied(r, db)
+		pick, err := db.FetchPkg(r.PackageInfo())
 		if err != nil {
 			return err
 		}
-		if sat {
+		// Check if the conflicting package or a provider of it is installed.
+		hit, exempted, err := checkForwardConflict(r, pick.PackageSpec, installed, ex)
+		if err != nil {
+			return err
+		}
+		if hit {
 			return fmt.Errorf("cannot install, conflict with installed package or provider: %s", r.PackageInfo())
+		}
+		for _, exPkg := range exempted {
+			k := pkgKey(exPkg)
+			if !logged[k] {
+				logged[k] = true
+				logger.Infof("conflict %q with %s skipped: installing %s removes it", pkg, exPkg, ps)
+			}
 		}
 	}
 	return nil
@@ -164,7 +281,7 @@ func (i *installer) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec)
 func (i *installer) installDeps(ctx context.Context, ps *goolib.PkgSpec, chain []string) error {
 	db := i.db
 	logger.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
-	if err := resolveConflicts(ps, db); err != nil {
+	if err := resolveConflicts(ps, selfExclusion(ps), db); err != nil {
 		return err
 	}
 	// Check for and install any dependencies.
@@ -298,7 +415,7 @@ func FromDisk(pkgPath, cache string, dbOnly, force, shouldReinstall bool, db *go
 	logger.Infof("Starting install of %q, version %q from %q", zs.Name, zs.Version, pkgPath)
 	fmt.Printf("Installing %s %s...\n", zs.Name, zs.Version)
 
-	if err := resolveConflicts(zs, db); err != nil {
+	if err := resolveConflicts(zs, selfExclusion(zs), db); err != nil {
 		return err
 	}
 	for p, ver := range zs.PkgDependencies {

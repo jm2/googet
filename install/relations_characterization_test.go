@@ -279,20 +279,20 @@ func TestCharacterizeReplaceBeforeDownload(t *testing.T) {
 }
 
 // TestCharacterizeSelfConflictBlocksUpgrade pins that a package that both
-// provides and conflicts with the same name conflicts with its own installed
-// version, so it can't be upgraded.
+// provides and conflicts with the same name can still upgrade, because the
+// installed version of the incoming package is excluded from its own conflict
+// check.
 //
-// Known wrong: a fix should exclude the package being upgraded from the
-// conflict check, so installing A 2 succeeds.
+// Intended: installing A 2 overwrites A 1, so A 1 does not block the upgrade.
 func TestCharacterizeSelfConflictBlocksUpgrade(t *testing.T) {
 	spec := func(version string) goolib.PkgSpec {
 		return goolib.PkgSpec{Name: "A", Arch: "noarch", Version: version, Provides: []string{"X"}, Conflicts: []string{"X"}}
 	}
 	f := newRelFixture(t, []goolib.PkgSpec{spec("1")}, []goolib.PkgSpec{spec("2")})
-	if err := f.install(t, "A"); err == nil || !strings.Contains(err.Error(), "conflict") {
-		t.Errorf("install A 2 = %v, want a conflict with installed A 1 (today a self-conflict blocks upgrades)", err)
+	if err := f.install(t, "A"); err != nil {
+		t.Fatalf("install A 2: %v", err)
 	}
-	if diff := cmp.Diff([]string{"A.noarch.1"}, f.installed(t)); diff != "" {
+	if diff := cmp.Diff([]string{"A.noarch.2"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages (-want +got):\n%s", diff)
 	}
 }
