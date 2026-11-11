@@ -3,6 +3,7 @@ package testutil
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
@@ -13,11 +14,56 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/logger"
 )
+
+// logSink is a concurrency-safe io.Writer registered with logger.Init so
+// individual tests can capture package-level log lines.
+type logSink struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *logSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.w == nil {
+		return len(p), nil
+	}
+	return s.w.Write(p)
+}
+
+func (s *logSink) set(w io.Writer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.w = w
+}
+
+var sharedLogSink logSink
+
+func init() {
+	logger.Init("test", false, false, &sharedLogSink)
+}
+
+// CaptureLogs redirects package-level logger output to a buffer for the
+// duration of t and restores silent logging on cleanup.
+//
+// CaptureLogs relies on testutil's init registering sharedLogSink before any
+// importing test package runs its own init, because logger.Init configures the
+// default logger only on its first call per process. CaptureLogs swaps a
+// process-wide log sink and must not be used in tests that call t.Parallel.
+func CaptureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	sharedLogSink.set(&buf)
+	t.Cleanup(func() { sharedLogSink.set(nil) })
+	return &buf
+}
 
 // GenGoo creates a name.noarch.version.goo package file in directory dir for
 // the package with given pkgspec. When installed name.goo writes a file having

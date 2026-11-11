@@ -16,11 +16,9 @@ import (
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
-	"github.com/google/logger"
 )
 
 func TestRemoveOne(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	for _, tc := range []struct {
 		desc      string
 		pkgName   string
@@ -128,7 +126,6 @@ func captureStdout(f func()) string {
 }
 
 func TestRemoveOneDryRun(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	ctx := context.Background()
 
 	for _, tc := range []struct {

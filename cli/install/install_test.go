@@ -21,7 +21,6 @@ import (
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
-	"github.com/google/logger"
 )
 
 // checkInstalled returns true if the test package identified by ps was
@@ -43,7 +42,6 @@ func checkInstalled(t *testing.T, dir string, ps goolib.PkgSpec) bool {
 }
 
 func TestInstall(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	for _, tc := range []struct {
 		desc            string             // description of test case
 		args            []string           // args to install command
@@ -269,7 +267,6 @@ func captureStdout(f func()) string {
 }
 
 func TestInstallDryRun(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	ctx := context.Background()
 	settings.Archs = []string{"noarch", "x86_64"}
 
