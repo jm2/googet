@@ -155,8 +155,8 @@ func (g *GooDB) RemovePkg(pkgName, arch string) error {
 // FetchPkg exports a single package from the googet database.
 //
 // Keep row filtering, (pkg_arch, pkg_ver) ordering, and the last-row fallback
-// in sync with install.fetchPick (covered by TestFetchPickMatchesFetchPkg in
-// package install).
+// in sync with snapshot.Pick in internal/snapshot (covered by
+// TestPickMatchesFetchPkg).
 func (g *GooDB) FetchPkg(pi goolib.PackageInfo) (client.PackageState, error) {
 	selectSpecQuery :=
 		`SELECT 
@@ -220,6 +220,11 @@ func (g *GooDB) FetchPkgs(pkgName string) (client.GooGetState, error) {
 
 // InstalledLockState returns the architecture, lock status, and version of the installed package.
 // If the package is not installed, it returns empty string and false.
+//
+// pkgName is matched with SQL LIKE, so "_" and "%" act as wildcards and ASCII
+// letters match either case, and an empty pkgName matches every package. Keep
+// this in sync with snapshot.LockState in internal/snapshot (covered by
+// TestLockStateMatchesInstalledLockState).
 func (g *GooDB) InstalledLockState(pkgName string) (installedArch string, isLocked bool, ver string, pkgFound bool, err error) {
 	pkgs, err := g.FetchPkgs(pkgName)
 	if err != nil {

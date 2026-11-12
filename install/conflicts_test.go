@@ -568,63 +568,6 @@ func openTestDB(t *testing.T) *googetdb.GooDB {
 	return db
 }
 
-// TestFetchPickMatchesFetchPkg differentially verifies fetchPick against
-// googetdb.GooDB.FetchPkg across randomized multi-arch, multi-version database
-// snapshots.
-func TestFetchPickMatchesFetchPkg(t *testing.T) {
-	rng := rand.New(rand.NewPCG(1, 2))
-	names := []string{"P", "Q", "R", "dotted.pkg"}
-	archs := []string{"noarch", "x86_64", "x86_32", "arm64", "arm"}
-	vers := []string{"1", "1.0.0", "2.0.0", "1.2.3@4", "10.0.0", "0.0.1-rc1", "notaver"}
-	qNames := []string{"P", "Q", "R", "dotted.pkg", "nonexistent", ""}
-	qArchs := []string{"", "noarch", "x86_64", "x86_32", "arm64", "arm", "unknown"}
-	qVers := []string{"", "1", "1.0.0", "2.0.0", "1.2.3@4", "99.9.9"}
-
-	const (
-		numStates       = 200
-		queriesPerState = 25
-	)
-	for i := range numStates {
-		db := openTestDB(t)
-		count := rng.IntN(9)
-		var state client.GooGetState
-		for range count {
-			ps := &goolib.PkgSpec{
-				Name:    names[rng.IntN(len(names))],
-				Arch:    archs[rng.IntN(len(archs))],
-				Version: vers[rng.IntN(len(vers))],
-			}
-			state = append(state, client.PackageState{PackageSpec: ps})
-		}
-		if err := db.WriteStateToDB(state); err != nil {
-			t.Fatal(err)
-		}
-		snapshot, err := db.FetchPkgs("")
-		if err != nil {
-			t.Fatal(err)
-		}
-		for q := range queriesPerState {
-			pi := goolib.PackageInfo{
-				Name: qNames[rng.IntN(len(qNames))],
-				Arch: qArchs[rng.IntN(len(qArchs))],
-				Ver:  qVers[rng.IntN(len(qVers))],
-			}
-			want, err := db.FetchPkg(pi)
-			if err != nil {
-				t.Fatalf("state %d query %d FetchPkg(%+v): %v", i, q, pi, err)
-			}
-			got, gotOK := fetchPick(pi, snapshot)
-			wantOK := want.PackageSpec != nil
-			if gotOK != wantOK {
-				t.Errorf("state %d query %d (%+v): fetchPick ok=%t, want %t", i, q, pi, gotOK, wantOK)
-			}
-			if diff := cmp.Diff(want, got); diff != "" {
-				t.Errorf("state %d query %d (%+v) mismatch (-want +got):\n%s", i, q, pi, diff)
-			}
-		}
-	}
-}
-
 // TestSimulateReplacementsMatchesResolveReplacements differentially verifies
 // simulateReplacements against resolveReplacements (with DBOnly) across
 // randomized installed states and Replaces lists, covering multi-arch rows,
