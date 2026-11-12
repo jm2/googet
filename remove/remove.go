@@ -46,43 +46,21 @@ func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downl
 	if ps.PackageSpec == nil {
 		return fmt.Errorf("package %q not found in state database", pi.Name)
 	}
+	return uninstallRow(ctx, pi, ps, dbOnly, downloader, db)
+}
 
+// uninstallRow uninstalls the installed package ps and deletes its database
+// row by name and arch. Unless dbOnly is set, it runs the package's uninstall
+// script from its cached archive, downloading the archive again if needed,
+// removes the files the package installed, and deletes the archive. label
+// names the package in messages.
+func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	if !dbOnly {
-		// Fix for package install by older versions of GooGet.
-		if ps.LocalPath == "" && ps.UnpackDir != "" {
-			ps.LocalPath = ps.UnpackDir + ".goo"
-		}
-		if ps.LocalPath == "" {
-			return fmt.Errorf("no local path available for package %q", pi.Name)
-		}
-
-		f, err := os.Open(ps.LocalPath)
-		if err != nil && !os.IsNotExist(err) {
+		archive, err := localArchive(ctx, label, ps, downloader)
+		if err != nil {
 			return err
 		}
-		var rd bool
-		if os.IsNotExist(err) {
-			logger.Infof("Local package does not exist for %s.%s.%s, redownloading...", pi.Name, pi.Arch, pi.Ver)
-			rd = true
-		}
-		// Force redownload if checksum does not match.
-		// If checksum is empty this was a local install so ignore.
-		if !rd && ps.Checksum != "" && goolib.Checksum(f) != ps.Checksum {
-			logger.Info("Local package checksum does not match, redownloading...")
-			rd = true
-		}
-		f.Close()
-
-		if rd {
-			if ps.DownloadURL == "" {
-				return fmt.Errorf("can not redownload %s.%s.%s, DownloadURL not saved", pi.Name, pi.Arch, pi.Ver)
-			}
-			if err := download.Package(ctx, ps.DownloadURL, ps.LocalPath, ps.Checksum, downloader); err != nil {
-				return fmt.Errorf("error redownloading %s.%s.%s, package may no longer exist in the repo, you can use the '-db_only' flag to remove it from the database: %v", pi.Name, pi.Arch, pi.Ver, err)
-			}
-		}
-
-		eDir, err := download.ExtractPkg(ps.LocalPath)
+		eDir, err := download.ExtractPkg(archive)
 		if err != nil {
 			return err
 		}
@@ -114,11 +92,63 @@ func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downl
 				}
 			}
 		}
-		if err := oswrap.RemoveAll(ps.LocalPath); err != nil {
+		if err := oswrap.RemoveAll(archive); err != nil {
 			logger.Errorf("error removing package data from cache directory: %v", err)
 		}
 	}
 	return db.RemovePkg(ps.PackageSpec.Name, ps.PackageSpec.Arch)
+}
+
+// LocalArchive returns the path of the installed package ps's cached archive,
+// which uninstalling ps needs. Packages installed by older versions of GooGet
+// record only an unpack directory, whose archive is that path plus ".goo".
+// If the archive is missing, or ps records a checksum that the archive
+// doesn't match, LocalArchive downloads it again from ps's download URL to
+// the same path.
+func LocalArchive(ctx context.Context, ps client.PackageState, downloader *client.Downloader) (string, error) {
+	if ps.PackageSpec == nil {
+		return "", fmt.Errorf("cannot resolve local archive: missing package spec")
+	}
+	return localArchive(ctx, goolib.PackageInfo{Name: ps.PackageSpec.Name, Arch: ps.PackageSpec.Arch, Ver: ps.PackageSpec.Version}, ps, downloader)
+}
+
+// localArchive is LocalArchive with label naming the package in messages.
+func localArchive(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, downloader *client.Downloader) (string, error) {
+	// Fix for package install by older versions of GooGet.
+	path := ps.LocalPath
+	if path == "" && ps.UnpackDir != "" {
+		path = ps.UnpackDir + ".goo"
+	}
+	if path == "" {
+		return "", fmt.Errorf("no local path available for package %q", label.Name)
+	}
+
+	f, err := os.Open(path)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	var rd bool
+	if os.IsNotExist(err) {
+		logger.Infof("Local package does not exist for %s.%s.%s, redownloading...", label.Name, label.Arch, label.Ver)
+		rd = true
+	}
+	// Force redownload if checksum does not match.
+	// If checksum is empty this was a local install so ignore.
+	if !rd && ps.Checksum != "" && goolib.Checksum(f) != ps.Checksum {
+		logger.Info("Local package checksum does not match, redownloading...")
+		rd = true
+	}
+	f.Close()
+
+	if rd {
+		if ps.DownloadURL == "" {
+			return "", fmt.Errorf("can not redownload %s.%s.%s, DownloadURL not saved", label.Name, label.Arch, label.Ver)
+		}
+		if err := download.Package(ctx, ps.DownloadURL, path, ps.Checksum, downloader); err != nil {
+			return "", fmt.Errorf("error redownloading %s.%s.%s, package may no longer exist in the repo, you can use the '-db_only' flag to remove it from the database: %v", label.Name, label.Arch, label.Ver, err)
+		}
+	}
+	return path, nil
 }
 
 // DepMap is a map of packages to dependant packages.
@@ -179,6 +209,34 @@ func (deps DepMap) buildWithLog(name, arch string, state client.GooGetState, log
 // root, removalOrder returns an error naming them, and nothing should be
 // removed. deps is not modified.
 func removalOrder(deps DepMap, root string) (order, rootCycle []string, err error) {
+	order, rootCycle, err = removalOrderSet(deps, []string{root})
+	if err != nil {
+		return nil, nil, err
+	}
+	// All removes the root separately, last.
+	order = slices.DeleteFunc(order, func(pkg string) bool { return pkg == root })
+	if len(order) == 0 {
+		order = nil
+	}
+	return order, rootCycle, nil
+}
+
+// removalOrderSet returns the packages in deps, including every package in
+// roots that is a key of deps, ordered so that each one comes after every
+// package that depends on it. Roots are being removed on purpose, so a root's
+// own dependencies are removed before it even when they depend on it in turn;
+// rootCycle lists, sorted, the packages that depend on a root in this way.
+// Dependencies between roots are kept, so a root that depends on another root
+// is removed first. Packages that are ready at the same time are taken in
+// sorted order. If packages other than roots depend on each other in a cycle,
+// removalOrderSet returns an error naming them, and nothing should be
+// removed; if only roots remain in a cycle, the first of the cycle's roots in
+// sorted order is removed next. deps is not modified.
+func removalOrderSet(deps DepMap, roots []string) (order, rootCycle []string, err error) {
+	isRoot := make(map[string]bool, len(roots))
+	for _, r := range roots {
+		isRoot[r] = true
+	}
 	pending := make(DepMap, len(deps))
 	for pkg, dependents := range deps {
 		pending[pkg] = slices.Clone(dependents)
@@ -189,13 +247,21 @@ func removalOrder(deps DepMap, root string) (order, rootCycle []string, err erro
 			}
 		}
 	}
-	if _, ok := pending[root]; ok {
-		for _, pkg := range slices.Sorted(maps.Keys(pending)) {
-			if slices.Contains(pending[pkg], root) {
-				rootCycle = append(rootCycle, pkg)
-			}
+	for _, pkg := range slices.Sorted(maps.Keys(pending)) {
+		if isRoot[pkg] {
+			continue
 		}
-		pending.remove(root)
+		var cycle bool
+		pending[pkg] = slices.DeleteFunc(pending[pkg], func(d string) bool {
+			if isRoot[d] {
+				cycle = true
+				return true
+			}
+			return false
+		})
+		if cycle {
+			rootCycle = append(rootCycle, pkg)
+		}
 	}
 	for len(pending) > 0 {
 		var ready []string
@@ -205,8 +271,17 @@ func removalOrder(deps DepMap, root string) (order, rootCycle []string, err erro
 			}
 		}
 		if len(ready) == 0 {
-			remaining := slices.Sorted(maps.Keys(pending))
-			return nil, nil, fmt.Errorf("cannot remove %s: these packages depend on each other in a cycle: %s; remove one of them first", root, strings.Join(remaining, ", "))
+			var remaining []string
+			for pkg := range pending {
+				if !isRoot[pkg] {
+					remaining = append(remaining, pkg)
+				}
+			}
+			if len(remaining) > 0 {
+				slices.Sort(remaining)
+				return nil, nil, fmt.Errorf("cannot remove %s: these packages depend on each other in a cycle: %s; remove one of them first", strings.Join(roots, ", "), strings.Join(remaining, ", "))
+			}
+			ready = []string{cycleBreak(pending)}
 		}
 		slices.Sort(ready)
 		for _, pkg := range ready {
@@ -215,6 +290,47 @@ func removalOrder(deps DepMap, root string) (order, rootCycle []string, err erro
 		order = append(order, ready...)
 	}
 	return order, rootCycle, nil
+}
+
+// cycleBreak returns the package removalOrderSet removes next when every
+// package left in pending is a root that waits for another to be removed
+// first. It returns the first, in sorted order, of the roots that lie on a
+// cycle that waits for nothing outside it, so that a root that depends on
+// another root, but isn't in the cycle itself, is still removed first.
+func cycleBreak(pending DepMap) string {
+	// reaches returns the packages that from waits for, directly or not.
+	reaches := func(from string) map[string]bool {
+		seen := map[string]bool{}
+		stack := []string{from}
+		for len(stack) > 0 {
+			pkg := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			for _, d := range pending[pkg] {
+				if !seen[d] {
+					seen[d] = true
+					stack = append(stack, d)
+				}
+			}
+		}
+		return seen
+	}
+	keys := slices.Sorted(maps.Keys(pending))
+	for _, pkg := range keys {
+		if !reaches(pkg)[pkg] {
+			continue
+		}
+		closed := true
+		for d := range reaches(pkg) {
+			if !reaches(d)[pkg] {
+				closed = false
+				break
+			}
+		}
+		if closed {
+			return pkg
+		}
+	}
+	return keys[0]
 }
 
 // depVersions resolves every key in dm against state via relation.SplitKey and
