@@ -362,11 +362,15 @@ func (ri *repoInstall) fromRepo(ctx context.Context, pi goolib.PackageInfo, repo
 		return err
 	}
 
-	// The state of the installed version, if any, is read before the new
-	// version replaces it in the database.
-	old, err := db.FetchPkg(pi)
+	// The version this install overwrites, if any, is the installed package
+	// with the same name and arch. Its state is read before the new version
+	// replaces it in the database.
+	old, err := db.FetchPkg(goolib.PackageInfo{Name: pi.Name, Arch: pi.Arch})
 	if err != nil {
 		return err
+	}
+	if old.PackageSpec == nil || old.PackageSpec.Name != pi.Name || old.PackageSpec.Arch != pi.Arch {
+		old = client.PackageState{}
 	}
 	insFiles, err := installPkg(dst, rs.PackageSpec, ri.opts, db, func(insFiles map[string]string) error {
 		return addPkg(db, client.PackageState{
