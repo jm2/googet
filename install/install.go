@@ -418,36 +418,12 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 	logger.Infof("Starting install of %q, version %q from %q", zs.Name, zs.Version, pkgPath)
 	fmt.Printf("Installing %s %s...\n", zs.Name, zs.Version)
 
-	if _, err := checkConflicts(zs, selfExclusion(zs), ins.opts.PackageConflicts, db); err != nil {
+	state, err := db.FetchPkgs("")
+	if err != nil {
 		return err
 	}
-	for p, ver := range zs.PkgDependencies {
-		pi := relation.ParseDependency(p, ver)
-		if ok, err := isSatisfied(pi, db); err != nil {
-			return err
-		} else if ok {
-			logger.Infof("Dependency met: %s.%s with version greater than %s installed or provided", pi.Name, pi.Arch, ver)
-			continue
-		}
-		return fmt.Errorf("package dependency %s %s (min version %s) not installed and not provided", pi.Name, pi.Arch, ver)
-	}
-	if len(zs.Replaces) > 0 {
-		installed, err := installedSpecs(db)
-		if err != nil {
-			return err
-		}
-		// Refuse if any installed arch of a replaced package qualifies, not
-		// just the row that minInstalled would check.
-		for _, pkg := range zs.Replaces {
-			r := relation.ParseRelation(pkg)
-			rows, err := relation.Resolve(r, installed)
-			if err != nil {
-				return err
-			}
-			if len(rows) > 0 {
-				return fmt.Errorf("cannot install, replaces installed package, remove first then try installation again: %s (installed: %s)", r.PackageInfo(), rows[0])
-			}
-		}
+	if _, err := buildPlan(planTarget{spec: zs}, nil, state, nil, planPolicy{conflicts: ins.opts.PackageConflicts}, liveSink{}); err != nil {
+		return err
 	}
 
 	dst := filepath.Join(ins.cache, goolib.PackageInfo{Name: zs.Name, Arch: zs.Arch, Ver: zs.Version}.PkgName())
