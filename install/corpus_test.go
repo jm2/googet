@@ -145,7 +145,7 @@ type trace struct {
 	// Err is the error text, or "" on success.
 	Err string
 	// Final lists name.arch.version for every installed package afterwards,
-	// sorted. It is empty when Err is set.
+	// sorted. A plan that fails has no Final.
 	Final []string
 	// Installs lists name.arch.version of each package installed, in order.
 	Installs []string
@@ -256,7 +256,6 @@ func runLive(t *testing.T, c corpusCase, f *relFixture) trace {
 	}
 	if err != nil {
 		tr.Err = err.Error()
-		return tr
 	}
 	tr.Final = f.installed(t)
 	return tr
