@@ -14,8 +14,14 @@ limitations under the License.
 package install
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
 	"math/rand/v2"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -323,7 +329,7 @@ func TestReplacesExemptsOnlyConcreteVictim(t *testing.T) {
 	// requirement remains satisfied in the database.
 	rSpec := &goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"P"}, Replaces: []string{"P.noarch"}}
 	def := deferredChecks{fwd: []relation.Requirement{relation.ParseRelation("P")}}
-	err = def.recheck(rSpec, f.db)
+	err = def.recheck(rSpec, ConflictWarn, f.db)
 	wantPostErr := "cannot install, conflict with installed package or provider: P (still installed after replacing)"
 	if err == nil || err.Error() != wantPostErr {
 		t.Errorf("deferred.recheck = %v, want exact error %q", err, wantPostErr)
@@ -391,7 +397,7 @@ func TestForwardConflictRecheckAfterReplacements(t *testing.T) {
 	// requirement remains satisfied in the database.
 	rSpec := &goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"P"}, Replaces: []string{"P.noarch"}}
 	def := deferredChecks{fwd: []relation.Requirement{relation.ParseRelation("P")}}
-	err = def.recheck(rSpec, f.db)
+	err = def.recheck(rSpec, ConflictWarn, f.db)
 	wantPostErr := "cannot install, conflict with installed package or provider: P (still installed after replacing)"
 	if err == nil || err.Error() != wantPostErr {
 		t.Errorf("deferred.recheck = %v, want exact error %q", err, wantPostErr)
@@ -467,7 +473,7 @@ func TestRecheckBeforeReplacementsLogging(t *testing.T) {
 	}
 	cleanLogs := testutil.CaptureLogs(t)
 	defClean := deferredChecks{fwd: []relation.Requirement{relation.ParseRelation("foo..1.0.0")}}
-	if err := defClean.recheckBeforeReplacements(&goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"B"}}, cleanDB); err != nil {
+	if err := defClean.recheckBeforeReplacements(&goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"B"}}, ConflictWarn, cleanDB); err != nil {
 		t.Fatalf("recheckBeforeReplacements on clean simulation = %v, want nil", err)
 	}
 	if strings.Contains(cleanLogs.String(), "Building dependency map") {
@@ -483,7 +489,7 @@ func TestRecheckBeforeReplacementsLogging(t *testing.T) {
 	}
 	skipLogs := testutil.CaptureLogs(t)
 	defSkip := deferredChecks{fwd: []relation.Requirement{relation.ParseRelation("P")}}
-	if err := defSkip.recheckBeforeReplacements(&goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}, skipDB); err != nil {
+	if err := defSkip.recheckBeforeReplacements(&goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}, ConflictWarn, skipDB); err != nil {
 		t.Errorf("recheckBeforeReplacements on incomplete simulation = %v, want nil deferral", err)
 	}
 	wantSkipMsg := "Replacement simulation for R.noarch.1 did not complete; deferring conflict checks until after replacements"
@@ -828,5 +834,945 @@ func TestFromDiskDoesNotExemptReplacesFromConflicts(t *testing.T) {
 	}
 	if diff := cmp.Diff([]string{"P.noarch.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages (-want +got):\n%s", diff)
+	}
+}
+
+// captureConsole captures os.Stdout output written during fn.
+func captureConsole(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	fn()
+	w.Close()
+	os.Stdout = old
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
+	return buf.String()
+}
+
+// TestReverseConflictModes verifies ConflictWarn, ConflictError, and
+// ConflictIgnore across Installer.FromRepo and Installer.FromDisk.
+func TestReverseConflictModes(t *testing.T) {
+	installedB := goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"A"}}
+	incomingA := goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "2"}
+
+	for _, tc := range []struct {
+		mode       ConflictMode
+		wantResult string
+		wantTag    string
+		wantWarn   bool
+		wantErr    bool
+		wantState  []string
+	}{
+		{
+			mode:       ConflictWarn,
+			wantResult: "warned",
+			wantTag:    "WARN : ",
+			wantWarn:   true,
+			wantState:  []string{"A.noarch.2", "B.noarch.1"},
+		},
+		{
+			mode:       ConflictError,
+			wantResult: "failed",
+			wantTag:    "ERROR: ",
+			wantErr:    true,
+			wantState:  []string{"B.noarch.1"},
+		},
+		{
+			mode:       ConflictIgnore,
+			wantResult: "ignored",
+			wantTag:    "INFO : ",
+			wantState:  []string{"A.noarch.2", "B.noarch.1"},
+		},
+	} {
+		for _, via := range []string{"FromRepo", "FromDisk"} {
+			t.Run(tc.mode.String()+"/"+via, func(t *testing.T) {
+				logs := testutil.CaptureLogs(t)
+				f := newRelFixture(t, []goolib.PkgSpec{installedB}, []goolib.PkgSpec{incomingA})
+				ins := New(f.cache, f.db, Options{PackageConflicts: tc.mode})
+
+				var err error
+				out := captureConsole(t, func() {
+					if via == "FromRepo" {
+						err = ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "A"}, "", f.rm, []string{"noarch"}, f.downloader)
+					} else {
+						dir := t.TempDir()
+						rs := testutil.GenGoo(t, dir, f.dst, incomingA)
+						err = ins.FromDisk(filepath.Join(dir, rs.Source), false)
+					}
+				})
+
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("%s error = %v, want error: %t", via, err, tc.wantErr)
+				}
+				if tc.wantErr {
+					if !errors.Is(err, ErrPackageConflict) {
+						t.Errorf("errors.Is(%v, ErrPackageConflict) = false, want true", err)
+					}
+					if !strings.Contains(err.Error(), "package conflict mode is error") {
+						t.Errorf("error = %q, want 'package conflict mode is error'", err.Error())
+					}
+					if strings.Contains(err.Error(), "-package_conflicts") {
+						t.Errorf("library error = %q, must not hard-code CLI flag name", err.Error())
+					}
+				}
+				if diff := cmp.Diff(tc.wantState, f.installed(t)); diff != "" {
+					t.Errorf("installed packages (-want +got):\n%s", diff)
+				}
+
+				wantLine := conflictLine(tc.mode, tc.wantResult, &installedB, "A", &incomingA)
+				var matchedTag bool
+				for _, line := range strings.Split(logs.String(), "\n") {
+					if strings.Contains(line, wantLine) && strings.HasPrefix(line, tc.wantTag) {
+						matchedTag = true
+					}
+				}
+				if !matchedTag {
+					t.Errorf("logs missing %q with prefix %q; got:\n%s", wantLine, tc.wantTag, logs.String())
+				}
+
+				wantStdout := `Warning: installed package B.noarch.1 conflicts with A.noarch.2 (entry "A"); installing anyway (package_conflicts=warn)`
+				if gotWarn := strings.Contains(out, wantStdout); gotWarn != tc.wantWarn {
+					t.Errorf("stdout contains warning = %t, want %t; stdout:\n%s", gotWarn, tc.wantWarn, out)
+				}
+			})
+		}
+	}
+}
+
+// TestReverseConflictsPure exercises reverseConflicts directly on in-memory
+// PkgSpec slices without a database.
+func TestReverseConflictsPure(t *testing.T) {
+	installed := []*goolib.PkgSpec{
+		{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"virt.noarch.2.0", "A.x86_64", "C.noarch.2"}},
+	}
+	for _, tc := range []struct {
+		name     string
+		incoming *goolib.PkgSpec
+		ex       exclusions
+		want     []string
+	}{
+		{
+			name:     "provides meets requirement",
+			incoming: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1", Provides: []string{"virt=2.5"}},
+			want:     []string{"virt.noarch.2.0"},
+		},
+		{
+			name:     "provides below requirement does not hit",
+			incoming: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1", Provides: []string{"virt=1.5"}},
+		},
+		{
+			name:     "non-matching arch does not hit",
+			incoming: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"},
+		},
+		{
+			name:     "matching arch hits",
+			incoming: &goolib.PkgSpec{Name: "A", Arch: "x86_64", Version: "1"},
+			want:     []string{"A.x86_64"},
+		},
+		{
+			name:     "below minimum version does not hit",
+			incoming: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "1"},
+		},
+		{
+			name:     "at minimum version hits",
+			incoming: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "2"},
+			want:     []string{"C.noarch.2"},
+		},
+		{
+			name:     "excluded installed row produces zero hits",
+			incoming: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "2"},
+			ex:       exclusions{victims: map[string]bool{"B.noarch": true}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits := reverseConflicts(tc.incoming, installed, tc.ex)
+			var got []string
+			for _, h := range hits {
+				got = append(got, h.entry)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("reverseConflicts entries (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestReverseConflictMatching verifies end-to-end reverse conflict matching by
+// Provides, architecture, and minimum version through Installer.FromRepo.
+func TestReverseConflictMatching(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		installed goolib.PkgSpec
+		incoming  goolib.PkgSpec
+		wantHit   bool
+	}{
+		{
+			name:      "provides hit",
+			installed: goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"X"}},
+			incoming:  goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1", Provides: []string{"X"}},
+			wantHit:   true,
+		},
+		{
+			name:      "arch mismatch no hit",
+			installed: goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"A.x86_64"}},
+			incoming:  goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"},
+		},
+		{
+			name:      "version below minimum no hit",
+			installed: goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"A.noarch.2"}},
+			incoming:  goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"},
+		},
+		{
+			name:      "version at minimum hits",
+			installed: goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"A.noarch.2"}},
+			incoming:  goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "2"},
+			wantHit:   true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRelFixture(t, []goolib.PkgSpec{tc.installed}, []goolib.PkgSpec{tc.incoming})
+			ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+			err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: tc.incoming.Name}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader)
+			if (err != nil) != tc.wantHit {
+				t.Errorf("FromRepo error = %v, want hit: %t", err, tc.wantHit)
+			}
+		})
+	}
+}
+
+// TestReverseConflictExclusionsAndDrift checks that self-upgrades and replaced
+// victims produce zero reverse hits when removed, while a victim that survives
+// replacement due to dependency-induced FetchPkg drift is caught before
+// downloading the incoming package.
+func TestReverseConflictExclusionsAndDrift(t *testing.T) {
+	t.Run("self upgrade produces no reverse hit", func(t *testing.T) {
+		logs := testutil.CaptureLogs(t)
+		spec := func(v string) goolib.PkgSpec {
+			return goolib.PkgSpec{Name: "A", Arch: "noarch", Version: v, Provides: []string{"X"}, Conflicts: []string{"X"}}
+		}
+		f := newRelFixture(t, []goolib.PkgSpec{spec("1")}, []goolib.PkgSpec{spec("2")})
+		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "A"}, "", f.rm, []string{"noarch"}, f.downloader); err != nil {
+			t.Fatalf("FromRepo upgrade: %v", err)
+		}
+		if strings.Contains(logs.String(), "package_conflict") {
+			t.Errorf("unexpected package_conflict log on self-upgrade:\n%s", logs.String())
+		}
+	})
+
+	t.Run("replaced victim produces no reverse hit", func(t *testing.T) {
+		logs := testutil.CaptureLogs(t)
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{{Name: "P", Arch: "noarch", Version: "1", Conflicts: []string{"R"}}},
+			[]goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}})
+		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch"}, f.downloader); err != nil {
+			t.Fatalf("FromRepo replace: %v", err)
+		}
+		if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+			t.Errorf("installed packages (-want +got):\n%s", diff)
+		}
+		if strings.Contains(logs.String(), "package_conflict") {
+			t.Errorf("unexpected package_conflict log on replaced victim:\n%s", logs.String())
+		}
+	})
+
+	t.Run("surviving victim after FetchPkg drift fails before replacement or download", func(t *testing.T) {
+		logs := testutil.CaptureLogs(t)
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{
+				{Name: "P", Arch: "x86_64", Version: "1", Conflicts: []string{"R"}},
+				{Name: "X", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			[]goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{
+					Name:            "R",
+					Arch:            "noarch",
+					Version:         "1",
+					Replaces:        []string{"P"},
+					PkgDependencies: map[string]string{"P.noarch": "1"},
+				},
+			})
+		// Corrupt R's archive so downloading R would fail with a checksum
+		// mismatch rather than the reverse conflict error.
+		f.corrupt(t, "R")
+		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+		err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader)
+		if err == nil || !strings.Contains(err.Error(), "conflict with installed package P.x86_64.1") {
+			t.Fatalf("FromRepo = %v, want reverse conflict with surviving P.x86_64.1", err)
+		}
+		if diff := cmp.Diff([]string{"P.noarch.1", "P.x86_64.1", "X.noarch.1"}, f.installed(t)); diff != "" {
+			t.Errorf("installed packages (-want +got):\n%s", diff)
+		}
+		if !f.fileExists("X") {
+			t.Errorf("X's file was removed before pre-replace reverse conflict check aborted")
+		}
+		wantLine := `package_conflict direction=reverse mode=error result=failed installed=P.x86_64.1 entry="R" incoming=R.noarch.1`
+		if got := strings.Count(logs.String(), wantLine); got != 1 {
+			t.Errorf("count of %q = %d, want 1; logs:\n%s", wantLine, got, logs.String())
+		}
+	})
+
+	t.Run("unremoved reverse victim fails pre-check without unparseable warning", func(t *testing.T) {
+		logs := testutil.CaptureLogs(t)
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1", Conflicts: []string{"Bad.noarch.notaver", "R"}},
+				{Name: "Other", Arch: "noarch", Version: "1"},
+			},
+			nil)
+		rSpec := &goolib.PkgSpec{
+			Name:     "R",
+			Arch:     "noarch",
+			Version:  "1",
+			Replaces: []string{"P.noarch.2", "Other"},
+		}
+		def := deferredChecks{rev: map[string]bool{"P.noarch": true}}
+		err := def.recheckBeforeReplacements(rSpec, ConflictError, f.db)
+		if !errors.Is(err, ErrPackageConflict) || !strings.Contains(err.Error(), "conflict with installed package P.noarch.1") {
+			t.Fatalf("recheckBeforeReplacements = %v, want ErrPackageConflict naming P.noarch.1", err)
+		}
+		if strings.Contains(logs.String(), "result=unparseable") {
+			t.Errorf("unexpected unparseable warning during pre-replace ConflictError failure:\n%s", logs.String())
+		}
+	})
+
+	t.Run("surviving victim after FetchPkg drift warns once post-replace under warn mode", func(t *testing.T) {
+		logs := testutil.CaptureLogs(t)
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{{Name: "P", Arch: "x86_64", Version: "1", Conflicts: []string{"R"}}},
+			[]goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{
+					Name:            "R",
+					Arch:            "noarch",
+					Version:         "1",
+					Replaces:        []string{"P"},
+					PkgDependencies: map[string]string{"P.noarch": "1"},
+				},
+			})
+		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictWarn})
+		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader); err != nil {
+			t.Fatalf("FromRepo under warn mode: %v", err)
+		}
+		if diff := cmp.Diff([]string{"P.x86_64.1", "R.noarch.1"}, f.installed(t)); diff != "" {
+			t.Errorf("installed packages (-want +got):\n%s", diff)
+		}
+		wantLine := `package_conflict direction=reverse mode=warn result=warned installed=P.x86_64.1 entry="R" incoming=R.noarch.1`
+		if got := strings.Count(logs.String(), wantLine); got != 1 {
+			t.Errorf("count of %q = %d, want 1; logs:\n%s", wantLine, got, logs.String())
+		}
+	})
+
+	t.Run("later Replaces cascade removes drifted reverse-conflicting arch", func(t *testing.T) {
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{
+				{Name: "Q", Arch: "noarch", Version: "1"},
+				{Name: "P", Arch: "x86_64", Version: "1", Conflicts: []string{"R"}, PkgDependencies: map[string]string{"Q": "1"}},
+			},
+			[]goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "Q", Arch: "noarch", Version: "1"},
+				{
+					Name:            "R",
+					Arch:            "noarch",
+					Version:         "1",
+					Replaces:        []string{"P", "Q"},
+					PkgDependencies: map[string]string{"P.noarch": "1"},
+				},
+			})
+		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader); err != nil {
+			t.Fatalf("FromRepo(R) = %v, want nil", err)
+		}
+		if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+			t.Errorf("installed packages (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("duplicate Replaces entries remove drifted reverse-conflicting arch", func(t *testing.T) {
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{{Name: "P", Arch: "x86_64", Version: "1", Conflicts: []string{"R"}}},
+			[]goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{
+					Name:            "R",
+					Arch:            "noarch",
+					Version:         "1",
+					Replaces:        []string{"P", "P"},
+					PkgDependencies: map[string]string{"P.noarch": "1"},
+				},
+			})
+		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader); err != nil {
+			t.Fatalf("FromRepo(R) = %v, want nil", err)
+		}
+		if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+			t.Errorf("installed packages (-want +got):\n%s", diff)
+		}
+	})
+}
+
+// TestReverseConflictForceAndReinstall checks that Options.Force never bypasses
+// ConflictError, while Reinstall continues to skip all relation checks.
+func TestReverseConflictForceAndReinstall(t *testing.T) {
+	f := newRelFixture(t,
+		[]goolib.PkgSpec{
+			{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"A"}},
+			{Name: "C", Arch: "noarch", Version: "1", Conflicts: []string{"B"}},
+		},
+		[]goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1"}})
+
+	ins := New(f.cache, f.db, Options{Force: true, PackageConflicts: ConflictError})
+	err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "A"}, "", f.rm, []string{"noarch"}, f.downloader)
+	if err == nil || !errors.Is(err, ErrPackageConflict) {
+		t.Fatalf("FromRepo with Force=true and ConflictError = %v, want ErrPackageConflict", err)
+	}
+
+	dir := t.TempDir()
+	rs := testutil.GenGoo(t, dir, f.dst, goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"})
+	err = ins.FromDisk(filepath.Join(dir, rs.Source), false)
+	if err == nil || !errors.Is(err, ErrPackageConflict) {
+		t.Fatalf("FromDisk with Force=true and ConflictError = %v, want ErrPackageConflict", err)
+	}
+
+	// Reinstall bypasses relation checks even when settings.PackageConflicts is error.
+	setPackageConflicts(t, "error")
+	psB, err := f.db.FetchPkg(goolib.PackageInfo{Name: "B", Arch: "noarch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Reinstall(t.Context(), psB, false, false, f.downloader, f.db); err != nil {
+		t.Fatalf("Reinstall(B) under packageconflicts=error: %v", err)
+	}
+}
+
+// TestReverseConflictOnDependencyFailsBeforeSubdependencies checks that a
+// reverse conflict on a dependency under ConflictError aborts before that
+// dependency's own dependencies are downloaded or installed.
+func TestReverseConflictOnDependencyFailsBeforeSubdependencies(t *testing.T) {
+	f := newRelFixture(t,
+		[]goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1", Conflicts: []string{"D"}}},
+		[]goolib.PkgSpec{
+			{Name: "R", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"D": "1"}},
+			{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"Sub": "1"}},
+			{Name: "Sub", Arch: "noarch", Version: "1"},
+		})
+	ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+	err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch"}, f.downloader)
+	if err == nil || !strings.Contains(err.Error(), "D.noarch.1") {
+		t.Fatalf("FromRepo(R) = %v, want conflict error naming D.noarch.1", err)
+	}
+	if diff := cmp.Diff([]string{"B.noarch.1"}, f.installed(t)); diff != "" {
+		t.Errorf("installed packages (-want +got):\n%s", diff)
+	}
+	if f.fileExists("Sub") {
+		t.Errorf("Sub's file was installed before D's reverse conflict aborted")
+	}
+}
+
+// TestReverseConflictUnparseableAndAtomicProvides checks malformed stored
+// versions and atomic (installed package, entry) evaluation across name and
+// multiple Provides entries.
+func TestReverseConflictUnparseableAndAtomicProvides(t *testing.T) {
+	for _, mode := range []ConflictMode{ConflictWarn, ConflictError, ConflictIgnore} {
+		t.Run("unparseable/"+mode.String(), func(t *testing.T) {
+			logs := testutil.CaptureLogs(t)
+			f := newRelFixture(t,
+				[]goolib.PkgSpec{{Name: "Q", Arch: "noarch", Version: "1", Conflicts: []string{"A.noarch.notaver"}}},
+				[]goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1"}})
+			ins := New(f.cache, f.db, Options{PackageConflicts: mode})
+			if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "A"}, "", f.rm, []string{"noarch"}, f.downloader); err != nil {
+				t.Fatalf("FromRepo under %s failed on unparseable stored conflict: %v", mode, err)
+			}
+			wantLine := fmt.Sprintf(`package_conflict direction=reverse mode=%s result=unparseable installed=Q.noarch.1 entry="A.noarch.notaver" incoming=A.noarch.1`, mode)
+			if got := strings.Count(logs.String(), wantLine); got != 1 {
+				t.Errorf("count of %q = %d, want 1; logs:\n%s", wantLine, got, logs.String())
+			}
+			if strings.Contains(logs.String(), "ERROR:") {
+				t.Errorf("unparseable conflict logged at ERROR in %s mode:\n%s", mode, logs.String())
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		incoming goolib.PkgSpec
+	}{
+		{
+			name:     "valid versioned sibling provide wins over unparseable provide",
+			incoming: goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1", Provides: []string{"virt=notaver", "virt=2.0"}},
+		},
+		{
+			name:     "unversioned sibling provide wins over unparseable provide",
+			incoming: goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1", Provides: []string{"virt=notaver", "virt"}},
+		},
+		{
+			name:     "matching both by name and provides emits one line",
+			incoming: goolib.PkgSpec{Name: "virt", Arch: "noarch", Version: "2.0", Provides: []string{"virt=2.0"}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := testutil.CaptureLogs(t)
+			f := newRelFixture(t,
+				[]goolib.PkgSpec{{Name: "Q", Arch: "noarch", Version: "1", Conflicts: []string{"virt.noarch.1.0"}}},
+				[]goolib.PkgSpec{tc.incoming})
+			ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
+			err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: tc.incoming.Name}, "", f.rm, []string{"noarch"}, f.downloader)
+			if err == nil {
+				t.Fatalf("FromRepo succeeded, want ConflictError")
+			}
+			if got := strings.Count(logs.String(), "package_conflict "); got != 1 {
+				t.Errorf("package_conflict count = %d, want 1; logs:\n%s", got, logs.String())
+			}
+		})
+	}
+}
+
+// TestLegacyWrappersHonourPackageConflicts checks that the package-level
+// FromRepo and FromDisk wrappers (including dbOnly repo installs used by
+// googet check) honour settings.PackageConflicts.
+func TestLegacyWrappersHonourPackageConflicts(t *testing.T) {
+	for _, tc := range []struct {
+		conf    string
+		wantErr bool
+	}{
+		{conf: "warn", wantErr: false},
+		{conf: "error", wantErr: true},
+		{conf: "ignore", wantErr: false},
+	} {
+		t.Run("FromRepo_dbOnly_"+tc.conf, func(t *testing.T) {
+			f := newRelFixture(t,
+				[]goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1", Conflicts: []string{"B"}}},
+				[]goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1"}})
+			setPackageConflicts(t, tc.conf)
+
+			var repoURL string
+			for u := range f.rm {
+				repoURL = u
+			}
+			err := FromRepo(t.Context(), goolib.PackageInfo{Name: "B", Arch: "noarch", Ver: "1"}, repoURL, f.cache, f.rm, []string{"noarch"}, true, false, f.downloader, f.db)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("FromRepo(dbOnly=true) with conf %q error = %v, want error: %t", tc.conf, err, tc.wantErr)
+			}
+		})
+
+		t.Run("FromDisk_"+tc.conf, func(t *testing.T) {
+			f := newRelFixture(t, []goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1", Conflicts: []string{"B"}}}, nil)
+			setPackageConflicts(t, tc.conf)
+
+			dir := t.TempDir()
+			rs := testutil.GenGoo(t, dir, f.dst, goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1"})
+			err := FromDisk(filepath.Join(dir, rs.Source), f.cache, false, false, false, f.db)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("FromDisk with conf %q error = %v, want error: %t", tc.conf, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// precheckScenario holds a single generated pre-check vs post-recheck
+// differential test case and its structural feature flags.
+type precheckScenario struct {
+	initState              client.GooGetState
+	driftState             client.GooGetState
+	rSpec                  *goolib.PkgSpec
+	hasSelfRef             bool
+	hasDotted              bool
+	hasArchlessReplacedDep bool
+}
+
+// precheckGen generates randomized package topologies for
+// TestPrecheckVerdictMatchesPostRecheck from a deterministic RNG.
+type precheckGen struct {
+	rng          *rand.Rand
+	names        []string
+	archs        []string
+	validVers    []string
+	instProvPool []string
+	instConfPool []string
+	rProvPool    []string
+	rConfPool    []string
+	repPool      []string
+}
+
+func newPrecheckGen(rng *rand.Rand) *precheckGen {
+	return &precheckGen{
+		rng:          rng,
+		names:        []string{"P", "Q", "foo", "dotted.pkg"},
+		archs:        []string{"noarch", "x86_64", "arm64"},
+		validVers:    []string{"0.5.0", "1", "1.0.0", "2.0.0", "3.0.0"},
+		instProvPool: []string{"foo", "foo=0.5.0", "foo=2.0.0", "virt", "virt=2.0.0", "P=2.0.0"},
+		instConfPool: []string{"R", "R.noarch", "R.noarch.1.0.0", "R.x86_64", "R..2.0.0", "virt", "virt..1.5.0", "R.noarch.notaver"},
+		rProvPool:    []string{"virt", "virt=1.0.0", "virt=2.0.0", "virt=notaver"},
+		rConfPool:    []string{"P", "Q", "foo", "P.noarch", "P.x86_64", "P..1.0.0", "foo..1.0.0", "virt", "virt..1.5.0", "dotted.pkg"},
+		repPool:      []string{"P", "Q", "foo", "P.noarch", "P.x86_64", "Q.noarch", "P.noarch.2.0.0", "foo..1.0.0", "dotted.pkg", "Missing"},
+	}
+}
+
+func (g *precheckGen) genSpec(name, arch string) *goolib.PkgSpec {
+	ver := g.validVers[g.rng.IntN(len(g.validVers))]
+	if g.rng.IntN(25) == 0 {
+		ver = "notaver"
+	}
+	var deps map[string]string
+	for range g.rng.IntN(3) {
+		depName := g.names[g.rng.IntN(len(g.names))]
+		depKey := depName
+		if g.rng.IntN(2) == 0 {
+			depKey = depName + "." + g.archs[g.rng.IntN(len(g.archs))]
+		}
+		if deps == nil {
+			deps = make(map[string]string)
+		}
+		deps[depKey] = "0.5.0"
+	}
+	var provs []string
+	if g.rng.IntN(3) == 0 {
+		provs = append(provs, g.instProvPool[g.rng.IntN(len(g.instProvPool))])
+	}
+	var confs []string
+	if g.rng.IntN(3) == 0 {
+		confs = append(confs, g.instConfPool[g.rng.IntN(len(g.instConfPool))])
+	}
+	return &goolib.PkgSpec{
+		Name:            name,
+		Arch:            arch,
+		Version:         ver,
+		Provides:        provs,
+		Conflicts:       confs,
+		PkgDependencies: deps,
+	}
+}
+
+// buildPickShift populates initState with a multi-arch provider and dependent
+// topology so post-replacement FetchPkg pick shifts are exercised without
+// dependency drift.
+func (g *precheckGen) buildPickShift(addTo func(*client.GooGetState, *goolib.PkgSpec), initState *client.GooGetState) (replaces, rConfs []string) {
+	pair := [][2]string{{"P", "foo"}, {"Q", "foo"}, {"Q", "P"}}[g.rng.IntN(3)]
+	provPkg, targetPkg := pair[0], pair[1]
+	highArch := []string{"arm64", "noarch"}[g.rng.IntN(2)]
+
+	pSpec := g.genSpec(provPkg, "noarch")
+	pSpec.Version = "1.0.0"
+	pSpec.Conflicts = nil
+	pSpec.PkgDependencies = nil
+	pSpec.Provides = append(pSpec.Provides, targetPkg+"=2.0.0")
+	addTo(initState, pSpec)
+
+	highSpec := g.genSpec(targetPkg, highArch)
+	highSpec.Version = "3.0.0"
+	highSpec.Conflicts = nil
+	highSpec.PkgDependencies = nil
+	addTo(initState, highSpec)
+
+	lowSpec := g.genSpec(targetPkg, "x86_64")
+	lowSpec.Version = "0.5.0"
+	lowSpec.Conflicts = nil
+	lowSpec.PkgDependencies = map[string]string{provPkg: "0.5.0"}
+	addTo(initState, lowSpec)
+
+	return []string{provPkg}, []string{targetPkg + "..1.0.0"}
+}
+
+// buildDriftVictim populates initState and driftState with an arch-less
+// Replaces topology where dependency drift adds an earlier-sorting
+// architecture and leaves the original victim installed.
+func (g *precheckGen) buildDriftVictim(addTo func(*client.GooGetState, *goolib.PkgSpec), initState, driftState *client.GooGetState) (replaces, rConfs []string) {
+	vName := []string{"P", "Q", "foo"}[g.rng.IntN(3)]
+	vSpec := g.genSpec(vName, "x86_64")
+	vSpec.Version = "1.0.0"
+	vSpec.PkgDependencies = nil
+	if g.rng.IntN(2) == 0 {
+		vSpec.Conflicts = []string{g.instConfPool[g.rng.IntN(3)]}
+	} else {
+		vSpec.Conflicts = nil
+		rConfs = append(rConfs, vName)
+	}
+	addTo(initState, vSpec)
+
+	if g.rng.IntN(2) == 0 {
+		depSpec := g.genSpec([]string{"P", "Q", "foo"}[g.rng.IntN(3)], "noarch")
+		depSpec.Version = "1.0.0"
+		depSpec.Conflicts = nil
+		depSpec.PkgDependencies = map[string]string{vName: "0.5.0"}
+		addTo(initState, depSpec)
+	}
+
+	driftArch := []string{"arm64", "noarch"}[g.rng.IntN(2)]
+	dSpec := g.genSpec(vName, driftArch)
+	dSpec.Version = "1.0.0"
+	dSpec.Conflicts = nil
+	dSpec.PkgDependencies = nil
+	addTo(driftState, dSpec)
+
+	replaces = []string{vName}
+	if g.rng.IntN(4) == 0 {
+		replaces = append(replaces, vName)
+	}
+	return replaces, rConfs
+}
+
+// buildRandom populates initState and driftState with an unconstrained random
+// installed state, optional post-checkConflicts drift rows, and random
+// Replaces and Conflicts.
+func (g *precheckGen) buildRandom(addTo func(*client.GooGetState, *goolib.PkgSpec), initState, driftState *client.GooGetState) (replaces, rConfs []string) {
+	var installedNames []string
+	for range 1 + g.rng.IntN(5) {
+		name := g.names[g.rng.IntN(len(g.names))]
+		arch := g.archs[g.rng.IntN(len(g.archs))]
+		ps := g.genSpec(name, arch)
+		before := len(*initState)
+		addTo(initState, ps)
+		if len(*initState) > before {
+			installedNames = append(installedNames, name)
+		}
+	}
+	for range 1 + g.rng.IntN(3) {
+		var cand string
+		switch {
+		case len(replaces) > 0 && g.rng.IntN(5) == 0:
+			cand = replaces[g.rng.IntN(len(replaces))]
+		case len(installedNames) > 0 && g.rng.IntN(2) == 0:
+			cand = installedNames[g.rng.IntN(len(installedNames))]
+			if g.rng.IntN(3) == 0 {
+				cand += "." + g.archs[g.rng.IntN(len(g.archs))]
+			}
+		default:
+			cand = g.repPool[g.rng.IntN(len(g.repPool))]
+		}
+		replaces = append(replaces, cand)
+	}
+	if g.rng.IntN(2) == 0 {
+		for range 1 + g.rng.IntN(2) {
+			name := g.names[g.rng.IntN(len(g.names))]
+			arch := g.archs[g.rng.IntN(len(g.archs))]
+			addTo(driftState, g.genSpec(name, arch))
+		}
+	}
+	for range g.rng.IntN(3) {
+		rConfs = append(rConfs, g.rConfPool[g.rng.IntN(len(g.rConfPool))])
+	}
+	return replaces, rConfs
+}
+
+func (g *precheckGen) nextScenario() precheckScenario {
+	seen := make(map[string]bool)
+	var sc precheckScenario
+	addTo := func(dst *client.GooGetState, ps *goolib.PkgSpec) {
+		key := ps.Name + "." + ps.Arch
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		*dst = append(*dst, client.PackageState{PackageSpec: ps})
+	}
+
+	var rProvs []string
+	for range g.rng.IntN(3) {
+		rProvs = append(rProvs, g.rProvPool[g.rng.IntN(len(g.rProvPool))])
+	}
+
+	var replaces, rConfs []string
+	switch g.rng.IntN(6) {
+	case 0:
+		replaces, rConfs = g.buildPickShift(addTo, &sc.initState)
+	case 1:
+		replaces, rConfs = g.buildDriftVictim(addTo, &sc.initState, &sc.driftState)
+	default:
+		replaces, rConfs = g.buildRandom(addTo, &sc.initState, &sc.driftState)
+	}
+
+	rVer := "1.0.0"
+	if g.rng.IntN(2) == 0 {
+		rVer = "2.0.0"
+	}
+	sc.rSpec = &goolib.PkgSpec{
+		Name:      "R",
+		Arch:      "noarch",
+		Version:   rVer,
+		Provides:  rProvs,
+		Conflicts: rConfs,
+		Replaces:  replaces,
+	}
+
+	replacedNames := make(map[string]bool, len(replaces))
+	for _, cand := range replaces {
+		replacedNames[relation.ParseRelation(cand).Name] = true
+	}
+	for _, st := range slices.Concat(sc.initState, sc.driftState) {
+		if strings.Contains(st.PackageSpec.Name, ".") {
+			sc.hasDotted = true
+		}
+		for depKey := range st.PackageSpec.PkgDependencies {
+			if relation.ParseDependency(depKey, "").Name == st.PackageSpec.Name {
+				sc.hasSelfRef = true
+			}
+			if !strings.Contains(depKey, ".") && replacedNames[depKey] {
+				sc.hasArchlessReplacedDep = true
+			}
+		}
+	}
+	return sc
+}
+
+// TestPrecheckVerdictMatchesPostRecheck differentially verifies that
+// recheckBeforeReplacements returns the same fail/no-fail verdict under both
+// ConflictError and ConflictWarn as running resolveReplacements (with DBOnly)
+// followed by recheck on a database copy, across a randomized corpus with
+// Conflicts and Provides on installed rows and on the incoming package, dotted
+// package names, self-referential dependencies, arch-less dependencies on
+// replaced names, and post-checkConflicts dependency state drift.
+func TestPrecheckVerdictMatchesPostRecheck(t *testing.T) {
+	gen := newPrecheckGen(rand.New(rand.NewPCG(5, 6)))
+
+	const numScenarios = 250
+	var (
+		subtestsRun              int
+		evaluated                int
+		fwdFails                 int
+		noDriftFwdFails          int
+		revErrorFails            int
+		warnSurvivingRevPasses   int
+		cleanPasses              int
+		repErrCases              int
+		selfRefCases             int
+		dottedCases              int
+		archlessReplacedDepCases int
+	)
+
+	for i := range numScenarios {
+		sc := gen.nextScenario()
+		for _, mode := range []ConflictMode{ConflictError, ConflictWarn} {
+			t.Run(fmt.Sprintf("scenario_%03d/%s", i, mode), func(t *testing.T) {
+				subtestsRun++
+				db := openTestDB(t)
+				if err := db.WriteStateToDB(sc.initState); err != nil {
+					t.Fatal(err)
+				}
+
+				ex, err := repoExclusions(sc.rSpec, db)
+				if err != nil {
+					return
+				}
+				var def deferredChecks
+				captureConsole(t, func() {
+					def, err = checkConflicts(sc.rSpec, ex, mode, db)
+				})
+				if err != nil {
+					return
+				}
+				// Mirror any database writes performed during dependency installation,
+				// then clone the pre-replacement state into dbCopy only for scenarios
+				// that passed initial checkConflicts.
+				if len(sc.driftState) > 0 {
+					if err := db.WriteStateToDB(sc.driftState); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				beforePre, err := db.FetchPkgs("")
+				if err != nil {
+					t.Fatal(err)
+				}
+				dbCopy := openTestDB(t)
+				if err := dbCopy.WriteStateToDB(beforePre); err != nil {
+					t.Fatal(err)
+				}
+
+				var preErr error
+				captureConsole(t, func() {
+					preErr = def.recheckBeforeReplacements(sc.rSpec, mode, db)
+				})
+				afterPre, err := db.FetchPkgs("")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diff := cmp.Diff(beforePre, afterPre, cmpopts.EquateEmpty()); diff != "" {
+					t.Fatalf("recheckBeforeReplacements mutated db (-before +after):\n%s", diff)
+				}
+
+				_, simOK := simulateReplacements(sc.rSpec, beforePre)
+				repErr := (&repoInstall{Installer: New("", dbCopy, Options{DBOnly: true, PackageConflicts: mode})}).resolveReplacements(t.Context(), sc.rSpec)
+				if simOK != (repErr == nil) {
+					t.Fatalf("simulateReplacements ok=%t, resolveReplacements err=%v", simOK, repErr)
+				}
+				if repErr != nil {
+					if preErr != nil {
+						t.Fatalf("pre-check failed (%v) when simulation did not complete (repErr=%v)", preErr, repErr)
+					}
+					repErrCases++
+					return
+				}
+
+				var postErr error
+				captureConsole(t, func() {
+					postErr = def.recheck(sc.rSpec, mode, dbCopy)
+				})
+				evaluated++
+				if sc.hasSelfRef {
+					selfRefCases++
+				}
+				if sc.hasDotted {
+					dottedCases++
+				}
+				if sc.hasArchlessReplacedDep {
+					archlessReplacedDepCases++
+				}
+
+				switch {
+				case preErr == nil && postErr != nil:
+					t.Fatalf("pre-check passed on surviving conflict (replaces=%v, conflicts=%v): postErr=%v",
+						sc.rSpec.Replaces, sc.rSpec.Conflicts, postErr)
+				case preErr != nil && postErr == nil:
+					t.Fatalf("pre-check falsely rejected clean replacement (replaces=%v, conflicts=%v): preErr=%v",
+						sc.rSpec.Replaces, sc.rSpec.Conflicts, preErr)
+				}
+
+				if preErr != nil {
+					if errors.Is(preErr, ErrPackageConflict) {
+						revErrorFails++
+					} else {
+						fwdFails++
+						if len(sc.driftState) == 0 {
+							noDriftFwdFails++
+						}
+					}
+					return
+				}
+				cleanPasses++
+				if mode == ConflictWarn && len(def.rev) > 0 {
+					afterCopy, err := dbCopy.FetchPkgs("")
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, h := range reverseConflicts(sc.rSpec, def.revSpecs(specsFromState(afterCopy)), selfExclusion(sc.rSpec)) {
+						if !h.unparseable {
+							warnSurvivingRevPasses++
+							break
+						}
+					}
+				}
+			})
+		}
+	}
+
+	if subtestsRun != numScenarios*2 {
+		return
+	}
+	t.Logf("pre-check differential corpus: scenarios=%d evaluated=%d fwdFails=%d (noDrift=%d) revErrorFails=%d warnSurvivingRevPasses=%d cleanPasses=%d repErrCases=%d selfRef=%d dotted=%d archlessReplacedDep=%d",
+		numScenarios, evaluated, fwdFails, noDriftFwdFails, revErrorFails, warnSurvivingRevPasses, cleanPasses, repErrCases, selfRefCases, dottedCases, archlessReplacedDepCases)
+	if evaluated == 0 || fwdFails == 0 || noDriftFwdFails == 0 || revErrorFails == 0 || warnSurvivingRevPasses == 0 || cleanPasses == 0 || repErrCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0 {
+		t.Errorf("degenerate pre-check differential corpus: evaluated=%d fwdFails=%d noDriftFwdFails=%d revErrorFails=%d warnSurvivingRevPasses=%d cleanPasses=%d repErrCases=%d selfRef=%d dotted=%d archlessReplacedDep=%d; want all > 0",
+			evaluated, fwdFails, noDriftFwdFails, revErrorFails, warnSurvivingRevPasses, cleanPasses, repErrCases, selfRefCases, dottedCases, archlessReplacedDepCases)
 	}
 }
