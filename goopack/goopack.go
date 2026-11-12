@@ -17,6 +17,7 @@ package main
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -342,6 +343,21 @@ func verifyFiles(gs *goolib.GooSpec, fm fileMap) error {
 	return nil
 }
 
+// checkRelations validates ps's package name and relation fields, writing
+// non-fatal warnings to w and returning an error if any fatal relation syntax
+// problem is present.
+func checkRelations(ps *goolib.PkgSpec, w io.Writer) error {
+	var fatals []error
+	for _, prob := range ps.RelationProblems() {
+		if errors.Is(prob, goolib.ErrRelationSyntax) {
+			fatals = append(fatals, prob)
+			continue
+		}
+		fmt.Fprintf(w, "Warning: %v\n", prob)
+	}
+	return errors.Join(fatals...)
+}
+
 func createPackage(gs *goolib.GooSpec, baseDir, outDir string) error {
 	switch {
 	case gs.Build.Linux != "" && runtime.GOOS == "linux":
@@ -416,6 +432,27 @@ func usage() {
 	fmt.Printf("Usage: %s <path/to/goospec>\n", filepath.Base(os.Args[0]))
 }
 
+// buildFromSpec reads specPath with varMap, checks its relation fields, and
+// writes the resulting .goo archive to outDir.
+func buildFromSpec(specPath, outDir string, varMap map[string]string, errOut io.Writer) error {
+	gs, err := goolib.ReadGooSpec(specPath, varMap)
+	if err != nil {
+		return err
+	}
+	if err := checkRelations(gs.PackageSpec, errOut); err != nil {
+		return err
+	}
+
+	baseDir := filepath.Dir(filepath.Clean(specPath))
+	if baseDir == "." {
+		baseDir, err = os.Getwd()
+		if err != nil {
+			return err
+		}
+	}
+	return createPackage(gs, baseDir, outDir)
+}
+
 func main() {
 	addFlags(os.Args[1:])
 	flag.Parse()
@@ -445,20 +482,7 @@ func main() {
 		}
 	}
 
-	varMap := populateVars()
-	gs, err := goolib.ReadGooSpec(flag.Arg(0), varMap)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	baseDir := filepath.Dir(filepath.Clean(flag.Arg(0)))
-	if baseDir == "." {
-		baseDir, err = os.Getwd()
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-	if err := createPackage(gs, baseDir, outDir); err != nil {
+	if err := buildFromSpec(flag.Arg(0), outDir, populateVars(), os.Stderr); err != nil {
 		log.Fatal(err)
 	}
 }
