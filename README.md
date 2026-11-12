@@ -39,12 +39,26 @@ proxyserver: http://address_to_proxy:port
 archs: [noarch, x86_64]
 cachelife: 10m
 stalltimeout: 5m
+strictconflicts: false
+packageconflicts: warn
 ```
 
-`stalltimeout` (a Go duration such as `5m` or `30s`, default `2m`; zero or
-negative values keep the default) is how long googet waits for a server to
-respond, or for more data during a download, before it treats the transfer as
-stalled. Raise it if your proxy scans large files before responding.
+Configuration keys in `googet.conf` are lowercase (for example, `packageconflicts`
+and `strictconflicts`; PascalCase keys are ignored).
+
+- `stalltimeout` (a Go duration such as `5m` or `30s`, default `2m`; zero or
+  negative values keep the default) is how long googet waits for a server to
+  respond, or for more data during a download, before it treats the transfer as
+  stalled. Raise it if your proxy scans large files before responding.
+- `packageconflicts` controls what happens when an already-installed package
+  declares `Conflicts` matching a package being installed:
+  - `warn` (default): log a warning and continue installing.
+  - `error`: fail the installation (normally before that package's dependencies
+    are installed).
+  - `ignore`: continue installing without printing a warning (still recorded at
+    info level in the log).
+  Reinstalling an already-installed package (`googet install -reinstall` and
+  `googet verify`) does not check package conflicts.
 
 ## Repo file
 

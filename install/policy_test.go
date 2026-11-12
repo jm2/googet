@@ -14,6 +14,7 @@ limitations under the License.
 package install
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,17 +33,125 @@ func setStrictConflicts(t *testing.T, v bool) {
 	t.Cleanup(func() { settings.StrictConflicts = old })
 }
 
+func setPackageConflicts(t *testing.T, v string) {
+	t.Helper()
+	old := settings.PackageConflicts
+	settings.PackageConflicts = v
+	t.Cleanup(func() { settings.PackageConflicts = old })
+}
+
 func TestOptionsFromSettings(t *testing.T) {
 	for _, dbOnly := range []bool{false, true} {
 		for _, strict := range []bool{false, true} {
 			for _, force := range []bool{false, true} {
-				setStrictConflicts(t, strict)
-				got := OptionsFromSettings(dbOnly, force)
-				want := Options{DBOnly: dbOnly, Force: force, StrictConflicts: strict}
-				if got != want {
-					t.Errorf("StrictConflicts=%t: OptionsFromSettings(%t, %t) = %+v, want %+v", strict, dbOnly, force, got, want)
+				for _, tc := range []struct {
+					conf       string
+					want       ConflictMode
+					wantErrLog int
+				}{
+					{conf: "", want: ConflictWarn},
+					{conf: "warn", want: ConflictWarn},
+					{conf: "error", want: ConflictError},
+					{conf: "ignore", want: ConflictIgnore},
+					{conf: "bogus", want: ConflictWarn, wantErrLog: 1},
+				} {
+					name := fmt.Sprintf("dbOnly=%t/strict=%t/force=%t/conf=%s", dbOnly, strict, force, tc.conf)
+					t.Run(name, func(t *testing.T) {
+						logs := testutil.CaptureLogs(t)
+						setStrictConflicts(t, strict)
+						setPackageConflicts(t, tc.conf)
+						got := OptionsFromSettings(dbOnly, force)
+						want := Options{DBOnly: dbOnly, Force: force, StrictConflicts: strict, PackageConflicts: tc.want}
+						if got != want {
+							t.Errorf("StrictConflicts=%t, PackageConflicts=%q: OptionsFromSettings(%t, %t) = %+v, want %+v", strict, tc.conf, dbOnly, force, got, want)
+						}
+						if errLogs := strings.Count(logs.String(), "ERROR:"); errLogs != tc.wantErrLog {
+							t.Errorf("PackageConflicts=%q: ERROR log count = %d, want %d; logs:\n%s", tc.conf, errLogs, tc.wantErrLog, logs.String())
+						}
+					})
 				}
 			}
+		}
+	}
+}
+
+// TestSettingsPackageConflictsContract verifies the cross-package contract
+// between settings.Initialize and ParseConflictMode: every value settings
+// accepts is accepted by ParseConflictMode, and every other value is normalized
+// to "".
+func TestSettingsPackageConflictsContract(t *testing.T) {
+	t.Cleanup(settings.Snapshot())
+
+	for _, tc := range []struct {
+		raw      string
+		accepted bool
+		wantMode ConflictMode
+	}{
+		{raw: "warn", accepted: true, wantMode: ConflictWarn},
+		{raw: "  WARN  ", accepted: true, wantMode: ConflictWarn},
+		{raw: "error", accepted: true, wantMode: ConflictError},
+		{raw: "ErRoR", accepted: true, wantMode: ConflictError},
+		{raw: "ignore", accepted: true, wantMode: ConflictIgnore},
+		{raw: " IGNORE ", accepted: true, wantMode: ConflictIgnore},
+		{raw: ""},
+		{raw: "   "},
+		{raw: "bogus"},
+		{raw: "strict"},
+		{raw: "false"},
+	} {
+		dir := t.TempDir()
+		yaml := "packageconflicts: \"" + tc.raw + "\"\n"
+		if err := os.WriteFile(filepath.Join(dir, "googet.conf"), []byte(yaml), 0644); err != nil {
+			t.Fatal(err)
+		}
+		settings.Initialize(dir, false)
+		if !tc.accepted {
+			if settings.PackageConflicts != "" {
+				t.Errorf("raw %q: settings.PackageConflicts = %q, want empty", tc.raw, settings.PackageConflicts)
+			}
+			continue
+		}
+		if settings.PackageConflicts == "" {
+			t.Errorf("raw %q: settings.PackageConflicts = empty, want accepted value", tc.raw)
+			continue
+		}
+		got, err := ParseConflictMode(settings.PackageConflicts)
+		if err != nil || got != tc.wantMode {
+			t.Errorf("raw %q -> settings.PackageConflicts %q: ParseConflictMode = (%v, %v), want (%v, nil)", tc.raw, settings.PackageConflicts, got, err, tc.wantMode)
+		}
+	}
+}
+
+func TestParseConflictMode(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    ConflictMode
+		wantErr bool
+	}{
+		{in: "warn", want: ConflictWarn},
+		{in: "WARN", want: ConflictWarn},
+		{in: "  Warn \t", want: ConflictWarn},
+		{in: "error", want: ConflictError},
+		{in: "ERROR", want: ConflictError},
+		{in: "ignore", want: ConflictIgnore},
+		{in: "Ignore", want: ConflictIgnore},
+		{in: "", wantErr: true},
+		{in: "   ", wantErr: true},
+		{in: "bogus", wantErr: true},
+	} {
+		got, err := ParseConflictMode(tc.in)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ParseConflictMode(%q) error = %v, want error: %t", tc.in, err, tc.wantErr)
+			continue
+		}
+		if !tc.wantErr && got != tc.want {
+			t.Errorf("ParseConflictMode(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+	for _, mode := range []ConflictMode{ConflictWarn, ConflictError, ConflictIgnore} {
+		got, err := ParseConflictMode(mode.String())
+		if err != nil || got != mode {
+			t.Errorf("ParseConflictMode(%q.String()) = %v, %v; want %v, nil", mode, got, err, mode)
 		}
 	}
 }
@@ -84,40 +193,47 @@ func TestMakeInstallFunctionUsesOptions(t *testing.T) {
 // TestInstallerNewIgnoresSettings checks that New and Installer follow Options
 // exclusively and never read settings globals.
 func TestInstallerNewIgnoresSettings(t *testing.T) {
-	for _, tc := range []struct {
-		name           string
-		settingsStrict bool
-		optsStrict     bool
-		wantErr        bool
-	}{
-		{name: "permissive Options overrides strict settings", settingsStrict: true, optsStrict: false},
-		{name: "strict Options overrides permissive settings", settingsStrict: false, optsStrict: true, wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newRelFixture(t, nil, []goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1"}})
-			// Package A owns the destination file that B installs.
-			goo := filepath.Join(f.cache, "A.noarch.1.goo")
-			writeGoo(t, goo, map[string]string{"x": "from A"})
-			ps := &goolib.PkgSpec{
-				Name:    "A",
-				Arch:    "noarch",
-				Version: "1",
-				Files:   map[string]string{"x": filepath.Join(f.dst, "B")},
-			}
-			if _, err := installPkg(goo, ps, Options{}, f.db, func(insFiles map[string]string) error {
-				return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
-			}); err != nil {
-				t.Fatal(err)
-			}
+	t.Run("permissive Options overrides strict settings", func(t *testing.T) {
+		f := newRelFixture(t, nil, []goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1"}})
+		// Package A owns B's file and also declares a reverse conflict with B.
+		goo := filepath.Join(f.cache, "A.noarch.1.goo")
+		writeGoo(t, goo, map[string]string{"x": "from A"})
+		ps := &goolib.PkgSpec{
+			Name:      "A",
+			Arch:      "noarch",
+			Version:   "1",
+			Conflicts: []string{"B"},
+			Files:     map[string]string{"x": filepath.Join(f.dst, "B")},
+		}
+		if _, err := installPkg(goo, ps, Options{}, f.db, func(insFiles map[string]string) error {
+			return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
+		}); err != nil {
+			t.Fatal(err)
+		}
 
-			setStrictConflicts(t, tc.settingsStrict)
-			ins := New(f.cache, f.db, Options{StrictConflicts: tc.optsStrict})
-			err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "B"}, "", f.rm, []string{"noarch"}, f.downloader)
-			if (err != nil) != tc.wantErr {
-				t.Fatalf("Installer.FromRepo error = %v, want error: %t", err, tc.wantErr)
-			}
-		})
-	}
+		setStrictConflicts(t, true)
+		setPackageConflicts(t, "error")
+
+		ins := New(f.cache, f.db, Options{StrictConflicts: false, PackageConflicts: ConflictIgnore})
+		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "B"}, "", f.rm, []string{"noarch"}, f.downloader); err != nil {
+			t.Fatalf("Installer.FromRepo with permissive Options failed despite settings: %v", err)
+		}
+	})
+
+	t.Run("strict Options overrides permissive settings", func(t *testing.T) {
+		f := newRelFixture(t,
+			[]goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1", Conflicts: []string{"B"}}},
+			[]goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1"}})
+
+		setStrictConflicts(t, false)
+		setPackageConflicts(t, "ignore")
+
+		ins := New(f.cache, f.db, Options{StrictConflicts: true, PackageConflicts: ConflictError})
+		err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "B"}, "", f.rm, []string{"noarch"}, f.downloader)
+		if err == nil || !strings.Contains(err.Error(), "conflict") {
+			t.Fatalf("Installer.FromRepo with ConflictError Options = %v, want conflict error", err)
+		}
+	})
 }
 
 // TestEntryPointsHonourStrictConflicts checks that FromRepo, FromDisk and

@@ -5,6 +5,8 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/googet/v2/client"
@@ -32,11 +34,45 @@ var (
 	AllowUnsafeURL bool
 	// StrictConflicts enables strict enforcement of file ownership conflicts.
 	StrictConflicts bool
+	// PackageConflicts controls how reverse package conflicts from installed
+	// packages are handled. readConf normalizes valid values ("warn", "error",
+	// or "ignore") to lowercase and resets unset or invalid values to "", so
+	// readConf only ever stores "" or a string accepted by
+	// install.ParseConflictMode.
+	PackageConflicts string
 	// Progress enables the download progress bar and install spinner on
 	// interactive terminals; set from googet.conf (default true) and
 	// overridden by an explicit -progress flag.
 	Progress = true
+	// Keep Snapshot in sync when adding package-level settings.
 )
+
+// Snapshot captures the current values of all package-level settings and
+// returns a function that restores them.
+func Snapshot() func() {
+	rootDir := RootDir
+	confirm := Confirm
+	cacheLife := CacheLife
+	lockFileMaxAge := LockFileMaxAge
+	archs := slices.Clone(Archs)
+	proxyServer := ProxyServer
+	allowUnsafeURL := AllowUnsafeURL
+	strictConflicts := StrictConflicts
+	packageConflicts := PackageConflicts
+	progress := Progress
+	return func() {
+		RootDir = rootDir
+		Confirm = confirm
+		CacheLife = cacheLife
+		LockFileMaxAge = lockFileMaxAge
+		Archs = archs
+		ProxyServer = proxyServer
+		AllowUnsafeURL = allowUnsafeURL
+		StrictConflicts = strictConflicts
+		PackageConflicts = packageConflicts
+		Progress = progress
+	}
+}
 
 // Initialize reads the initial settings.
 func Initialize(rootDir string, confirm bool) {
@@ -83,13 +119,14 @@ func RepoDir() string {
 
 // conf represents a googet configuration file.
 type conf struct {
-	Archs           []string
-	CacheLife       string
-	LockFileMaxAge  string
-	StallTimeout    string
-	ProxyServer     string
-	AllowUnsafeURL  bool
-	StrictConflicts bool
+	Archs            []string
+	CacheLife        string
+	LockFileMaxAge   string
+	StallTimeout     string
+	ProxyServer      string
+	AllowUnsafeURL   bool
+	StrictConflicts  bool
+	PackageConflicts string
 	// Progress is a pointer so an absent key keeps the default of true.
 	Progress *bool
 }
@@ -106,6 +143,7 @@ func unmarshalConfFile(filename string) (*conf, error) {
 
 // readConf initializes settings based on the configuration file at cf.
 func readConf(filename string) {
+	PackageConflicts = ""
 	gc, err := unmarshalConfFile(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -163,6 +201,14 @@ func readConf(filename string) {
 
 	AllowUnsafeURL = gc.AllowUnsafeURL
 	StrictConflicts = gc.StrictConflicts
+	if gc.PackageConflicts != "" {
+		switch pc := strings.ToLower(strings.TrimSpace(gc.PackageConflicts)); pc {
+		case "warn", "error", "ignore":
+			PackageConflicts = pc
+		default:
+			logger.Errorf("Invalid packageconflicts value %q in %s: want warn, error, or ignore; falling back to warn", gc.PackageConflicts, filename)
+		}
+	}
 	Progress = true
 	if gc.Progress != nil {
 		Progress = *gc.Progress
