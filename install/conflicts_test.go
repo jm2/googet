@@ -748,7 +748,7 @@ func TestSimulateReplacementsMatchesResolveReplacements(t *testing.T) {
 		}
 
 		simPost, simOK := simulateReplacements(rSpec, snapshot)
-		realErr := (&installer{db: db, dbOnly: true}).resolveReplacements(t.Context(), rSpec)
+		realErr := (&repoInstall{Installer: New("", db, Options{DBOnly: true})}).resolveReplacements(t.Context(), rSpec)
 
 		if simOK != (realErr == nil) {
 			t.Fatalf("scenario %d (replaces=%v): simulateReplacements ok=%t, resolveReplacements err=%v", i, replaces, simOK, realErr)
