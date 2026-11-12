@@ -376,20 +376,23 @@ func TestCharacterizeCreatedParentDirsNotRecorded(t *testing.T) {
 }
 
 // TestCharacterizeConflictsCheckedBeforeReplaces pins that a package that
-// lists the same name in Conflicts and Replaces can't replace it, because
-// conflicts are checked first.
+// lists the same name in Conflicts and Replaces replaces the installed package
+// rather than failing its own conflict check.
 //
-// Known wrong: a fix should exempt replaced packages from the conflict check,
-// so installing R replaces P.
+// Intended: the row that Replaces removes is exempted from the forward
+// conflict check, so installing R replaces P and removes P's files.
 func TestCharacterizeConflictsCheckedBeforeReplaces(t *testing.T) {
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{{Name: "P", Arch: "noarch", Version: "1"}},
 		[]goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"P"}, Replaces: []string{"P"}}})
-	if err := f.install(t, "R"); err == nil || !strings.Contains(err.Error(), "conflict") {
-		t.Errorf("install R = %v, want a conflict error (today Conflicts is checked before Replaces)", err)
+	if err := f.install(t, "R"); err != nil {
+		t.Fatalf("install R: %v", err)
 	}
-	if diff := cmp.Diff([]string{"P.noarch.1"}, f.installed(t)); diff != "" {
+	if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages (-want +got):\n%s", diff)
+	}
+	if f.fileExists("P") {
+		t.Errorf("P's file still exists after replacement")
 	}
 }
 
