@@ -148,7 +148,7 @@ func (f *relFixture) installArchive(t *testing.T, name string, contents, files m
 	goo := filepath.Join(f.cache, name+".noarch.1.goo")
 	writeGoo(t, goo, contents)
 	ps := &goolib.PkgSpec{Name: name, Arch: "noarch", Version: "1", Files: files}
-	installed, err := installPkg(goo, ps, false, policy{}, f.db, func(insFiles map[string]string) error {
+	installed, err := installPkg(goo, ps, Options{}, f.db, func(insFiles map[string]string) error {
 		return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
 	})
 	if err != nil {
@@ -443,7 +443,7 @@ func TestCharacterizeReplacesVersionIsMinimum(t *testing.T) {
 		t.Run(tc.installed, func(t *testing.T) {
 			f := newRelFixture(t, []goolib.PkgSpec{{Name: "foo", Arch: "noarch", Version: tc.installed}}, nil)
 			r := &goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"foo.noarch.2.0.0"}}
-			if err := (&installer{dbOnly: true, downloader: f.downloader, db: f.db}).resolveReplacements(t.Context(), r); err != nil {
+			if err := (&repoInstall{Installer: New("", f.db, Options{DBOnly: true}), downloader: f.downloader}).resolveReplacements(t.Context(), r); err != nil {
 				t.Fatalf("resolveReplacements: %v", err)
 			}
 			if gotReplaced := len(f.installed(t)) == 0; gotReplaced != tc.wantReplaced {
