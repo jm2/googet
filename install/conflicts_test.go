@@ -483,7 +483,8 @@ func TestRecheckBeforeReplacementsLogging(t *testing.T) {
 	skipDB := openTestDB(t)
 	if err := skipDB.WriteStateToDB(client.GooGetState{
 		{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1"}},
-		{PackageSpec: &goolib.PkgSpec{Name: "dotted.pkg", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}}},
+		{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1", "B": "1"}}},
+		{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"A": "1"}}},
 	}); err != nil {
 		t.Fatal(err)
 	}

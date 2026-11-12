@@ -222,7 +222,7 @@ func simulateReplacements(ps *goolib.PkgSpec, installed client.GooGetState) (cli
 			return nil, false
 		}
 		for _, dep := range order {
-			if !drop(goolib.PkgNameSplit(dep)) {
+			if !drop(relation.SplitKey(dep)) {
 				return nil, false
 			}
 		}

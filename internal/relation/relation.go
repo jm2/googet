@@ -61,6 +61,18 @@ func ParseProvide(s string) Provide {
 	return Provide{Name: name, Ver: ver}
 }
 
+// SplitKey splits a name.arch package key, as remove.DepMap uses, into its
+// name and arch at the last dot. Architectures never contain a dot, so a
+// package name that does is kept whole. A key without a dot is a name with no
+// arch.
+func SplitKey(key string) goolib.PackageInfo {
+	i := strings.LastIndex(key, ".")
+	if i < 0 {
+		return goolib.PackageInfo{Name: key}
+	}
+	return goolib.PackageInfo{Name: key[:i], Arch: key[i+1:]}
+}
+
 // PackageInfo returns r's fields as a PackageInfo.
 func (r Requirement) PackageInfo() goolib.PackageInfo {
 	return goolib.PackageInfo{Name: r.Name, Arch: r.Arch, Ver: r.Ver}

@@ -22,6 +22,7 @@ import (
 	"log"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -230,12 +231,22 @@ func TestPlan(t *testing.T) {
 		t.Error("Plan on non-root cycle = nil, want error")
 	}
 
-	// Dotted package names fail state lookup via PkgNameSplit just like EnumerateDeps.
+	// A package name that contains a dot resolves like any other name, both
+	// as the package being removed and as a dependent.
 	dottedState := client.GooGetState{
-		{PackageSpec: &goolib.PkgSpec{Name: "dotted.pkg", Arch: "noarch", Version: "1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "dotted.pkg", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}}},
 	}
-	if _, err := Plan(goolib.PackageInfo{Name: "dotted.pkg", Arch: "noarch"}, dottedState); err == nil {
-		t.Error("Plan on dotted package name = nil, want error")
+	got, err = Plan(goolib.PackageInfo{Name: "P", Arch: "noarch"}, dottedState)
+	if err != nil {
+		t.Errorf("Plan(P) with a dotted dependent: %v", err)
+	}
+	if want := []string{"dotted.pkg.noarch"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Plan(P) = %v, want %v", got, want)
+	}
+	got, err = Plan(goolib.PackageInfo{Name: "dotted.pkg", Arch: "noarch"}, dottedState)
+	if err != nil || len(got) != 0 {
+		t.Errorf("Plan(dotted.pkg) = %v, %v; want no dependents and no error", got, err)
 	}
 	if logs.Len() != 0 {
 		t.Errorf("Plan error paths emitted unexpected log output:\n%s", logs.String())
@@ -255,4 +266,50 @@ func TestUninstallPkgMissingFromDB(t *testing.T) {
 			t.Errorf("uninstallPkg(missing, dbOnly=%t) = %v, want error containing %q", dbOnly, err, "not found in state database")
 		}
 	}
+}
+
+// TestRemoveDottedDependent checks that removing a package also removes a
+// dependent whose name contains a dot, and leaves alone an unrelated package
+// whose name is the dotted name's first segment.
+func TestRemoveDottedDependent(t *testing.T) {
+	db, err := googetdb.NewDB(filepath.Join(t.TempDir(), "googet.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.WriteStateToDB(client.GooGetState{
+		{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}}},
+		{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pi := goolib.PackageInfo{Name: "P", Arch: "noarch"}
+	deps, dl, err := EnumerateDeps(pi, db)
+	if err != nil {
+		t.Fatalf("EnumerateDeps(P): %v", err)
+	}
+	if want := []string{"P.noarch 1", "foo.bar.noarch 1"}; !reflect.DeepEqual(sorted(dl), want) {
+		t.Errorf("EnumerateDeps(P) list = %v, want %v", dl, want)
+	}
+	if err := All(context.Background(), pi, deps, true, nil, db); err != nil {
+		t.Fatalf("All(P): %v", err)
+	}
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	for _, ps := range state {
+		left = append(left, ps.PackageSpec.String())
+	}
+	if want := []string{"foo.noarch.1"}; !reflect.DeepEqual(left, want) {
+		t.Errorf("installed after removing P = %v, want %v", left, want)
+	}
+}
+
+func sorted(s []string) []string {
+	out := append([]string(nil), s...)
+	sort.Strings(out)
+	return out
 }

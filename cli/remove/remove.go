@@ -21,11 +21,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/remove"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/logger"
@@ -83,8 +86,7 @@ func (cmd *removeCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 }
 
 func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader *client.Downloader, db *googetdb.GooDB) error {
-	pi := goolib.PkgNameSplit(pkgName)
-	ps, err := db.FetchPkg(pi)
+	ps, err := lookupInstalledPkg(pkgName, db)
 	if err != nil {
 		return err
 	}
@@ -92,7 +94,7 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 		logger.Errorf("Package %q not installed, cannot remove.", pkgName)
 		return nil
 	}
-	pi = goolib.PackageInfo{Name: ps.PackageSpec.Name, Arch: ps.PackageSpec.Arch}
+	pi := goolib.PackageInfo{Name: ps.PackageSpec.Name, Arch: ps.PackageSpec.Arch}
 	deps, dl, err := remove.EnumerateDeps(pi, db)
 	if err != nil {
 		return err
@@ -121,4 +123,29 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 	}
 	fmt.Printf("Removing %s and all dependencies...\n", pi.Name)
 	return remove.All(ctx, pi, deps, cmd.dbOnly, downloader, db)
+}
+
+// lookupInstalledPkg resolves pkgName as an exact package name, a dotted-safe
+// name.arch key when the suffix is a known architecture, or a legacy
+// name.arch.version tuple. Because db.FetchPkg falls back to the last installed
+// row sharing pi.Name when Arch or Ver does not match, non-bare probes verify
+// the returned spec before accepting it.
+func lookupInstalledPkg(pkgName string, db *googetdb.GooDB) (client.PackageState, error) {
+	trimmed := strings.TrimSpace(pkgName)
+	if ps, err := db.FetchPkg(goolib.PackageInfo{Name: trimmed}); err != nil || ps.PackageSpec != nil {
+		return ps, err
+	}
+	if sk := relation.SplitKey(trimmed); sk.Arch != "" && slices.Contains(goolib.ValidArchs(), sk.Arch) {
+		ps, err := db.FetchPkg(sk)
+		if err != nil || (ps.PackageSpec != nil && ps.PackageSpec.Arch == sk.Arch) {
+			return ps, err
+		}
+		return client.PackageState{}, nil
+	}
+	pi := goolib.PkgNameSplit(trimmed)
+	ps, err := db.FetchPkg(pi)
+	if err != nil || (ps.PackageSpec != nil && ps.Match(pi)) {
+		return ps, err
+	}
+	return client.PackageState{}, nil
 }

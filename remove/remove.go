@@ -217,12 +217,12 @@ func removalOrder(deps DepMap, root string) (order, rootCycle []string, err erro
 	return order, rootCycle, nil
 }
 
-// depVersions resolves every key in dm against state via PkgNameSplit and
+// depVersions resolves every key in dm against state via relation.SplitKey and
 // returns the "name.arch version" summary list built by EnumerateDeps.
 func depVersions(dm DepMap, state client.GooGetState) ([]string, error) {
 	var dl []string
 	for k := range dm {
-		di := goolib.PkgNameSplit(k)
+		di := relation.SplitKey(k)
 		ps, err := state.GetPackageState(di)
 		if err != nil {
 			return nil, fmt.Errorf("error finding package in state file, even though the dependancy map was just built: %v", err)
@@ -233,7 +233,7 @@ func depVersions(dm DepMap, state client.GooGetState) ([]string, error) {
 }
 
 // checkResolvable verifies that every key in dm resolves in state under the
-// same PkgNameSplit lookup EnumerateDeps performs.
+// same relation.SplitKey lookup EnumerateDeps performs.
 func checkResolvable(dm DepMap, state client.GooGetState) error {
 	_, err := depVersions(dm, state)
 	return err
@@ -241,7 +241,7 @@ func checkResolvable(dm DepMap, state client.GooGetState) error {
 
 // Plan returns the dependent packages in state that All uninstalls before
 // uninstalling pi, in All's exact removal order and excluding pi itself. Each
-// element is a "name.arch" key as passed to goolib.PkgNameSplit by All; pi's
+// element is a "name.arch" key as passed to relation.SplitKey by All; pi's
 // own root key (pi.Name + "." + pi.Arch, with an empty arch suffix when
 // pi.Arch is empty) is seeded into the dependency map and then omitted from
 // order because All uninstalls pi last. Plan is pure, does not modify state,
@@ -292,7 +292,7 @@ func All(ctx context.Context, pi goolib.PackageInfo, deps DepMap, dbOnly bool, d
 		logger.Infof("%s is in a dependency cycle with %s, which is being removed; removing %s first", pkg, root, pkg)
 	}
 	for _, dep := range order {
-		if err := uninstallPkg(ctx, goolib.PkgNameSplit(dep), dbOnly, downloader, db); err != nil {
+		if err := uninstallPkg(ctx, relation.SplitKey(dep), dbOnly, downloader, db); err != nil {
 			return err
 		}
 	}
