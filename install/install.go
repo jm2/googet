@@ -15,13 +15,13 @@ limitations under the License.
 package install
 
 import (
-	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,6 +33,7 @@ import (
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
+	"github.com/google/googet/v2/internal/snapshot"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/progress"
 	"github.com/google/googet/v2/remove"
@@ -106,90 +107,95 @@ func isSatisfied(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
 	return false, nil
 }
 
-// fetchPick mirrors googetdb.GooDB.FetchPkg over an in-memory state snapshot:
-// among entries with PackageSpec.Name == pi.Name ordered bytewise by
-// (Arch, Version) to match SQLite's default BINARY collation, it returns the
-// first entry matching pi, or the last entry of that name if none matches, or
-// false if no entry has pi.Name.
-func fetchPick(pi goolib.PackageInfo, installed client.GooGetState) (client.PackageState, bool) {
-	var sameName []client.PackageState
-	for _, st := range installed {
-		if st.PackageSpec != nil && st.PackageSpec.Name == pi.Name {
-			sameName = append(sameName, st)
+// minInstalledRowIn is minInstalledRow over the installed state st.
+func minInstalledRowIn(r relation.Requirement, st client.GooGetState) (client.PackageState, bool, error) {
+	p, ok := snapshot.Pick(r.PackageInfo(), st)
+	if !ok {
+		return client.PackageState{}, false, nil
+	}
+	ok, err := r.MinInstalled(p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version)
+	if err != nil || !ok {
+		return client.PackageState{}, false, err
+	}
+	return p, true, nil
+}
+
+// satisfiedIn is isSatisfied over the installed state st: it reports whether
+// the row snapshot.Pick selects for r meets r's minimum version, or else
+// whether any installed package provides r.
+func satisfiedIn(r relation.Requirement, st client.GooGetState) (bool, error) {
+	if _, ok, err := minInstalledRowIn(r, st); err != nil || ok {
+		return ok, err
+	}
+	for _, p := range st {
+		if p.PackageSpec != nil && providesRequirement(p.PackageSpec, r) {
+			return true, nil
 		}
 	}
-	if len(sameName) == 0 {
-		return client.PackageState{}, false
-	}
-	slices.SortFunc(sameName, func(a, b client.PackageState) int {
-		return cmp.Or(
-			strings.Compare(a.PackageSpec.Arch, b.PackageSpec.Arch),
-			strings.Compare(a.PackageSpec.Version, b.PackageSpec.Version),
-		)
-	})
-	var last client.PackageState
-	for _, st := range sameName {
-		if st.Match(pi) {
-			return st, true
-		}
-		last = st
-	}
-	return last, true
+	return false, nil
 }
 
 // simulateReplacements is an exact in-memory model of resolveReplacements over
-// the database snapshot taken after dependencies are installed. It replays each
-// ps.Replaces entry sequentially over a shrinking copy of installed using the
-// same FetchPkg row selection, MinInstalled version gate, and remove.Plan
-// cascade ordering as resolveReplacements and remove.All, returning the
-// simulated post-replacement state and true on completion, or nil and false if
-// any version comparison, dependent lookup, or cycle check fails.
+// the database snapshot taken after dependencies are installed. It returns
+// the simulated post-replacement state and true on completion, or nil and
+// false if resolveReplacements would fail. See replaceRows.
 func simulateReplacements(ps *goolib.PkgSpec, installed client.GooGetState) (client.GooGetState, bool) {
-	snapshot := make(client.GooGetState, 0, len(installed))
+	post, _, err := replaceRows(ps, installed)
+	if err != nil {
+		return nil, false
+	}
+	return post, true
+}
+
+// replaceRows replays resolveReplacements for ps over installed without
+// changing anything. It processes each ps.Replaces entry in order over a
+// shrinking copy of installed, using the same FetchPkg row selection,
+// MinInstalled version gate and remove.Plan cascade order as
+// resolveReplacements and remove.All. Like remove.All, it removes each
+// entry's root last by selecting it again once the entry's dependents are
+// gone. It returns the post-replacement state and the removed rows in removal
+// order, or the error resolveReplacements would return.
+func replaceRows(ps *goolib.PkgSpec, installed client.GooGetState) (post client.GooGetState, removed []client.PackageState, err error) {
+	state := make(client.GooGetState, 0, len(installed))
 	for _, st := range installed {
 		if st.PackageSpec != nil {
-			snapshot = append(snapshot, st)
+			state = append(state, st)
 		}
 	}
-	drop := func(pi goolib.PackageInfo) bool {
-		pick, found := fetchPick(pi, snapshot)
+	drop := func(pi goolib.PackageInfo) error {
+		pick, found := snapshot.Pick(pi, state)
 		if !found {
-			return false
+			return fmt.Errorf("package %q not found in state database", pi.Name)
 		}
+		removed = append(removed, pick)
 		name, arch := pick.PackageSpec.Name, pick.PackageSpec.Arch
-		snapshot = slices.DeleteFunc(snapshot, func(st client.PackageState) bool {
+		state = slices.DeleteFunc(state, func(st client.PackageState) bool {
 			return st.PackageSpec.Name == name && st.PackageSpec.Arch == arch
 		})
-		return true
+		return nil
 	}
 	for _, raw := range ps.Replaces {
 		r := relation.ParseRelation(raw)
 		pi := r.PackageInfo()
-		pick, found := fetchPick(pi, snapshot)
-		if !found {
+		if _, ok, err := minInstalledRowIn(r, state); err != nil {
+			return nil, nil, err
+		} else if !ok {
 			continue
 		}
-		match, err := r.MinInstalled(pick.PackageSpec.Name, pick.PackageSpec.Arch, pick.PackageSpec.Version)
+		order, err := remove.Plan(pi, state)
 		if err != nil {
-			return nil, false
-		}
-		if !match {
-			continue
-		}
-		order, err := remove.Plan(pi, snapshot)
-		if err != nil {
-			return nil, false
+			return nil, nil, err
 		}
 		for _, dep := range order {
-			if !drop(relation.SplitKey(dep)) {
-				return nil, false
+			if err := drop(relation.SplitKey(dep)); err != nil {
+				return nil, nil, err
 			}
 		}
-		if !drop(pi) {
-			return nil, false
+		if err := drop(pi); err != nil {
+			return nil, nil, err
 		}
 	}
-	return snapshot, true
+	return state, removed, nil
 }
 
 const (
@@ -258,8 +264,9 @@ func (ri *repoInstall) installDeps(ctx context.Context, ps *goolib.PkgSpec, chai
 	if err != nil {
 		return err
 	}
-	// Check for and install any dependencies.
-	for p, ver := range ps.PkgDependencies {
+	// Check for and install any dependencies, in a fixed order.
+	for _, p := range slices.Sorted(maps.Keys(ps.PkgDependencies)) {
+		ver := ps.PkgDependencies[p]
 		pi := relation.ParseDependency(p, ver)
 		ok, err := isSatisfied(pi, db)
 		if err != nil {
