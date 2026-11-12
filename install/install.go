@@ -15,6 +15,7 @@ limitations under the License.
 package install
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -40,18 +41,40 @@ import (
 	"github.com/google/logger"
 )
 
+// minInstalledRow returns the installed row db.FetchPkg picks for r if it
+// satisfies r's minimum version. Keep its selection and version gate in sync
+// with simulateReplacements (covered by
+// TestSimulateReplacementsMatchesResolveReplacements).
+func minInstalledRow(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
+	p, err := db.FetchPkg(r.PackageInfo())
+	if err != nil {
+		return client.PackageState{}, false, err
+	}
+	if p.PackageSpec == nil {
+		return client.PackageState{}, false, nil
+	}
+	ok, err := r.MinInstalled(p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version)
+	if err != nil {
+		return client.PackageState{}, false, err
+	}
+	if !ok {
+		return client.PackageState{}, false, nil
+	}
+	return p, true, nil
+}
+
+// replaceVictim returns the installed package that Replaces entry r removes:
+// the single row minInstalledRow selects for r.
+func replaceVictim(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
+	return minInstalledRow(r, db)
+}
+
 // minInstalled reports whether the package r names is installed at r's
 // minimum version or later. It checks the single installed row that
 // db.FetchPkg picks for r.
 func minInstalled(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
-	p, err := db.FetchPkg(r.PackageInfo())
-	if err != nil {
-		return false, err
-	}
-	if p.PackageSpec == nil {
-		return false, nil
-	}
-	return r.MinInstalled(p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version)
+	_, ok, err := minInstalledRow(r, db)
+	return ok, err
 }
 
 // isSatisfied reports whether the package dependency is satisfied by an installed package
@@ -90,10 +113,13 @@ func pkgKey(ps *goolib.PkgSpec) string {
 }
 
 // exclusions identifies installed packages, keyed as name.arch, that a forward
-// conflict check skips because installing the incoming package overwrites them.
+// conflict check skips because installing the incoming package removes them.
 type exclusions struct {
 	// self is the incoming package's own name.arch key.
 	self string
+	// victims holds the name.arch keys of rows that Replaces entries remove
+	// during a repository install.
+	victims map[string]bool
 }
 
 // selfExclusion returns an exclusion set containing only ps itself.
@@ -101,9 +127,126 @@ func selfExclusion(ps *goolib.PkgSpec) exclusions {
 	return exclusions{self: pkgKey(ps)}
 }
 
+// repoExclusions returns the initial exclusion set for installing ps from a
+// repository, covering ps itself and the single row each Replaces entry picks.
+func repoExclusions(ps *goolib.PkgSpec, db *googetdb.GooDB) (exclusions, error) {
+	ex := selfExclusion(ps)
+	for _, pkg := range ps.Replaces {
+		v, ok, err := replaceVictim(relation.ParseRelation(pkg), db)
+		if err != nil {
+			return exclusions{}, err
+		}
+		if !ok {
+			continue
+		}
+		if ex.victims == nil {
+			ex.victims = make(map[string]bool)
+		}
+		ex.victims[pkgKey(v.PackageSpec)] = true
+	}
+	return ex, nil
+}
+
+// fetchPick mirrors googetdb.GooDB.FetchPkg over an in-memory state snapshot:
+// among entries with PackageSpec.Name == pi.Name ordered bytewise by
+// (Arch, Version) to match SQLite's default BINARY collation, it returns the
+// first entry matching pi, or the last entry of that name if none matches, or
+// false if no entry has pi.Name.
+func fetchPick(pi goolib.PackageInfo, installed client.GooGetState) (client.PackageState, bool) {
+	var sameName []client.PackageState
+	for _, st := range installed {
+		if st.PackageSpec != nil && st.PackageSpec.Name == pi.Name {
+			sameName = append(sameName, st)
+		}
+	}
+	if len(sameName) == 0 {
+		return client.PackageState{}, false
+	}
+	slices.SortFunc(sameName, func(a, b client.PackageState) int {
+		return cmp.Or(
+			strings.Compare(a.PackageSpec.Arch, b.PackageSpec.Arch),
+			strings.Compare(a.PackageSpec.Version, b.PackageSpec.Version),
+		)
+	})
+	var last client.PackageState
+	for _, st := range sameName {
+		if st.Match(pi) {
+			return st, true
+		}
+		last = st
+	}
+	return last, true
+}
+
+// simulateReplacements is an exact in-memory model of resolveReplacements over
+// the database snapshot taken after dependencies are installed. It replays each
+// ps.Replaces entry sequentially over a shrinking copy of installed using the
+// same FetchPkg row selection, MinInstalled version gate, and remove.Plan
+// cascade ordering as resolveReplacements and remove.All, returning the
+// simulated post-replacement state and true on completion, or nil and false if
+// any version comparison, dependent lookup, or cycle check fails.
+func simulateReplacements(ps *goolib.PkgSpec, installed client.GooGetState) (client.GooGetState, bool) {
+	snapshot := make(client.GooGetState, 0, len(installed))
+	for _, st := range installed {
+		if st.PackageSpec != nil {
+			snapshot = append(snapshot, st)
+		}
+	}
+	drop := func(pi goolib.PackageInfo) bool {
+		pick, found := fetchPick(pi, snapshot)
+		if !found {
+			return false
+		}
+		name, arch := pick.PackageSpec.Name, pick.PackageSpec.Arch
+		snapshot = slices.DeleteFunc(snapshot, func(st client.PackageState) bool {
+			return st.PackageSpec.Name == name && st.PackageSpec.Arch == arch
+		})
+		return true
+	}
+	for _, raw := range ps.Replaces {
+		r := relation.ParseRelation(raw)
+		pi := r.PackageInfo()
+		pick, found := fetchPick(pi, snapshot)
+		if !found {
+			continue
+		}
+		match, err := r.MinInstalled(pick.PackageSpec.Name, pick.PackageSpec.Arch, pick.PackageSpec.Version)
+		if err != nil {
+			return nil, false
+		}
+		if !match {
+			continue
+		}
+		order, err := remove.Plan(pi, snapshot)
+		if err != nil {
+			return nil, false
+		}
+		for _, dep := range order {
+			if !drop(goolib.PkgNameSplit(dep)) {
+				return nil, false
+			}
+		}
+		if !drop(pi) {
+			return nil, false
+		}
+	}
+	return snapshot, true
+}
+
 // has reports whether key is excluded from conflict checks.
 func (e exclusions) has(key string) bool {
-	return key != "" && key == e.self
+	return key != "" && (key == e.self || e.victims[key])
+}
+
+// specsFromState extracts the non-nil PkgSpec pointers from state.
+func specsFromState(state client.GooGetState) []*goolib.PkgSpec {
+	specs := make([]*goolib.PkgSpec, 0, len(state))
+	for _, st := range state {
+		if st.PackageSpec != nil {
+			specs = append(specs, st.PackageSpec)
+		}
+	}
+	return specs
 }
 
 // installedSpecs returns the non-nil package specs currently recorded in db.
@@ -112,13 +255,7 @@ func installedSpecs(db *googetdb.GooDB) ([]*goolib.PkgSpec, error) {
 	if err != nil {
 		return nil, err
 	}
-	specs := make([]*goolib.PkgSpec, 0, len(state))
-	for _, st := range state {
-		if st.PackageSpec != nil {
-			specs = append(specs, st.PackageSpec)
-		}
-	}
-	return specs, nil
+	return specsFromState(state), nil
 }
 
 // nonExcluded returns the non-nil specs in installed whose name.arch key is
@@ -181,32 +318,35 @@ func checkForwardConflict(r relation.Requirement, pick *goolib.PkgSpec, installe
 }
 
 // resolveConflicts fails if any of ps.Conflicts matches an installed row not
-// excluded by ex.
-func resolveConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) error {
+// excluded by ex. It returns the entries that passed only because a Replaces
+// victim was exempt; callers must recheck them after resolveReplacements runs.
+func resolveConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) ([]relation.Requirement, error) {
 	if len(ps.Conflicts) == 0 {
-		return nil
+		return nil, nil
 	}
 	// Check for any conflicting packages.
 	// TODO(ajackura): Make sure no conflicting packages are listed as
 	// dependencies or subdependancies.
 	installed, err := installedSpecs(db)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	selfOnly := exclusions{self: ex.self}
 	logged := make(map[string]bool)
+	var deferred []relation.Requirement
 	for _, pkg := range ps.Conflicts {
 		r := relation.ParseRelation(pkg)
 		pick, err := db.FetchPkg(r.PackageInfo())
 		if err != nil {
-			return err
+			return nil, err
 		}
 		// Check if the conflicting package or a provider of it is installed.
 		hit, exempted, err := checkForwardConflict(r, pick.PackageSpec, installed, ex)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if hit {
-			return fmt.Errorf("cannot install, conflict with installed package or provider: %s", r.PackageInfo())
+			return nil, fmt.Errorf("cannot install, conflict with installed package or provider: %s", r.PackageInfo())
 		}
 		for _, exPkg := range exempted {
 			k := pkgKey(exPkg)
@@ -214,6 +354,98 @@ func resolveConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) err
 				logged[k] = true
 				logger.Infof("conflict %q with %s skipped: installing %s removes it", pkg, exPkg, ps)
 			}
+		}
+		if len(ex.victims) > 0 {
+			selfHit, _, err := checkForwardConflict(r, pick.PackageSpec, installed, selfOnly)
+			if err != nil {
+				return nil, err
+			}
+			if selfHit {
+				deferred = append(deferred, r)
+			}
+		}
+	}
+	return deferred, nil
+}
+
+// deferredChecks holds conflict checks that passed before dependency
+// installation only because a Replaces victim was exempted, so callers can
+// verify after replacements run that no conflicting row remains installed.
+type deferredChecks struct {
+	// fwd holds parsed ps.Conflicts requirements that passed only via a victim exemption.
+	fwd []relation.Requirement
+}
+
+// checkConflicts evaluates ps's conflicts under ex and returns any checks that
+// were deferred onto Replaces removal.
+func checkConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) (deferredChecks, error) {
+	fwd, err := resolveConflicts(ps, ex, db)
+	if err != nil {
+		return deferredChecks{}, err
+	}
+	return deferredChecks{fwd: fwd}, nil
+}
+
+// recheckBeforeReplacements simulates resolveReplacements on the
+// post-dependency database snapshot and re-evaluates deferred forward conflict
+// entries against the simulated post-replacement state with self-only
+// exclusions, failing before resolveReplacements removes any package whenever
+// the post-replacement recheck would fail. If simulation does not complete
+// cleanly, it logs at info level and defers to resolveReplacements and recheck.
+func (d deferredChecks) recheckBeforeReplacements(ps *goolib.PkgSpec, db *googetdb.GooDB) error {
+	if len(d.fwd) == 0 {
+		return nil
+	}
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		return err
+	}
+	post, ok := simulateReplacements(ps, state)
+	if !ok {
+		logger.Infof("Replacement simulation for %s did not complete; deferring conflict checks until after replacements", ps)
+		return nil
+	}
+	pickFromPost := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
+		st, _ := fetchPick(pi, post)
+		return st.PackageSpec, nil
+	}
+	return recheckForwardEntries(d.fwd, ps, specsFromState(post), pickFromPost, "")
+}
+
+// recheck re-evaluates deferred conflict entries with self-only exclusions
+// after resolveReplacements completes, ensuring no exempted victim survived.
+func (d deferredChecks) recheck(ps *goolib.PkgSpec, db *googetdb.GooDB) error {
+	if len(d.fwd) == 0 {
+		return nil
+	}
+	installed, err := installedSpecs(db)
+	if err != nil {
+		return err
+	}
+	pickFromDB := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
+		st, err := db.FetchPkg(pi)
+		return st.PackageSpec, err
+	}
+	return recheckForwardEntries(d.fwd, ps, installed, pickFromDB, " (still installed after replacing)")
+}
+
+// recheckForwardEntries checks each requirement in reqs against installed
+// under selfExclusion(ps) using pickFor to resolve each requirement's primary
+// row without repeating exemption logs, appending suffix to the conflict error
+// on a hit.
+func recheckForwardEntries(reqs []relation.Requirement, ps *goolib.PkgSpec, installed []*goolib.PkgSpec, pickFor func(goolib.PackageInfo) (*goolib.PkgSpec, error), suffix string) error {
+	selfOnly := selfExclusion(ps)
+	for _, r := range reqs {
+		pick, err := pickFor(r.PackageInfo())
+		if err != nil {
+			return err
+		}
+		hit, _, err := checkForwardConflict(r, pick, installed, selfOnly)
+		if err != nil {
+			return err
+		}
+		if hit {
+			return fmt.Errorf("cannot install, conflict with installed package or provider: %s%s", r.PackageInfo(), suffix)
 		}
 	}
 	return nil
@@ -247,7 +479,9 @@ type installer struct {
 }
 
 // resolveReplacements removes the installed packages that ps replaces, along
-// with the packages that depend on them.
+// with the packages that depend on them. Keep this loop in sync with
+// simulateReplacements (covered by
+// TestSimulateReplacementsMatchesResolveReplacements).
 func (i *installer) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec) error {
 	db := i.db
 	// Check for and remove any package this replaces.
@@ -255,7 +489,7 @@ func (i *installer) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec)
 	// dependencies or subdependancies.
 	for _, pkg := range ps.Replaces {
 		r := relation.ParseRelation(pkg)
-		ins, err := minInstalled(r, db)
+		_, ins, err := replaceVictim(r, db)
 		if err != nil {
 			return err
 		}
@@ -281,7 +515,12 @@ func (i *installer) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec)
 func (i *installer) installDeps(ctx context.Context, ps *goolib.PkgSpec, chain []string) error {
 	db := i.db
 	logger.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
-	if err := resolveConflicts(ps, selfExclusion(ps), db); err != nil {
+	ex, err := repoExclusions(ps, db)
+	if err != nil {
+		return err
+	}
+	deferred, err := checkConflicts(ps, ex, db)
+	if err != nil {
 		return err
 	}
 	// Check for and install any dependencies.
@@ -312,7 +551,13 @@ func (i *installer) installDeps(ctx context.Context, ps *goolib.PkgSpec, chain [
 			return err
 		}
 	}
-	return i.resolveReplacements(ctx, ps)
+	if err := deferred.recheckBeforeReplacements(ps, db); err != nil {
+		return err
+	}
+	if err := i.resolveReplacements(ctx, ps); err != nil {
+		return err
+	}
+	return deferred.recheck(ps, db)
 }
 
 // FromRepo installs a package and all dependencies from a repository.
@@ -415,7 +660,7 @@ func FromDisk(pkgPath, cache string, dbOnly, force, shouldReinstall bool, db *go
 	logger.Infof("Starting install of %q, version %q from %q", zs.Name, zs.Version, pkgPath)
 	fmt.Printf("Installing %s %s...\n", zs.Name, zs.Version)
 
-	if err := resolveConflicts(zs, selfExclusion(zs), db); err != nil {
+	if _, err := checkConflicts(zs, selfExclusion(zs), db); err != nil {
 		return err
 	}
 	for p, ver := range zs.PkgDependencies {

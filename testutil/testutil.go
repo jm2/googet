@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -63,6 +64,17 @@ func CaptureLogs(t *testing.T) *bytes.Buffer {
 	sharedLogSink.set(&buf)
 	t.Cleanup(func() { sharedLogSink.set(nil) })
 	return &buf
+}
+
+// ScaledIterations returns n, or a tenth of n (at least 1) on Windows, for
+// randomized tests whose iterations each write a SQLite database. A SQLite
+// write transaction takes about a hundred times longer on Windows CI runners
+// than on Linux ones, and the tested logic doesn't depend on the platform.
+func ScaledIterations(n int) int {
+	if runtime.GOOS != "windows" {
+		return n
+	}
+	return max(n/10, 1)
 }
 
 // GenGoo creates a name.noarch.version.goo package file in directory dir for

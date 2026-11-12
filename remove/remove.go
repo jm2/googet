@@ -33,11 +33,18 @@ import (
 	"github.com/google/logger"
 )
 
+// uninstallPkg removes the single installed row db.FetchPkg picks for pi. Keep
+// its row selection and RemovePkg(name, arch) deletion in sync with
+// install.simulateReplacements (covered by
+// TestSimulateReplacementsMatchesResolveReplacements in package install).
 func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	logger.Infof("Executing removal of package %q", pi.Name)
 	ps, err := db.FetchPkg(pi)
 	if err != nil {
 		return fmt.Errorf("package not found in state file: %v", err)
+	}
+	if ps.PackageSpec == nil {
+		return fmt.Errorf("package %q not found in state database", pi.Name)
 	}
 
 	if !dbOnly {
@@ -126,17 +133,29 @@ func (deps DepMap) remove(name string) {
 }
 
 // build adds name.arch and, transitively, every installed package that
-// depends on it. Each package is visited once, so a dependency cycle ends,
-// and each dependent is listed once per package even if it names the
-// package by more than one dependency key.
+// depends on it, logging each visited package at info level.
 func (deps DepMap) build(name, arch string, state client.GooGetState) {
+	deps.buildWithLog(name, arch, state, logger.Infof)
+}
+
+// buildWithLog adds name.arch and, transitively, every installed package that
+// depends on it, calling logf for each visited package when logf is non-nil.
+// Each package is visited once, so a dependency cycle ends, and each dependent
+// is listed once per package even if it names the package by more than one
+// dependency key.
+func (deps DepMap) buildWithLog(name, arch string, state client.GooGetState, logf func(string, ...any)) {
 	key := name + "." + arch
 	if _, ok := deps[key]; ok {
 		return
 	}
-	logger.Infof("Building dependency map for %q", name)
+	if logf != nil {
+		logf("Building dependency map for %q", name)
+	}
 	deps[key] = nil
 	for _, p := range state {
+		if p.PackageSpec == nil {
+			continue
+		}
 		if p.PackageSpec.Name == name && p.PackageSpec.Arch == arch {
 			continue
 		}
@@ -146,7 +165,7 @@ func (deps DepMap) build(name, arch string, state client.GooGetState) {
 				if dep := n + "." + a; !slices.Contains(deps[key], dep) {
 					deps[key] = append(deps[key], dep)
 				}
-				deps.build(n, a, state)
+				deps.buildWithLog(n, a, state, logf)
 			}
 		}
 	}
@@ -198,22 +217,57 @@ func removalOrder(deps DepMap, root string) (order, rootCycle []string, err erro
 	return order, rootCycle, nil
 }
 
-// EnumerateDeps returns a DepMap and list of dependencies for a package.
-func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string, error) {
-	dm := make(DepMap)
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return nil, nil, fmt.Errorf("Error connecting to state database while building dependency map: %v", err)
-	}
-	dm.build(pi.Name, pi.Arch, state)
+// depVersions resolves every key in dm against state via PkgNameSplit and
+// returns the "name.arch version" summary list built by EnumerateDeps.
+func depVersions(dm DepMap, state client.GooGetState) ([]string, error) {
 	var dl []string
 	for k := range dm {
 		di := goolib.PkgNameSplit(k)
 		ps, err := state.GetPackageState(di)
 		if err != nil {
-			return nil, nil, fmt.Errorf("error finding package in state file, even though the dependancy map was just built: %v", err)
+			return nil, fmt.Errorf("error finding package in state file, even though the dependancy map was just built: %v", err)
 		}
 		dl = append(dl, k+" "+ps.PackageSpec.Version)
+	}
+	return dl, nil
+}
+
+// checkResolvable verifies that every key in dm resolves in state under the
+// same PkgNameSplit lookup EnumerateDeps performs.
+func checkResolvable(dm DepMap, state client.GooGetState) error {
+	_, err := depVersions(dm, state)
+	return err
+}
+
+// Plan returns the dependent packages in state that All uninstalls before
+// uninstalling pi, in All's exact removal order and excluding pi itself. Each
+// element is a "name.arch" key as passed to goolib.PkgNameSplit by All; pi's
+// own root key (pi.Name + "." + pi.Arch, with an empty arch suffix when
+// pi.Arch is empty) is seeded into the dependency map and then omitted from
+// order because All uninstalls pi last. Plan is pure, does not modify state,
+// and emits no log output; it returns an error if any entry in the dependency
+// map cannot be resolved in state or if a dependency cycle prevents removal.
+func Plan(pi goolib.PackageInfo, state client.GooGetState) (order []string, err error) {
+	dm := make(DepMap)
+	dm.buildWithLog(pi.Name, pi.Arch, state, nil)
+	if err := checkResolvable(dm, state); err != nil {
+		return nil, err
+	}
+	order, _, err = removalOrder(dm, pi.Name+"."+pi.Arch)
+	return order, err
+}
+
+// EnumerateDeps returns a DepMap and list of dependencies for a package.
+func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string, error) {
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		return nil, nil, fmt.Errorf("Error connecting to state database while building dependency map: %v", err)
+	}
+	dm := make(DepMap)
+	dm.build(pi.Name, pi.Arch, state)
+	dl, err := depVersions(dm, state)
+	if err != nil {
+		return nil, nil, err
 	}
 	return dm, dl, nil
 }
@@ -222,6 +276,10 @@ func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string,
 // will be removed first. The removal order is worked out before anything is
 // removed, so a dependency cycle that prevents it fails without removing
 // anything. deps is not modified.
+//
+// Keep the removal order and root-last execution in sync with Plan and
+// install.simulateReplacements (covered by
+// TestSimulateReplacementsMatchesResolveReplacements in package install).
 func All(ctx context.Context, pi goolib.PackageInfo, deps DepMap, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	// deps includes an entry for pi itself, which removalOrder leaves out
 	// because pi is always uninstalled at the end.

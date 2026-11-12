@@ -152,7 +152,11 @@ func (g *GooDB) RemovePkg(pkgName, arch string) error {
 	return tx.Commit()
 }
 
-// FetchPkg exports a single package from the googet database
+// FetchPkg exports a single package from the googet database.
+//
+// Keep row filtering, (pkg_arch, pkg_ver) ordering, and the last-row fallback
+// in sync with install.fetchPick (covered by TestFetchPickMatchesFetchPkg in
+// package install).
 func (g *GooDB) FetchPkg(pi goolib.PackageInfo) (client.PackageState, error) {
 	selectSpecQuery :=
 		`SELECT 
