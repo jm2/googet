@@ -14,11 +14,13 @@ limitations under the License.
 package main
 
 import (
+	"flag"
 	"io/ioutil"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/googet/v2/oswrap"
+	"github.com/google/subcommands"
 )
 
 func TestRotateLog(t *testing.T) {
@@ -92,5 +94,39 @@ func TestWantProgress(t *testing.T) {
 					tc.conf, tc.flagSet, tc.flagVal, tc.verbose, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestInstallAndUpdatePackageConflictsFlagParity checks that install and
+// update register -package_conflicts and -force with identical defaults and
+// usage strings.
+func TestInstallAndUpdatePackageConflictsFlagParity(t *testing.T) {
+	flagsByCmd := make(map[string]*flag.FlagSet)
+	subcommands.DefaultCommander.VisitCommands(func(_ *subcommands.CommandGroup, cmd subcommands.Command) {
+		switch cmd.Name() {
+		case "install", "update":
+			fs := flag.NewFlagSet(cmd.Name(), flag.ContinueOnError)
+			cmd.SetFlags(fs)
+			flagsByCmd[cmd.Name()] = fs
+		}
+	})
+	if len(flagsByCmd) != 2 {
+		t.Fatalf("found commands %v, want install and update", flagsByCmd)
+	}
+	instPC := flagsByCmd["install"].Lookup("package_conflicts")
+	updPC := flagsByCmd["update"].Lookup("package_conflicts")
+	if instPC == nil || updPC == nil {
+		t.Fatalf("package_conflicts lookup: install=%v, update=%v; want both non-nil", instPC, updPC)
+	}
+	if instPC.DefValue != "warn" || updPC.DefValue != "warn" {
+		t.Errorf("DefValue: install=%q, update=%q; want warn for both", instPC.DefValue, updPC.DefValue)
+	}
+	if instPC.Usage != updPC.Usage {
+		t.Errorf("Usage mismatch:\ninstall: %q\nupdate:  %q", instPC.Usage, updPC.Usage)
+	}
+	instForce := flagsByCmd["install"].Lookup("force")
+	updForce := flagsByCmd["update"].Lookup("force")
+	if instForce == nil || updForce == nil || instForce.Usage != updForce.Usage {
+		t.Errorf("force Usage mismatch: install=%v, update=%v", instForce, updForce)
 	}
 }

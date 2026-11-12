@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 
 	"github.com/google/googet/v2/cli"
+	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
@@ -38,18 +39,19 @@ import (
 func init() { subcommands.Register(&installCmd{}, "package management") }
 
 type installCmd struct {
-	reinstall  bool
-	redownload bool
-	dbOnly     bool
-	sources    string
-	dryRun     bool
-	force      bool
+	reinstall   bool
+	redownload  bool
+	dbOnly      bool
+	sources     string
+	dryRun      bool
+	force       bool
+	policyFlags policy.Flags
 }
 
 func (*installCmd) Name() string     { return "install" }
 func (*installCmd) Synopsis() string { return "download and install a package and its dependencies" }
 func (*installCmd) Usage() string {
-	return fmt.Sprintf("%s install [-reinstall] [-sources repo1,repo2...] [-dry_run] [-force] <name>...\n", filepath.Base(os.Args[0]))
+	return fmt.Sprintf("%s install [-reinstall] [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore] <name>...\n", filepath.Base(os.Args[0]))
 }
 
 func (cmd *installCmd) SetFlags(f *flag.FlagSet) {
@@ -58,7 +60,8 @@ func (cmd *installCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&cmd.dbOnly, "db_only", false, "only make changes to DB, don't perform install system actions")
 	f.StringVar(&cmd.sources, "sources", "", "comma separated list of sources, setting this overrides local .repo files")
 	f.BoolVar(&cmd.dryRun, "dry_run", false, "show what would be installed but do not install")
-	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config)")
+	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts)")
+	cmd.policyFlags.Register(f)
 }
 
 func (cmd *installCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...any) subcommands.ExitStatus {
@@ -84,10 +87,11 @@ func (cmd *installCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...an
 		return subcommands.ExitFailure
 	}
 
+	cache := settings.CacheDir()
 	i := &installer{
 		db:              db,
-		cache:           settings.CacheDir(),
-		dbOnly:          cmd.dbOnly,
+		cache:           cache,
+		pkgInstaller:    install.New(cache, db, cmd.policyFlags.Options(cmd.dbOnly, cmd.force)),
 		shouldReinstall: cmd.reinstall,
 		redownload:      cmd.redownload,
 		confirm:         settings.Confirm,
@@ -149,7 +153,7 @@ type installer struct {
 	cache           string             // path to cache directory
 	downloader      *client.Downloader // HTTP client
 	repoMap         client.RepoMap     // packages available for install
-	dbOnly          bool               // update database without actually installing
+	pkgInstaller    *install.Installer // Package installer configured with resolved options.
 	shouldReinstall bool               // install even if already installed
 	redownload      bool               // ignore cached downloads when reinstalling
 	confirm         bool               // prompt before changes
@@ -168,8 +172,8 @@ func (i *installer) installFromFile(path string) error {
 		fmt.Printf("Not installing %s...\n", base)
 		return nil
 	}
-	if err := install.FromDisk(path, i.cache, i.dbOnly, i.force, i.shouldReinstall, i.db); err != nil {
-		return fmt.Errorf("installing %s: %v", path, err)
+	if err := i.pkgInstaller.FromDisk(path, i.shouldReinstall); err != nil {
+		return fmt.Errorf("installing %s: %w", path, policy.WrapError(err))
 	}
 	return nil
 }
@@ -244,8 +248,8 @@ func (i *installer) installFromRepo(ctx context.Context, name string, archs []st
 		fmt.Println("canceling install...")
 		return nil
 	}
-	if err := install.FromRepo(ctx, pi, r, i.cache, i.repoMap, archs, i.dbOnly, i.force, i.downloader, i.db); err != nil {
-		return fmt.Errorf("installing %s.%s.%s: %v", pi.Name, pi.Arch, pi.Ver, err)
+	if err := i.pkgInstaller.FromRepo(ctx, pi, r, i.repoMap, archs, i.downloader); err != nil {
+		return fmt.Errorf("installing %s.%s.%s: %w", pi.Name, pi.Arch, pi.Ver, policy.WrapError(err))
 	}
 
 	return nil

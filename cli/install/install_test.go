@@ -15,13 +15,29 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/install"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
 )
+
+// newTestInstaller constructs an installer configured from current settings
+// using the same policy resolution path as installCmd.Execute.
+func newTestInstaller(db *googetdb.GooDB, cache string, downloader *client.Downloader, shouldReinstall, dryRun bool) *installer {
+	var flags policy.Flags
+	return &installer{
+		db:              db,
+		cache:           cache,
+		downloader:      downloader,
+		pkgInstaller:    install.New(cache, db, flags.Options(false, false)),
+		shouldReinstall: shouldReinstall,
+		dryRun:          dryRun,
+	}
+}
 
 // checkInstalled returns true if the test package identified by ps was
 // installed, based on whether or not the package file was written.
@@ -184,12 +200,7 @@ func TestInstall(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDownloader: %v", err)
 			}
-			i := installer{
-				db:              db,
-				cache:           t.TempDir(),
-				downloader:      downloader,
-				shouldReinstall: tc.shouldReinstall,
-			}
+			i := newTestInstaller(db, t.TempDir(), downloader, tc.shouldReinstall, false)
 			// Set up the test server.
 			gooDir, logDir := t.TempDir(), t.TempDir()
 			srv := testutil.ServeGoo(t, gooDir)
@@ -388,12 +399,7 @@ func TestInstallDryRun(t *testing.T) {
 			initialState, _ := db.FetchPkgs("")
 
 			downloader, _ := client.NewDownloader("")
-			i := &installer{
-				db:         db,
-				cache:      t.TempDir(),
-				downloader: downloader,
-				dryRun:     true,
-			}
+			i := newTestInstaller(db, t.TempDir(), downloader, false, true)
 
 			gooDir, logDir := t.TempDir(), t.TempDir()
 			srv := testutil.ServeGoo(t, gooDir)
