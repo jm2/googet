@@ -65,3 +65,47 @@ func TestFromDiskRefusesReplacedPackage(t *testing.T) {
 		})
 	}
 }
+
+// TestFromDiskCheckOrder checks the order of FromDisk's checks and their
+// error texts: conflicts first, then dependencies, then the refusal to
+// replace an installed package. Each case removes the previous case's cause.
+func TestFromDiskCheckOrder(t *testing.T) {
+	installed := []goolib.PkgSpec{
+		{Name: "C", Arch: "noarch", Version: "1"},
+		{Name: "P", Arch: "noarch", Version: "1"},
+	}
+	for _, tc := range []struct {
+		name    string
+		spec    goolib.PkgSpec
+		wantErr string
+	}{
+		{
+			name:    "conflict",
+			spec:    goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"C"}, PkgDependencies: map[string]string{"missing": "1"}, Replaces: []string{"P"}},
+			wantErr: "cannot install, conflict with installed package or provider: C",
+		},
+		{
+			name:    "dependency",
+			spec:    goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"C": "1", "missing": "2"}, Replaces: []string{"P"}},
+			wantErr: "package dependency missing  (min version 2) not installed and not provided",
+		},
+		{
+			name:    "replaces",
+			spec:    goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"C": "1"}, Replaces: []string{"P"}},
+			wantErr: "cannot install, replaces installed package, remove first then try installation again: P (installed: P.noarch.1)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRelFixture(t, installed, nil)
+			dir := t.TempDir()
+			rs := testutil.GenGoo(t, dir, f.dst, tc.spec)
+			err := FromDisk(filepath.Join(dir, rs.Source), f.cache, true, false, false, f.db)
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("FromDisk = %v, want error %q", err, tc.wantErr)
+			}
+			if diff := cmp.Diff([]string{"C.noarch.1", "P.noarch.1"}, f.installed(t)); diff != "" {
+				t.Errorf("installed packages (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
