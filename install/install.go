@@ -55,14 +55,16 @@ func minInstalledRowIn(r relation.Requirement, st client.GooGetState) (client.Pa
 }
 
 // satisfiedIn reports whether the dependency r is satisfied in the installed
-// state st: either the row snapshot.Pick selects for r meets r's minimum
-// version, or some installed package provides r.
+// state st: either some installed row meets r by package identity at r's
+// minimum version or later, or some installed package provides r.
 func satisfiedIn(r relation.Requirement, st client.GooGetState) (bool, error) {
-	if _, ok, err := minInstalledRowIn(r, st); err != nil || ok {
-		return ok, err
+	specs := specsFromState(st)
+	rows, err := relation.Resolve(r, specs)
+	if err != nil || len(rows) > 0 {
+		return len(rows) > 0, err
 	}
-	for _, p := range st {
-		if p.PackageSpec != nil && providesRequirement(p.PackageSpec, r) {
+	for _, ps := range specs {
+		if providesRequirement(ps, r) {
 			return true, nil
 		}
 	}

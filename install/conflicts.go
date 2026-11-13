@@ -22,7 +22,6 @@ import (
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
-	"github.com/google/googet/v2/internal/snapshot"
 )
 
 // pkgKey returns the database identity key (name.arch) for ps.
@@ -82,18 +81,6 @@ func specsFromState(state client.GooGetState) []*goolib.PkgSpec {
 	return specs
 }
 
-// nonExcluded returns the non-nil specs in installed whose name.arch key is
-// not in ex.
-func nonExcluded(installed []*goolib.PkgSpec, ex exclusions) []*goolib.PkgSpec {
-	out := make([]*goolib.PkgSpec, 0, len(installed))
-	for _, ps := range installed {
-		if ps != nil && !ex.has(pkgKey(ps)) {
-			out = append(out, ps)
-		}
-	}
-	return out
-}
-
 // providesRequirement reports whether ps declares a Provides entry that
 // satisfies r.
 func providesRequirement(ps *goolib.PkgSpec, r relation.Requirement) bool {
@@ -105,29 +92,19 @@ func providesRequirement(ps *goolib.PkgSpec, r relation.Requirement) bool {
 	return false
 }
 
-// checkForwardConflict evaluates a single Conflicts requirement r against the
-// primary FetchPkg candidate pick and the full installed package list under ex.
-// It returns whether an unexcluded conflict exists and any excluded rows that
-// matched r.
-func checkForwardConflict(r relation.Requirement, pick *goolib.PkgSpec, installed []*goolib.PkgSpec, ex exclusions) (hit bool, exempted []*goolib.PkgSpec, err error) {
-	if pick != nil {
-		ok, err := r.MinInstalled(pick.Name, pick.Arch, pick.Version)
-		if err != nil {
-			return false, nil, err
+// checkForwardConflict evaluates a single Conflicts requirement r against all
+// installed package specs under ex. It returns whether an unexcluded conflict
+// exists and any excluded rows that matched r.
+func checkForwardConflict(r relation.Requirement, installed []*goolib.PkgSpec, ex exclusions) (hit bool, exempted []*goolib.PkgSpec, err error) {
+	matches, err := relation.Resolve(r, installed)
+	if err != nil {
+		return false, nil, err
+	}
+	for _, m := range matches {
+		if !ex.has(pkgKey(m)) {
+			return true, exempted, nil
 		}
-		if ok {
-			if !ex.has(pkgKey(pick)) {
-				return true, nil, nil
-			}
-			exempted = append(exempted, pick)
-			others, err := relation.Resolve(r, nonExcluded(installed, ex))
-			if err != nil {
-				return false, nil, err
-			}
-			if len(others) > 0 {
-				return true, exempted, nil
-			}
-		}
+		exempted = append(exempted, m)
 	}
 	for _, inst := range installed {
 		if inst == nil || !providesRequirement(inst, r) {
@@ -158,9 +135,8 @@ func resolveConflictsIn(ps *goolib.PkgSpec, ex exclusions, st client.GooGetState
 	var deferred []relation.Requirement
 	for _, pkg := range ps.Conflicts {
 		r := relation.ParseRelation(pkg)
-		pick, _ := snapshot.Pick(r.PackageInfo(), st)
 		// Check if the conflicting package or a provider of it is installed.
-		hit, exempted, err := checkForwardConflict(r, pick.PackageSpec, installed, ex)
+		hit, exempted, err := checkForwardConflict(r, installed, ex)
 		if err != nil {
 			return nil, err
 		}
@@ -175,7 +151,7 @@ func resolveConflictsIn(ps *goolib.PkgSpec, ex exclusions, st client.GooGetState
 			}
 		}
 		if len(ex.victims) > 0 {
-			selfHit, _, err := checkForwardConflict(r, pick.PackageSpec, installed, selfOnly)
+			selfHit, _, err := checkForwardConflict(r, installed, selfOnly)
 			if err != nil {
 				return nil, err
 			}
@@ -396,11 +372,7 @@ func (d deferredChecks) recheckBeforeReplacementsIn(ps *goolib.PkgSpec, mode Con
 	}
 	postSpecs := specsFromState(post)
 	if needFwd {
-		pickFromPost := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
-			pick, _ := snapshot.Pick(pi, post)
-			return pick.PackageSpec, nil
-		}
-		if err := recheckForwardEntries(d.fwd, ps, postSpecs, pickFromPost, ""); err != nil {
+		if err := recheckForwardEntries(d.fwd, ps, postSpecs, ""); err != nil {
 			return err
 		}
 	}
@@ -429,11 +401,7 @@ func (d deferredChecks) recheckIn(ps *goolib.PkgSpec, mode ConflictMode, st clie
 	}
 	installed := specsFromState(st)
 	if len(d.fwd) > 0 {
-		pickFromState := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
-			pick, _ := snapshot.Pick(pi, st)
-			return pick.PackageSpec, nil
-		}
-		if err := recheckForwardEntries(d.fwd, ps, installed, pickFromState, " (still installed after replacing)"); err != nil {
+		if err := recheckForwardEntries(d.fwd, ps, installed, " (still installed after replacing)"); err != nil {
 			return err
 		}
 	}
@@ -445,17 +413,12 @@ func (d deferredChecks) recheckIn(ps *goolib.PkgSpec, mode ConflictMode, st clie
 }
 
 // recheckForwardEntries checks each requirement in reqs against installed
-// under selfExclusion(ps) using pickFor to resolve each requirement's primary
-// row without repeating exemption logs, appending suffix to the conflict error
-// on a hit.
-func recheckForwardEntries(reqs []relation.Requirement, ps *goolib.PkgSpec, installed []*goolib.PkgSpec, pickFor func(goolib.PackageInfo) (*goolib.PkgSpec, error), suffix string) error {
+// under selfExclusion(ps) without repeating exemption logs, appending suffix
+// to the conflict error on a hit.
+func recheckForwardEntries(reqs []relation.Requirement, ps *goolib.PkgSpec, installed []*goolib.PkgSpec, suffix string) error {
 	selfOnly := selfExclusion(ps)
 	for _, r := range reqs {
-		pick, err := pickFor(r.PackageInfo())
-		if err != nil {
-			return err
-		}
-		hit, _, err := checkForwardConflict(r, pick, installed, selfOnly)
+		hit, _, err := checkForwardConflict(r, installed, selfOnly)
 		if err != nil {
 			return err
 		}
