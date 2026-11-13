@@ -33,10 +33,8 @@ import (
 	"github.com/google/logger"
 )
 
-// uninstallPkg removes the single installed row db.FetchPkg picks for pi. Keep
-// its row selection and RemovePkg(name, arch) deletion in sync with
-// install.simulateReplacements (covered by
-// TestSimulateReplacementsMatchesResolveReplacements in package install).
+// uninstallPkg removes the single installed row db.FetchPkg picks for pi
+// (unlike UninstallRow, which removes an exact name.arch.version row).
 func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	logger.Infof("Executing removal of package %q", pi.Name)
 	ps, err := db.FetchPkg(pi)
@@ -410,6 +408,53 @@ func Plan(pi goolib.PackageInfo, state client.GooGetState) (order []string, err 
 	return order, err
 }
 
+// OrderSet returns the packages in pkgs (each formatted as "name.arch"),
+// ordered so that every package comes after every other package in pkgs that
+// depends on it in state. Packages in roots are being removed intentionally,
+// so a root's own dependencies on non-roots are ignored when breaking cycles,
+// while dependencies between roots are preserved so that a root depending on
+// another root is removed first. rootCycle lists, sorted, non-root packages in
+// pkgs that form a dependency cycle with a root. OrderSet is pure, does not
+// modify state, and returns an error if any key in pkgs is absent from state
+// or if non-root packages depend on each other in a cycle.
+func OrderSet(pkgs, roots []string, state client.GooGetState) (order, rootCycle []string, err error) {
+	if len(pkgs) == 0 {
+		return nil, nil, nil
+	}
+	byKey := make(map[string]*goolib.PkgSpec, len(state))
+	for _, st := range state {
+		if st.PackageSpec != nil {
+			byKey[st.PackageSpec.Name+"."+st.PackageSpec.Arch] = st.PackageSpec
+		}
+	}
+	inSet := make(map[string]bool, len(pkgs))
+	for _, k := range pkgs {
+		if _, ok := byKey[k]; !ok {
+			return nil, nil, fmt.Errorf("package %q not found in state database", relation.SplitKey(k).Name)
+		}
+		inSet[k] = true
+	}
+	sortedPkgs := slices.Sorted(maps.Keys(inSet))
+	deps := make(DepMap, len(sortedPkgs))
+	for _, k := range sortedPkgs {
+		ps := byKey[k]
+		deps[k] = nil
+		for _, candKey := range sortedPkgs {
+			if candKey == k {
+				continue
+			}
+			cand := byKey[candKey]
+			for depKey := range cand.PkgDependencies {
+				if relation.ParseDependency(depKey, "").SameIdentity(ps.Name, ps.Arch) {
+					deps[k] = append(deps[k], candKey)
+					break
+				}
+			}
+		}
+	}
+	return removalOrderSet(deps, roots)
+}
+
 // EnumerateDeps returns a DepMap and list of dependencies for a package.
 func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string, error) {
 	state, err := db.FetchPkgs("")
@@ -430,9 +475,8 @@ func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string,
 // removed, so a dependency cycle that prevents it fails without removing
 // anything. deps is not modified.
 //
-// Keep the removal order and root-last execution in sync with Plan and
-// install.simulateReplacements (covered by
-// TestSimulateReplacementsMatchesResolveReplacements in package install).
+// Keep the removal order and root-last execution in sync with Plan via
+// removalOrder.
 func All(ctx context.Context, pi goolib.PackageInfo, deps DepMap, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	// deps includes an entry for pi itself, which removalOrder leaves out
 	// because pi is always uninstalled at the end.

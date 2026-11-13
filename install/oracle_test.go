@@ -194,37 +194,22 @@ func minInstalledRow(r relation.Requirement, db *googetdb.GooDB) (client.Package
 	return p, true, nil
 }
 
-// replaceVictim returns the installed package that Replaces entry r removes:
-// the single row minInstalledRow selects for r.
-func replaceVictim(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
-	return minInstalledRow(r, db)
-}
-
-// resolveReplacements removes the installed packages that ps replaces, along
-// with the packages that depend on them. Keep this loop in sync with
-// simulateReplacements (covered by
-// TestSimulateReplacementsMatchesResolveReplacements).
+// resolveReplacements removes the concrete installed rows that ps replaces,
+// along with their dependent cascades ordered via remove.OrderSet, executing
+// against db via remove.UninstallRow.
 func (ri *repoInstall) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec) error {
 	db := ri.db
-	// Check for and remove any package this replaces.
-	// TODO(ajackura): Make sure no replacements are listed as
-	// dependencies or subdependancies.
-	for _, pkg := range ps.Replaces {
-		r := relation.ParseRelation(pkg)
-		_, ins, err := replaceVictim(r, db)
-		if err != nil {
-			return err
-		}
-		if !ins {
-			continue
-		}
-		pi := r.PackageInfo()
-		deps, _, err := remove.EnumerateDeps(pi, db)
-		if err != nil {
-			return err
-		}
-		logger.Infof("%s replaces %s, removing", ps, pi)
-		if err := remove.All(ctx, pi, deps, ri.opts.DBOnly, ri.downloader, db); err != nil {
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		return err
+	}
+	_, removed, err := replaceRows(ps, state)
+	if err != nil {
+		return err
+	}
+	for _, row := range removed {
+		logger.Infof("%s replaces %s, removing", ps, row.PackageSpec)
+		if err := remove.UninstallRow(ctx, row, remove.Options{DBOnly: ri.opts.DBOnly, Downloader: ri.downloader}, db); err != nil {
 			return err
 		}
 	}

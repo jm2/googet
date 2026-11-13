@@ -144,10 +144,11 @@ func versionChange(s planStep) string {
 }
 
 // removalReason says why step removes the installed package r: either one of
-// step's Replaces entries names it, or it depends on a package they name.
+// step's Replaces entries names it at its minimum version or later, or it
+// depends on a package they name.
 func removalReason(s planStep, r client.PackageState) string {
 	for _, raw := range s.spec.PackageSpec.Replaces {
-		if relation.ParseRelation(raw).SameIdentity(r.PackageSpec.Name, r.PackageSpec.Arch) {
+		if ok, err := relation.ParseRelation(raw).MinInstalled(r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version); err == nil && ok {
 			return "replaced by " + s.spec.PackageSpec.String()
 		}
 	}
