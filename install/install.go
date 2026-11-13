@@ -804,6 +804,11 @@ func listDeps(pi goolib.PackageInfo, rm client.RepoMap, repo string, dl []goolib
 }
 
 // ListDeps returns a list of dependencies and subdependancies for a package.
+//
+// Deprecated: ListDeps lists every dependency the repositories resolve,
+// whether or not it is already installed, and fails if a dependency that an
+// installed package satisfies isn't in any repository. Use Installer.Plan,
+// which lists what an install actually does.
 func ListDeps(pi goolib.PackageInfo, rm client.RepoMap, repo string, archs []string, db *googetdb.GooDB) ([]goolib.PackageInfo, error) {
 	logger.Infof("Building dependency list for %s.%s.%s", pi.Name, pi.Arch, pi.Ver)
 	return listDeps(pi, rm, repo, nil, archs, db)

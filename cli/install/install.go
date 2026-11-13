@@ -233,20 +233,20 @@ func (i *installer) installFromRepo(ctx context.Context, name string, archs []st
 		return nil
 	}
 
-	b, err := i.enumerateDeps(pi, r, archs, i.dryRun)
-	if err != nil {
-		return err
-	}
-
-	if i.dryRun {
-		fmt.Println(b.String())
-		fmt.Printf("Dry run: Would install %s.%s.%s and its dependencies if not already installed.\n", pi.Name, pi.Arch, pi.Ver)
-		return nil
-	}
-
-	if i.confirm && !cli.Confirmation(b.String()) {
-		fmt.Println("canceling install...")
-		return nil
+	if i.dryRun || i.confirm {
+		b, err := i.describePlan(pi, r, archs, i.dryRun)
+		if err != nil {
+			return fmt.Errorf("installing %s.%s.%s: %w", pi.Name, pi.Arch, pi.Ver, policy.WrapError(err))
+		}
+		if i.dryRun {
+			fmt.Println(b.String())
+			fmt.Printf("Dry run: Would install %s.%s.%s and its dependencies if not already installed.\n", pi.Name, pi.Arch, pi.Ver)
+			return nil
+		}
+		if !cli.Confirmation(b.String()) {
+			fmt.Println("canceling install...")
+			return nil
+		}
 	}
 	if err := i.pkgInstaller.FromRepo(ctx, pi, r, i.repoMap, archs, i.downloader); err != nil {
 		return fmt.Errorf("installing %s.%s.%s: %w", pi.Name, pi.Arch, pi.Ver, policy.WrapError(err))
@@ -276,22 +276,17 @@ func (i *installer) reinstall(ctx context.Context, pi goolib.PackageInfo, ps cli
 	return nil
 }
 
-func (i *installer) enumerateDeps(pi goolib.PackageInfo, r string, archs []string, dryRun bool) (*bytes.Buffer, error) {
-	dl, err := install.ListDeps(pi, i.repoMap, r, archs, i.db)
+// describePlan describes what installing pi from repo r does, for the
+// confirmation prompt or a dry run: the packages it installs, the installed
+// packages it removes and any warnings. It returns the error the install
+// would fail with, if any, without changing anything.
+func (i *installer) describePlan(pi goolib.PackageInfo, r string, archs []string, dryRun bool) (*bytes.Buffer, error) {
+	p, err := i.pkgInstaller.Plan(pi, r, i.repoMap, archs)
 	if err != nil {
-		return nil, fmt.Errorf("error listing dependencies for %s.%s.%s: %v", pi.Name, pi.Arch, pi.Ver, err)
+		return nil, err
 	}
 	var b bytes.Buffer
-	fmt.Fprintln(&b, "The following packages will be installed:")
-	for _, di := range dl {
-		ni, err := install.NeedsInstallation(di, i.db)
-		if err != nil {
-			return nil, err
-		}
-		if ni {
-			fmt.Fprintf(&b, "  %s.%s.%s\n", di.Name, di.Arch, di.Ver)
-		}
-	}
+	b.WriteString(p.String())
 	if !dryRun {
 		fmt.Fprintf(&b, "Do you wish to install %s.%s.%s and all dependencies?", pi.Name, pi.Arch, pi.Ver)
 	}
