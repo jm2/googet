@@ -22,6 +22,7 @@ package relation
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -76,6 +77,34 @@ func SplitKey(key string) goolib.PackageInfo {
 // PackageInfo returns r's fields as a PackageInfo.
 func (r Requirement) PackageInfo() goolib.PackageInfo {
 	return goolib.PackageInfo{Name: r.Name, Arch: r.Arch, Ver: r.Ver}
+}
+
+// String formats r as a human-readable requirement clause ("name[.arch][ >= ver]").
+func (r Requirement) String() string {
+	return FormatPackageRequirement(r.PackageInfo())
+}
+
+// FormatPackageRequirement formats pi as a requirement clause ("name[.arch][ >= ver]").
+func FormatPackageRequirement(pi goolib.PackageInfo) string {
+	name := pi.Name
+	if pi.Arch != "" {
+		name += "." + pi.Arch
+	}
+	if pi.Ver != "" {
+		return name + " >= " + pi.Ver
+	}
+	return name
+}
+
+// JoinSpecs formats non-nil specs with sep between name.arch.version entries.
+func JoinSpecs(specs []*goolib.PkgSpec, sep string) string {
+	parts := make([]string, 0, len(specs))
+	for _, ps := range specs {
+		if ps != nil {
+			parts = append(parts, ps.String())
+		}
+	}
+	return strings.Join(parts, sep)
 }
 
 // SameIdentity reports whether a package with the given name and arch is the
@@ -140,8 +169,144 @@ func Resolve(r Requirement, installed []*goolib.PkgSpec) ([]*goolib.PkgSpec, err
 			out = append(out, ps)
 		}
 	}
-	slices.SortFunc(out, func(a, b *goolib.PkgSpec) int {
-		return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.Arch, b.Arch))
+	slices.SortFunc(out, compareSpecs)
+	return out, nil
+}
+
+// Satisfied reports whether any non-nil spec in specs satisfies the dependency
+// requirement r, either by package identity at r's minimum version or later
+// (using Resolve) or through a Provides entry. A version comparison error on a
+// matching package identity is returned; a malformed version in a Provides
+// entry does not satisfy r and returns no error.
+func Satisfied(r Requirement, specs []*goolib.PkgSpec) (bool, error) {
+	rows, err := Resolve(r, specs)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) > 0 {
+		return true, nil
+	}
+	for _, ps := range specs {
+		if ps == nil {
+			continue
+		}
+		if providesRequirement(ps, r) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Orphan describes one dependency requirement of a remaining package that
+// removing a set of packages leaves unsatisfied.
+type Orphan struct {
+	// Dependent is the remaining package whose dependency becomes unsatisfied.
+	Dependent *goolib.PkgSpec
+	// Requirement is the unsatisfied dependency requirement.
+	Requirement Requirement
+	// Removed lists the unique packages in removing, ordered by name and arch,
+	// that satisfied Requirement before removal.
+	Removed []*goolib.PkgSpec
+	// ByName reports whether any package in removing satisfied Requirement by
+	// package identity rather than solely through Provides.
+	ByName bool
+}
+
+// Unsatisfied returns every dependency requirement of a package in remaining
+// that at least one package in removing satisfied and that no package in
+// remaining still satisfies. Nil specs are skipped, duplicate (name, arch)
+// specs are counted once, and results are ordered by dependent (name, arch)
+// and then requirement (name, arch, version). It returns an error if an
+// identity version comparison fails.
+func Unsatisfied(removing, remaining []*goolib.PkgSpec) ([]Orphan, error) {
+	remUnique := uniqueSpecs(removing)
+	remLeft := uniqueSpecs(remaining)
+	if len(remUnique) == 0 || len(remLeft) == 0 {
+		return nil, nil
+	}
+	var out []Orphan
+	for _, dep := range remLeft {
+		var seen []Requirement
+		for _, key := range slices.Sorted(maps.Keys(dep.PkgDependencies)) {
+			req := ParseDependency(key, dep.PkgDependencies[key])
+			if slices.Contains(seen, req) {
+				continue
+			}
+			seen = append(seen, req)
+
+			byIdentity, err := Resolve(req, remUnique)
+			if err != nil {
+				return nil, err
+			}
+			removed := slices.Clone(byIdentity)
+			for _, ps := range remUnique {
+				if providesRequirement(ps, req) && !containsSpec(removed, ps) {
+					removed = append(removed, ps)
+				}
+			}
+			if len(removed) == 0 {
+				continue
+			}
+			ok, err := Satisfied(req, remLeft)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				continue
+			}
+			slices.SortFunc(removed, compareSpecs)
+			out = append(out, Orphan{
+				Dependent:   dep,
+				Requirement: req,
+				Removed:     removed,
+				ByName:      len(byIdentity) > 0,
+			})
+		}
+	}
+	slices.SortFunc(out, func(a, b Orphan) int {
+		return cmp.Or(
+			compareSpecs(a.Dependent, b.Dependent),
+			strings.Compare(a.Requirement.Name, b.Requirement.Name),
+			strings.Compare(a.Requirement.Arch, b.Requirement.Arch),
+			strings.Compare(a.Requirement.Ver, b.Requirement.Ver),
+		)
 	})
 	return out, nil
+}
+
+// providesRequirement reports whether ps declares a Provides entry that
+// satisfies r without a version parse error.
+func providesRequirement(ps *goolib.PkgSpec, r Requirement) bool {
+	for _, raw := range ps.Provides {
+		ok, err := r.SatisfiedBy(ParseProvide(raw))
+		if err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// uniqueSpecs returns the non-nil specs in in, keeping the first occurrence of
+// each (name, arch) pair and sorting by name and then arch.
+func uniqueSpecs(in []*goolib.PkgSpec) []*goolib.PkgSpec {
+	var out []*goolib.PkgSpec
+	for _, ps := range in {
+		if ps != nil && !containsSpec(out, ps) {
+			out = append(out, ps)
+		}
+	}
+	slices.SortFunc(out, compareSpecs)
+	return out
+}
+
+// containsSpec reports whether list already holds a spec with ps's name and arch.
+func containsSpec(list []*goolib.PkgSpec, ps *goolib.PkgSpec) bool {
+	return slices.ContainsFunc(list, func(o *goolib.PkgSpec) bool {
+		return o.Name == ps.Name && o.Arch == ps.Arch
+	})
+}
+
+// compareSpecs orders specs lexicographically by name and then arch.
+func compareSpecs(a, b *goolib.PkgSpec) int {
+	return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.Arch, b.Arch))
 }
