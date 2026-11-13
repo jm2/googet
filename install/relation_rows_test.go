@@ -14,24 +14,18 @@ limitations under the License.
 package install
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
 )
 
-// TestCharacterizeMultiArchRowSelection pins how Conflicts, Replaces and
-// dependencies are checked when a package is installed for more than one
-// arch. minInstalled checks only the row that googetdb.FetchPkg picks: the
-// row matching the exact version asked for, or else the last row by
-// (arch, version). Because the version asked for is a minimum, that is
-// usually the last arch, whatever arch the relation names.
-//
-// Known wrong: a fix should check every installed row the relation names, so
-// that the rows marked wrong below become true.
-//
-// TODO: flip the known-wrong rows when the replace path is reworked to check
-// every installed row (planned with the dependent-aware replace).
+// TestCharacterizeMultiArchRowSelection pins how Conflicts, dependencies, and
+// the legacy minInstalled helper behave when a package is installed for more
+// than one arch. Forward Conflicts and dependency satisfaction check every
+// installed row matching the relation, while the legacy minInstalled helper
+// checks only the single row googetdb.FetchPkg selects.
 func TestCharacterizeMultiArchRowSelection(t *testing.T) {
 	f := newRelFixture(t, []goolib.PkgSpec{
 		{Name: "foo", Arch: "noarch", Version: "3"},
@@ -44,9 +38,9 @@ func TestCharacterizeMultiArchRowSelection(t *testing.T) {
 	}{
 		{rel: relation.ParseRelation("foo"), want: true, note: "Intended: no version matches the first row."},
 		{rel: relation.ParseRelation("foo.x86_64.1"), want: true, note: "Intended: exact version picks that row."},
-		{rel: relation.ParseRelation("foo.noarch.2"), want: false, note: "Known wrong: foo.noarch 3 qualifies, but the x86_64 row is checked."},
-		{rel: relation.ParseRelation("foo..2"), want: false, note: "Known wrong: foo.noarch 3 qualifies, but the x86_64 row is checked."},
-		{rel: relation.ParseDependency("foo.noarch", "2"), want: false, note: "Known wrong: foo.noarch 3 qualifies, but the x86_64 row is checked."},
+		{rel: relation.ParseRelation("foo.noarch.2"), want: false, note: "Single-pick legacy helper checks the x86_64 row."},
+		{rel: relation.ParseRelation("foo..2"), want: false, note: "Single-pick legacy helper checks the x86_64 row."},
+		{rel: relation.ParseDependency("foo.noarch", "2"), want: false, note: "Single-pick legacy helper checks the x86_64 row."},
 	} {
 		got, err := minInstalled(tc.rel, f.db)
 		if err != nil {
@@ -58,13 +52,17 @@ func TestCharacterizeMultiArchRowSelection(t *testing.T) {
 		}
 	}
 
-	// Known wrong: installed foo.noarch 3 should conflict.
+	// Installed foo.noarch 3 conflicts even though foo.x86_64 1 is also installed.
 	conflicting := &goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"foo.noarch.2"}}
-	if _, err := resolveConflicts(conflicting, exclusions{}, f.db); err != nil {
-		t.Errorf("resolveConflicts(Conflicts: foo.noarch.2) = %v, want nil (today the x86_64 row is checked)", err)
+	if _, err := resolveConflicts(conflicting, exclusions{}, f.db); err == nil || !strings.Contains(err.Error(), "foo.noarch.2") {
+		t.Errorf("resolveConflicts(Conflicts: foo.noarch.2) = %v, want conflict error naming foo.noarch.2", err)
 	}
-	// Known wrong: installed foo.noarch 3 should satisfy the dependency.
-	if ok, err := isSatisfied(relation.ParseDependency("foo.noarch", "2"), f.db); err != nil || ok {
-		t.Errorf("isSatisfied(foo.noarch >= 2) = %t, %v; want false, nil (today the x86_64 row is checked)", ok, err)
+	// Installed foo.noarch 3 satisfies foo.noarch >= 2 across multi-arch rows.
+	state, err := f.db.FetchPkgs("")
+	if err != nil {
+		t.Fatalf("FetchPkgs: %v", err)
+	}
+	if ok, err := satisfiedIn(relation.ParseDependency("foo.noarch", "2"), state); err != nil || !ok {
+		t.Errorf("satisfiedIn(foo.noarch >= 2) = %t, %v; want true, nil", ok, err)
 	}
 }

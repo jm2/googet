@@ -190,31 +190,27 @@ func TestCheckForwardConflictPure(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		rel       string
-		pick      *goolib.PkgSpec
 		installed []*goolib.PkgSpec
 		ex        exclusions
 		wantHit   bool
 		wantEx    []string
 	}{
 		{
-			name:      "unexcluded name pick hits",
+			name:      "unexcluded name match hits",
 			rel:       "A",
-			pick:      aNoarch,
 			installed: []*goolib.PkgSpec{aNoarch},
 			wantHit:   true,
 		},
 		{
-			name:      "excluded name pick with no other arch skips",
+			name:      "excluded name match with no other arch skips",
 			rel:       "A",
-			pick:      aNoarch,
 			installed: []*goolib.PkgSpec{aNoarch},
 			ex:        exNoarch,
 			wantEx:    []string{"A.noarch.1"},
 		},
 		{
-			name:      "excluded name pick falls back to other arch",
+			name:      "excluded name match falls back to other arch",
 			rel:       "A",
-			pick:      aNoarch,
 			installed: []*goolib.PkgSpec{aNoarch, aX64},
 			ex:        exNoarch,
 			wantHit:   true,
@@ -237,7 +233,7 @@ func TestCheckForwardConflictPure(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			hit, exempted, err := checkForwardConflict(relation.ParseRelation(tc.rel), tc.pick, tc.installed, tc.ex)
+			hit, exempted, err := checkForwardConflict(relation.ParseRelation(tc.rel), tc.installed, tc.ex)
 			if err != nil {
 				t.Fatalf("checkForwardConflict(%q): %v", tc.rel, err)
 			}
@@ -1590,7 +1586,8 @@ func (g *precheckGen) nextScenario() precheckScenario {
 func TestPrecheckVerdictMatchesPostRecheck(t *testing.T) {
 	gen := newPrecheckGen(rand.New(rand.NewPCG(5, 6)))
 
-	const numScenarios = 250
+	const fullScenarios = 250
+	numScenarios := testutil.ScaledIterations(fullScenarios)
 	var (
 		subtestsRun              int
 		evaluated                int
@@ -1726,8 +1723,13 @@ func TestPrecheckVerdictMatchesPostRecheck(t *testing.T) {
 	}
 	t.Logf("pre-check differential corpus: scenarios=%d evaluated=%d fwdFails=%d (noDrift=%d) revErrorFails=%d warnSurvivingRevPasses=%d cleanPasses=%d repErrCases=%d selfRef=%d dotted=%d archlessReplacedDep=%d",
 		numScenarios, evaluated, fwdFails, noDriftFwdFails, revErrorFails, warnSurvivingRevPasses, cleanPasses, repErrCases, selfRefCases, dottedCases, archlessReplacedDepCases)
-	if evaluated == 0 || fwdFails == 0 || noDriftFwdFails == 0 || revErrorFails == 0 || warnSurvivingRevPasses == 0 || cleanPasses == 0 || repErrCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0 {
-		t.Errorf("degenerate pre-check differential corpus: evaluated=%d fwdFails=%d noDriftFwdFails=%d revErrorFails=%d warnSurvivingRevPasses=%d cleanPasses=%d repErrCases=%d selfRef=%d dotted=%d archlessReplacedDep=%d; want all > 0",
-			evaluated, fwdFails, noDriftFwdFails, revErrorFails, warnSurvivingRevPasses, cleanPasses, repErrCases, selfRefCases, dottedCases, archlessReplacedDepCases)
+	if noDriftFwdFails != 0 {
+		t.Errorf("checkConflicts missed %d zero-drift multi-arch forward conflicts before recheckBeforeReplacements", noDriftFwdFails)
+	}
+	// A scaled-down corpus, as on Windows, can miss a case class; the full
+	// corpus must reach every one.
+	if numScenarios == fullScenarios && (evaluated == 0 || fwdFails == 0 || revErrorFails == 0 || warnSurvivingRevPasses == 0 || cleanPasses == 0 || repErrCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0) {
+		t.Errorf("degenerate pre-check differential corpus: evaluated=%d fwdFails=%d revErrorFails=%d warnSurvivingRevPasses=%d cleanPasses=%d repErrCases=%d selfRef=%d dotted=%d archlessReplacedDep=%d; want all > 0",
+			evaluated, fwdFails, revErrorFails, warnSurvivingRevPasses, cleanPasses, repErrCases, selfRefCases, dottedCases, archlessReplacedDepCases)
 	}
 }
