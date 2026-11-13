@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -99,12 +100,17 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 	if err != nil {
 		return err
 	}
+	orphans, err := providesOrphans(deps, db)
+	if err != nil {
+		logger.Warningf("Checking unsatisfied dependencies for %q: %v", pkgName, err)
+	}
 
 	if cmd.dryRun {
 		fmt.Println("Dry run: The following packages would be removed:")
 		for _, d := range dl {
 			fmt.Println("  " + d)
 		}
+		writeUnsatisfied(os.Stdout, orphans)
 		fmt.Printf("Dry run: Would remove %s and all dependencies.\n", pi.Name)
 		return nil
 	}
@@ -115,11 +121,18 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 		for _, d := range dl {
 			fmt.Fprintln(&b, "  "+d)
 		}
+		writeUnsatisfied(&b, orphans)
 		fmt.Fprintf(&b, "Do you wish to remove %s and all dependencies?", pi.Name)
 		if !cli.Confirmation(b.String()) {
 			fmt.Println("canceling removal...")
 			return nil
 		}
+	} else {
+		writeUnsatisfied(os.Stdout, orphans)
+	}
+	for _, o := range orphans {
+		logger.Warningf("dependency_unsatisfied op=remove result=listed dependent=%s requirement=%q removed=%s",
+			o.Dependent, o.Requirement.String(), relation.JoinSpecs(o.Removed, ","))
 	}
 	fmt.Printf("Removing %s and all dependencies...\n", pi.Name)
 	return remove.All(ctx, pi, deps, cmd.dbOnly, downloader, db)
@@ -148,4 +161,48 @@ func lookupInstalledPkg(pkgName string, db *googetdb.GooDB) (client.PackageState
 		return ps, err
 	}
 	return client.PackageState{}, nil
+}
+
+// providesOrphans returns the Provides-only dependents left with an
+// unsatisfied dependency once the packages in deps are removed from db.
+func providesOrphans(deps remove.DepMap, db *googetdb.GooDB) ([]relation.Orphan, error) {
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		return nil, err
+	}
+	var removing, remaining []*goolib.PkgSpec
+	for _, st := range state {
+		if st.PackageSpec == nil {
+			continue
+		}
+		key := st.PackageSpec.Name + "." + st.PackageSpec.Arch
+		if _, ok := deps[key]; ok {
+			removing = append(removing, st.PackageSpec)
+		} else {
+			remaining = append(remaining, st.PackageSpec)
+		}
+	}
+	orphans, err := relation.Unsatisfied(removing, remaining)
+	if err != nil {
+		return nil, err
+	}
+	var out []relation.Orphan
+	for _, o := range orphans {
+		if !o.ByName {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+
+// writeUnsatisfied formats orphans for the removal prompt, dry run, or
+// unattended console output. It writes nothing when orphans is empty.
+func writeUnsatisfied(w io.Writer, orphans []relation.Orphan) {
+	if len(orphans) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "The following packages will have an unsatisfied dependency (not removed):")
+	for _, o := range orphans {
+		fmt.Fprintf(w, "  %s (requires %s, provided by %s)\n", o.Dependent, o.Requirement.String(), relation.JoinSpecs(o.Removed, ", "))
+	}
 }
