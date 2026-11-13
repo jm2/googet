@@ -43,26 +43,31 @@ func TestBuildPlanMatchesFromRepo(t *testing.T) {
 	}
 	var failed, replaced, multiStep int
 	for _, seed := range seeds {
-		c := genCorpusCase(seed)
-		planned, live := runCase(t, c)
-		if live.Err != "" {
-			failed++
-			live.Final, live.Installs, live.Removed = nil, nil, nil
-		}
-		if len(planned.Removed) > 0 {
-			replaced++
-		}
-		if len(planned.Installs) > 1 {
-			multiStep++
-		}
-		if diff := cmp.Diff(live, planned); diff != "" {
-			t.Errorf("seed %d (%+v): plan differs from FromRepo (-FromRepo +plan):\n%s", seed, c, diff)
+		base := genCorpusCase(seed)
+		for _, om := range []OrphanMode{OrphanFail, OrphanRemove} {
+			c := base
+			c.Orphans = om
+			planned, live := runCase(t, c)
+			if live.Err != "" {
+				failed++
+				live.Final, live.Installs, live.Removed = nil, nil, nil
+			}
+			if len(planned.Removed) > 0 {
+				replaced++
+			}
+			if len(planned.Installs) > 1 {
+				multiStep++
+			}
+			if diff := cmp.Diff(live, planned); diff != "" {
+				t.Errorf("seed %d mode=%s (%+v): plan differs from FromRepo (-FromRepo +plan):\n%s", seed, om, c, diff)
+			}
 		}
 	}
-	if failed == 0 || replaced == 0 || multiStep == 0 || failed == len(seeds) {
-		t.Errorf("degenerate corpus: %d of %d failed, %d replaced packages, %d installed several packages", failed, len(seeds), replaced, multiStep)
+	total := len(seeds) * 2
+	if failed == 0 || replaced == 0 || multiStep == 0 || failed == total {
+		t.Errorf("degenerate corpus: %d of %d failed, %d replaced packages, %d installed several packages", failed, total, replaced, multiStep)
 	}
-	t.Logf("%d scenarios: %d failed, %d replaced packages, %d installed several packages", len(seeds), failed, replaced, multiStep)
+	t.Logf("%d scenarios: %d failed, %d replaced packages, %d installed several packages", total, failed, replaced, multiStep)
 }
 
 // TestBuildPlanSteps checks the steps buildPlan returns for hand-written
@@ -121,7 +126,8 @@ func TestBuildPlanSteps(t *testing.T) {
 		{
 			name: "a dependency's replacements run in its own step",
 			c: corpusCase{
-				Target: "A",
+				Target:  "A",
+				Orphans: OrphanRemove,
 				Installed: []goolib.PkgSpec{
 					{Name: "P", Arch: "noarch", Version: "1"},
 					{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
@@ -132,6 +138,22 @@ func TestBuildPlanSteps(t *testing.T) {
 				},
 			},
 			wantSteps: []string{"R.noarch.1 replacing D.noarch.1,P.noarch.1", "A.noarch.1"},
+		},
+		{
+			name: "a dependency's replacement fails in OrphanFail mode when a dependent is orphaned",
+			c: corpusCase{
+				Target:  "A",
+				Orphans: OrphanFail,
+				Installed: []goolib.PkgSpec{
+					{Name: "P", Arch: "noarch", Version: "1"},
+					{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+				},
+				Available: []goolib.PkgSpec{
+					{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"R": "1"}},
+					{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}},
+				},
+			},
+			want: trace{Err: "replacing would leave installed packages with an unsatisfied dependency: D.noarch.1 (requires P >= 1, broken by removing P.noarch.1 for R.noarch.1) (evaluated at each replacement step before later packages in the same run are installed)"},
 		},
 		{
 			name: "a dependency cycle fails before any step",
@@ -151,7 +173,7 @@ func TestBuildPlanSteps(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			p, err := buildPlan(planTarget{pi: goolib.PackageInfo{Name: tc.c.Target}}, f.rm, state, corpusArchs, planPolicy{}, &recordingSink{})
+			p, err := buildPlan(planTarget{pi: goolib.PackageInfo{Name: tc.c.Target}}, f.rm, state, corpusArchs, planPolicy{conflicts: tc.c.Mode, orphans: tc.c.Orphans}, &recordingSink{})
 			if tc.want.Err != "" {
 				if err == nil || err.Error() != tc.want.Err {
 					t.Fatalf("buildPlan = %v, want error %q", err, tc.want.Err)
@@ -314,25 +336,28 @@ func TestSatisfiedInMatchesIsSatisfied(t *testing.T) {
 // reads or writes the database, the file system, the logger or settings, and
 // prints nothing, so that planning has no side effects.
 func TestPlannerIsPure(t *testing.T) {
-	f, err := parser.ParseFile(token.NewFileSet(), "plan.go", nil, parser.ImportsOnly)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, imp := range f.Imports {
-		path := strings.Trim(imp.Path.Value, `"`)
-		for _, banned := range []string{"os", "github.com/google/googet/v2/googetdb", "github.com/google/logger", "github.com/google/googet/v2/download", "github.com/google/googet/v2/system", "github.com/google/googet/v2/settings", "github.com/google/googet/v2/oswrap"} {
-			if path == banned {
-				t.Errorf("plan.go imports %s", path)
+	for _, filename := range []string{"plan.go", "orphans.go"} {
+		f, err := parser.ParseFile(token.NewFileSet(), filename, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, imp := range f.Imports {
+			path := strings.Trim(imp.Path.Value, `"`)
+			for _, banned := range []string{"os", "github.com/google/googet/v2/googetdb", "github.com/google/logger", "github.com/google/googet/v2/download", "github.com/google/googet/v2/system", "github.com/google/googet/v2/settings", "github.com/google/googet/v2/oswrap"} {
+				if path == banned {
+					t.Errorf("%s imports %s", filename, path)
+				}
 			}
 		}
-	}
-	src, err := os.ReadFile("plan.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, call := range []string{"fmt.Print", "fmt.Fprint"} {
-		if strings.Contains(string(src), call) {
-			t.Errorf("plan.go calls %s", call)
+		src, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(src), "fmt.Print") {
+			t.Errorf("%s calls fmt.Print*", filename)
+		}
+		if filename == "plan.go" && strings.Contains(string(src), "fmt.Fprint") {
+			t.Errorf("%s calls fmt.Fprint*", filename)
 		}
 	}
 }

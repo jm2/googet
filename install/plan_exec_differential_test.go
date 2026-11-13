@@ -40,7 +40,8 @@ func TestPlanMatchesNonDBOnlyExecutionFilesAndCache(t *testing.T) {
 				{Name: "T", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"B": "1"}, Replaces: []string{"P"}},
 				{Name: "B", Arch: "noarch", Version: "1"},
 			},
-			Target: "T",
+			Target:  "T",
+			Orphans: OrphanRemove,
 		},
 		{
 			Installed: []goolib.PkgSpec{
@@ -52,7 +53,19 @@ func TestPlanMatchesNonDBOnlyExecutionFilesAndCache(t *testing.T) {
 				{Name: "A", Arch: "noarch", Version: "2", PkgDependencies: map[string]string{"R": "1"}},
 				{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}},
 			},
-			Target: "A",
+			Target:  "A",
+			Orphans: OrphanRemove,
+		},
+		{
+			// Default OrphanFail keeps dependents satisfied by the replacer's Provides.
+			Installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			Available: []goolib.PkgSpec{
+				{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}, Provides: []string{"P=1"}},
+			},
+			Target: "R",
 		},
 		{
 			// Self-replacing package shares its cached archive with the removed copy.
@@ -80,7 +93,7 @@ func TestPlanMatchesNonDBOnlyExecutionFilesAndCache(t *testing.T) {
 
 	for idx, c := range scenarios {
 		f := newRelFixture(t, c.Installed, c.Available)
-		ins := New(f.cache, f.db, Options{PackageConflicts: c.Mode})
+		ins := New(f.cache, f.db, Options{PackageConflicts: c.Mode, OrphanedDependents: c.Orphans})
 
 		logs := testutil.CaptureLogs(t)
 		var planned *Plan

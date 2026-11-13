@@ -142,7 +142,7 @@ func TestSubprocessKillAndInterruptDuringReplace(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			conf := "allowunsafeurl: true\narchs: [noarch, x86_64]\n"
+			conf := "allowunsafeurl: true\narchs: [noarch, x86_64]\norphaneddependents: remove\n"
 			if err := os.WriteFile(filepath.Join(rootDir, "googet.conf"), []byte(conf), 0644); err != nil {
 				t.Fatal(err)
 			}

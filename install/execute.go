@@ -17,11 +17,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/download"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/remove"
 	"github.com/google/logger"
@@ -83,7 +85,7 @@ func (ri *repoInstall) fromRepo(ctx context.Context, pi goolib.PackageInfo, repo
 	if err != nil {
 		return err
 	}
-	p, err := buildPlan(planTarget{pi: pi, repo: repo}, ri.rm, state, ri.archs, planPolicy{conflicts: ri.opts.PackageConflicts}, liveSink{})
+	p, err := buildPlan(planTarget{pi: pi, repo: repo}, ri.rm, state, ri.archs, planPolicy{conflicts: ri.opts.PackageConflicts, orphans: ri.opts.OrphanedDependents}, liveSink{})
 	if err != nil {
 		return err
 	}
@@ -186,6 +188,13 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 		if err := ri.atStage(stageBeforeReplace, ps.String()); err != nil {
 			return err
 		}
+		if len(s.listed) > 0 {
+			writeListedOrphans(os.Stdout, ps, s.listed)
+			for _, o := range s.listed {
+				logger.Warningf("dependency_unsatisfied op=replace result=listed dependent=%s requirement=%q removed=%s replacer=%s",
+					o.Dependent, o.Requirement, relation.JoinSpecs(o.Removed, ","), ps)
+			}
+		}
 		var err error
 		rec, err = ri.removeReplaced(ctx, s)
 		if err != nil {
@@ -269,13 +278,13 @@ func (ri *repoInstall) checkRemovals(s planStep) error {
 	if err != nil {
 		return err
 	}
-	_, now, err := replaceRows(s.spec.PackageSpec, state)
-	if err == nil && slices.EqualFunc(now, s.removed, func(a, b client.PackageState) bool {
+	out, err := planReplacement(s.spec.PackageSpec, state)
+	if err == nil && (ri.opts.OrphanedDependents != OrphanFail || len(out.orphans) == 0) && slices.EqualFunc(out.removed, s.removed, func(a, b client.PackageState) bool {
 		return pkgKey(a.PackageSpec) == pkgKey(b.PackageSpec)
 	}) {
 		return nil
 	}
-	return ri.divergence(s, "removal-set", fmt.Sprintf("planned to remove %s, would now remove %s (%v)", rowKeys(s.removed), rowKeys(now), err))
+	return ri.divergence(s, "removal-set", fmt.Sprintf("planned to remove %s, would now remove %s (%v)", rowKeys(s.removed), rowKeys(out.removed), err))
 }
 
 // recheckConflicts fails if a conflict check that the plan deferred until

@@ -11,6 +11,7 @@ import (
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
+	"gopkg.in/yaml.v3"
 )
 
 func TestInitialize(t *testing.T) {
@@ -209,6 +210,7 @@ func TestSnapshotRestoresAllGlobals(t *testing.T) {
 	settings.AllowUnsafeURL = true
 	settings.StrictConflicts = true
 	settings.PackageConflicts = "error"
+	settings.OrphanedDependents = "remove"
 	settings.Progress = false
 
 	restore := settings.Snapshot()
@@ -243,7 +245,143 @@ func TestSnapshotRestoresAllGlobals(t *testing.T) {
 	if got, want := settings.PackageConflicts, "error"; got != want {
 		t.Errorf("settings.PackageConflicts = %q, want %q", got, want)
 	}
+	if got, want := settings.OrphanedDependents, "remove"; got != want {
+		t.Errorf("settings.OrphanedDependents = %q, want %q", got, want)
+	}
 	if got, want := settings.Progress, false; got != want {
 		t.Errorf("settings.Progress = %t, want %t", got, want)
+	}
+}
+
+func TestOrphanedDependentsParsingAndReset(t *testing.T) {
+	t.Cleanup(settings.Snapshot())
+	for _, tc := range []struct {
+		name      string
+		yaml      string
+		want      string
+		wantErrCt int
+	}{
+		{name: "absent key", yaml: "cachelife: 10m\n", want: ""},
+		{name: "lowercase fail", yaml: "orphaneddependents: fail\n", want: "fail"},
+		{name: "lowercase remove", yaml: "orphaneddependents: remove\n", want: "remove"},
+		{name: "mixed case and whitespace remove", yaml: "orphaneddependents: \"  ReMoVe \"\n", want: "remove"},
+		{name: "uppercase fail", yaml: "orphaneddependents: FAIL\n", want: "fail"},
+		{name: "PascalCase key ignored", yaml: "OrphanedDependents: remove\n", want: ""},
+		{name: "unknown extra key ignored", yaml: "futurekey: 123\norphaneddependents: remove\n", want: "remove"},
+		{name: "invalid value logs error once and falls back to empty", yaml: "orphaneddependents: bogus\n", want: "", wantErrCt: 1},
+		{name: "whitespace-only value logs error once and falls back to empty", yaml: "orphaneddependents: \"   \"\n", want: "", wantErrCt: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := testutil.CaptureLogs(t)
+			rootDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(rootDir, "googet.conf"), []byte(tc.yaml), 0644); err != nil {
+				t.Fatal(err)
+			}
+			settings.Initialize(rootDir, false)
+			if settings.OrphanedDependents != tc.want {
+				t.Errorf("settings.OrphanedDependents = %q, want %q", settings.OrphanedDependents, tc.want)
+			}
+			if got := strings.Count(logs.String(), "ERROR:"); got != tc.wantErrCt {
+				t.Errorf("ERROR log count = %d, want %d; logs:\n%s", got, tc.wantErrCt, logs.String())
+			}
+		})
+	}
+
+	t.Run("sequential Initialize resets prior state", func(t *testing.T) {
+		rootDir := t.TempDir()
+		conf := filepath.Join(rootDir, "googet.conf")
+
+		if err := os.WriteFile(conf, []byte("orphaneddependents: remove\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		settings.Initialize(rootDir, false)
+		if settings.OrphanedDependents != "remove" {
+			t.Fatalf("settings.OrphanedDependents = %q, want remove", settings.OrphanedDependents)
+		}
+
+		// Transition to an absent key must reset OrphanedDependents to empty.
+		if err := os.WriteFile(conf, []byte("cachelife: 5m\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		settings.Initialize(rootDir, false)
+		if settings.OrphanedDependents != "" {
+			t.Errorf("after absent key, settings.OrphanedDependents = %q, want empty", settings.OrphanedDependents)
+		}
+
+		// Set remove again, then transition to an invalid value.
+		if err := os.WriteFile(conf, []byte("orphaneddependents: remove\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		settings.Initialize(rootDir, false)
+		if err := os.WriteFile(conf, []byte("orphaneddependents: invalid\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		settings.Initialize(rootDir, false)
+		if settings.OrphanedDependents != "" {
+			t.Errorf("after invalid key, settings.OrphanedDependents = %q, want empty", settings.OrphanedDependents)
+		}
+
+		// Transition to a missing googet.conf must also stay empty.
+		settings.Initialize(t.TempDir(), false)
+		if settings.OrphanedDependents != "" {
+			t.Errorf("after missing conf, settings.OrphanedDependents = %q, want empty", settings.OrphanedDependents)
+		}
+	})
+}
+
+// TestOldClientConfStructIgnoresOrphanedDependentsKey checks that a
+// googet.conf containing orphaneddependents decodes cleanly into the older
+// conf struct definition without failing or dropping known keys.
+func TestOldClientConfStructIgnoresOrphanedDependentsKey(t *testing.T) {
+	type pre360Conf struct {
+		Archs            []string
+		CacheLife        string
+		LockFileMaxAge   string
+		ProxyServer      string
+		AllowUnsafeURL   bool
+		StrictConflicts  bool
+		PackageConflicts string
+		Progress         *bool
+	}
+	raw := []byte("archs: [noarch, x86_64]\ncachelife: 15m\npackageconflicts: error\norphaneddependents: remove\n")
+	var old pre360Conf
+	if err := yaml.Unmarshal(raw, &old); err != nil {
+		t.Fatalf("yaml.Unmarshal into pre-3.6.0 conf failed: %v", err)
+	}
+	if diff := cmp.Diff([]string{"noarch", "x86_64"}, old.Archs); diff != "" {
+		t.Errorf("old.Archs (-want +got):\n%s", diff)
+	}
+	if old.CacheLife != "15m" || old.PackageConflicts != "error" {
+		t.Errorf("old conf = %+v, want CacheLife=15m and PackageConflicts=error", old)
+	}
+}
+
+// TestNormalizePolicyModesAndErrorFormatting checks NormalizeConflictMode,
+// NormalizeOrphanMode, and non-stuttered error formatting in readConf.
+func TestNormalizePolicyModesAndErrorFormatting(t *testing.T) {
+	t.Cleanup(settings.Snapshot())
+	if got, err := settings.NormalizeConflictMode("  ErRoR "); err != nil || got != "error" {
+		t.Errorf("NormalizeConflictMode = (%q, %v), want (error, nil)", got, err)
+	}
+	if _, err := settings.NormalizeConflictMode("bogus"); err == nil {
+		t.Errorf("NormalizeConflictMode(bogus) = nil, want error")
+	}
+	if got, err := settings.NormalizeOrphanMode(" ReMoVe\n"); err != nil || got != "remove" {
+		t.Errorf("NormalizeOrphanMode = (%q, %v), want (remove, nil)", got, err)
+	}
+	if _, err := settings.NormalizeOrphanMode(""); err == nil {
+		t.Errorf("NormalizeOrphanMode('') = nil, want error")
+	}
+
+	logs := testutil.CaptureLogs(t)
+	rootDir := t.TempDir()
+	conf := filepath.Join(rootDir, "googet.conf")
+	if err := os.WriteFile(conf, []byte("packageconflicts: bogus\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	settings.Initialize(rootDir, false)
+	wantLog := "Invalid packageconflicts in " + conf + `: invalid package conflict mode "bogus": want warn, error, or ignore; falling back to warn`
+	if !strings.Contains(logs.String(), wantLog) {
+		t.Errorf("logs = %q, want substring %q", logs.String(), wantLog)
 	}
 }

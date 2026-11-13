@@ -85,7 +85,7 @@ func TestFailedReplacerReinstallsReplacedPackages(t *testing.T) {
 	before := f.rows(t)
 	logs := testutil.CaptureLogs(t)
 	var err error
-	out := captureStdout(t, func() { err = f.install(t, "R") })
+	out := captureStdout(t, func() { err = f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R") })
 	if err == nil || !strings.Contains(err.Error(), "missing-script.exe") || !strings.Contains(err.Error(), "reinstalled the packages that installing R.noarch.1 had removed: P.noarch.1, D.noarch.1") {
 		t.Fatalf("install R = %v, want the install script's error and the reinstalled packages", err)
 	}
@@ -122,7 +122,7 @@ func TestFailedReplacerReinstallsReplacedPackages(t *testing.T) {
 func TestFailedUninstallReinstallsEarlierRemovals(t *testing.T) {
 	f := replaceFixture(t, goolib.PkgSpec{}, goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1", Uninstall: failingScript},
 		goolib.PkgSpec{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}})
-	err := f.install(t, "R")
+	err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R")
 	if err == nil || !strings.Contains(err.Error(), "missing-script.exe") || !strings.Contains(err.Error(), "had removed: D.noarch.1") {
 		t.Fatalf("install R = %v, want P's uninstall error and D reinstalled", err)
 	}
@@ -143,7 +143,7 @@ func TestFailedUninstallReinstallsEarlierRemovals(t *testing.T) {
 func TestRecoveryFailureKeepsArchiveAndReportsIt(t *testing.T) {
 	f := replaceFixture(t, goolib.PkgSpec{Install: failingScript})
 	pArchive := f.rows(t)["P"].LocalPath
-	err := f.runWithHook(t, t.Context(), Options{}, "R", func(stage applyStage, step string) error {
+	err := f.runWithHook(t, t.Context(), Options{OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, step string) error {
 		if stage == stageAfterUninstall && step == "P.noarch.1" {
 			// Make P's kept archive unusable.
 			return os.WriteFile(pArchive, []byte("corrupt"), 0644)
@@ -169,7 +169,7 @@ func TestRecoveryFailureKeepsArchiveAndReportsIt(t *testing.T) {
 func TestSuccessfulReplaceDeletesKeptArchives(t *testing.T) {
 	f := replaceFixture(t, goolib.PkgSpec{})
 	before := f.rows(t)
-	if err := f.install(t, "R"); err != nil {
+	if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
 		t.Fatalf("install R: %v", err)
 	}
 	if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
@@ -188,7 +188,7 @@ func TestDatabaseOnlyRecoveryRestoresRows(t *testing.T) {
 	f := replaceFixture(t, goolib.PkgSpec{})
 	before := f.rows(t)
 	stop := errors.New("stop")
-	err := f.runWithHook(t, t.Context(), Options{DBOnly: true}, "R", func(stage applyStage, _ string) error {
+	err := f.runWithHook(t, t.Context(), Options{DBOnly: true, OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, _ string) error {
 		if stage == stageAfterReplace {
 			return stop
 		}
@@ -213,7 +213,7 @@ func TestRecordFailureRollsBackReplacerAndRecovers(t *testing.T) {
 	attempts := 0
 	var err error
 	out := captureStdout(t, func() {
-		err = f.runWithHook(t, t.Context(), Options{}, "R", func(stage applyStage, step string) error {
+		err = f.runWithHook(t, t.Context(), Options{OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, step string) error {
 			if stage == stageAddPkg && step == "R.noarch.1" {
 				attempts++
 				return full
@@ -248,7 +248,7 @@ func TestRecordFailureRollsBackReplacerAndRecovers(t *testing.T) {
 func TestRecordingRetriedOnce(t *testing.T) {
 	f := replaceFixture(t, goolib.PkgSpec{})
 	attempts := 0
-	err := f.runWithHook(t, t.Context(), Options{}, "R", func(stage applyStage, step string) error {
+	err := f.runWithHook(t, t.Context(), Options{OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, step string) error {
 		if stage == stageAddPkg && step == "R.noarch.1" {
 			attempts++
 			if attempts == 1 {

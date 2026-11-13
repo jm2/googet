@@ -41,10 +41,11 @@ cachelife: 10m
 stalltimeout: 5m
 strictconflicts: false
 packageconflicts: warn
+orphaneddependents: fail
 ```
 
-Configuration keys in `googet.conf` are lowercase (for example, `packageconflicts`
-and `strictconflicts`; PascalCase keys are ignored).
+Configuration keys in `googet.conf` are lowercase (for example, `packageconflicts`,
+`orphaneddependents`, and `strictconflicts`; PascalCase keys are ignored).
 
 - `stalltimeout` (a Go duration such as `5m` or `30s`, default `2m`; zero or
   negative values keep the default) is how long googet waits for a server to
@@ -59,27 +60,41 @@ and `strictconflicts`; PascalCase keys are ignored).
     info level in the log).
   Reinstalling an already-installed package (`googet install -reinstall` and
   `googet verify`) does not check package conflicts.
+- `orphaneddependents` controls what happens when a package's `Replaces`
+  entries remove an installed package and leave another installed package's
+  name-based dependency unsatisfied:
+  - `fail` (default): fail `googet install` before changing anything and list
+    the affected dependents; during `googet update`, log a warning, skip that
+    update, and continue updating other packages.
+  - `remove`: uninstall the affected dependents before removing the replaced
+    package.
+  Dependents satisfied by the replacing package's `Provides` or by another
+  remaining provider stay installed. Dependents that relied only on a
+  `Provides` entry of the replaced package are listed and never removed.
 
-On `googet install` and `googet update`, `-package_conflicts` overrides
-`packageconflicts` in `googet.conf`:
+On `googet install` and `googet update`, CLI policy flags override
+`googet.conf`:
 
 | Policy | CLI flag | `googet.conf` key | Default | Notes |
 | --- | --- | --- | --- | --- |
 | Reverse package conflicts | `-package_conflicts=warn\|error\|ignore` | `packageconflicts: warn\|error\|ignore` | `warn` | Precedence: CLI flag > `googet.conf` > default. `-force` applies only to file overlaps (`strictconflicts`) and never affects `-package_conflicts`. |
+| Orphaned dependents on replace | `-orphaned_dependents=fail\|remove` | `orphaneddependents: fail\|remove` | `fail` | Precedence: CLI flag > `googet.conf` > default. `-force` never affects `-orphaned_dependents`. During `googet update`, `fail` skips the orphaning update instead of failing the run. |
 
 Compatibility note: do not pass `-package_conflicts` to `googet` binaries older
-than 3.5.0, because older binaries exit with an unknown-flag usage error
-(including when an older `googet` binary runs a self-upgrade). Setting
-`packageconflicts` in `googet.conf` is ignored by older binaries.
+than 3.5.0, or `-orphaned_dependents` to `googet` binaries older than 3.6.0,
+because older binaries exit with an unknown-flag usage error (including when an
+older `googet` binary runs a self-upgrade). Setting `packageconflicts` or
+`orphaneddependents` in `googet.conf` is ignored by older binaries.
 
 ## How an install proceeds
 
 `googet install` and `googet update` install a package in three phases:
 
 1. **Plan.** GooGet works out every package it will install, in order, and
-   every installed package that a `Replaces` entry removes, and checks
-   conflicts and dependencies. If anything fails here, nothing changes. The
-   resolution messages for all packages are printed in this phase.
+   every installed package removed by a `Replaces` entry or cascaded dependent
+   removal, and checks conflicts and dependencies. If anything fails here,
+   nothing changes. The resolution messages for all packages are printed in
+   this phase.
 2. **Fetch.** GooGet downloads and verifies the archive of every package it
    will install. Unless `-db_only` is set, it also makes sure the cached
    archive of every package it will remove is present, because uninstalling
@@ -94,9 +109,11 @@ than 3.5.0, because older binaries exit with an unknown-flag usage error
 
 The confirmation prompt and `googet install -dry_run` show the plan: the
 packages that will be installed, in order, the installed packages that will be
-removed and why, and any conflict warnings. `-dry_run` exits with an error if
-the install would fail while it is planned, for example on a conflict.
-`googet update -dry_run` lists available updates without planning them.
+removed and why, any `Provides`-only dependents left with an unsatisfied
+dependency (not removed), and any conflict warnings. `-dry_run` exits with an
+error if the install would fail while it is planned, for example on a conflict
+or orphaned dependent. `googet update -dry_run` lists available updates without
+planning them.
 
 ### Replacing packages is best-effort
 

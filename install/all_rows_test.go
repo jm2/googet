@@ -156,10 +156,26 @@ func TestResolveMatchesSQLiteReference(t *testing.T) {
 	}
 }
 
+// oracleSatisfiedIn evaluates dependency satisfaction independently of
+// relation.Satisfied by combining relation.Resolve with client.SatisfiesProvider.
+func oracleSatisfiedIn(r relation.Requirement, st client.GooGetState) (bool, error) {
+	specs := specsFromState(st)
+	rows, err := relation.Resolve(r, specs)
+	if err != nil || len(rows) > 0 {
+		return len(rows) > 0, err
+	}
+	for _, ps := range specs {
+		if providesRequirement(ps, r) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // TestUnsatisfiedAgreesWithSatisfiedIn checks over random multi-arch states and
 // removal subsets that relation.Unsatisfied reports a remaining package's
-// requirement as orphaned if and only if satisfiedIn held before removal and no
-// longer holds after removal.
+// requirement as orphaned if and only if satisfiedIn and oracleSatisfiedIn held
+// before removal and no longer hold after removal.
 func TestUnsatisfiedAgreesWithSatisfiedIn(t *testing.T) {
 	rng := rand.New(rand.NewPCG(314, 159))
 	names := []string{"P", "Q", "R", "virt"}
@@ -226,9 +242,15 @@ func TestUnsatisfiedAgreesWithSatisfiedIn(t *testing.T) {
 				if err != nil {
 					t.Fatalf("seed %d: satisfiedIn(before): %v", seed, err)
 				}
+				if oracleBefore, oErr := oracleSatisfiedIn(req, beforeState); oErr != nil || oracleBefore != wasOK {
+					t.Fatalf("seed %d: oracleSatisfiedIn(before)=(%t,%v), satisfiedIn=(%t,nil)", seed, oracleBefore, oErr, wasOK)
+				}
 				nowOK, err := satisfiedIn(req, afterState)
 				if err != nil {
 					t.Fatalf("seed %d: satisfiedIn(after): %v", seed, err)
+				}
+				if oracleAfter, oErr := oracleSatisfiedIn(req, afterState); oErr != nil || oracleAfter != nowOK {
+					t.Fatalf("seed %d: oracleSatisfiedIn(after)=(%t,%v), satisfiedIn=(%t,nil)", seed, oracleAfter, oErr, nowOK)
 				}
 				if wasOK && !nowOK {
 					entry := fmt.Sprintf("%s|%s|%s|%s", dep, req.Name, req.Arch, req.Ver)
