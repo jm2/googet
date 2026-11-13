@@ -189,8 +189,8 @@ func TestRecoveryExactReverseScriptOrderAndStrictConflicts(t *testing.T) {
 	rm := client.RepoMap{srv.URL: client.Repo{Packages: []goolib.RepoSpec{replacer}}}
 
 	err = New(cacheDir, db, Options{StrictConflicts: true}).FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", rm, corpusArchs, downloader)
-	if err == nil || !strings.Contains(err.Error(), "reinstalled the packages that installing R.noarch.1 had removed: Q.noarch.1, P.noarch.1, D.noarch.1, E.noarch.1") {
-		t.Fatalf("FromRepo(R) = %v, want script error with Q, P, D, E reinstalled in reverse removal order", err)
+	if err == nil || !strings.Contains(err.Error(), "reinstalled the packages that installing R.noarch.1 had removed: P.noarch.1, D.noarch.1, Q.noarch.1, E.noarch.1") {
+		t.Fatalf("FromRepo(R) = %v, want script error with P, D, Q, E reinstalled in reverse removal order", err)
 	}
 
 	gotBytes, err := os.ReadFile(orderLog)
@@ -200,13 +200,13 @@ func TestRecoveryExactReverseScriptOrderAndStrictConflicts(t *testing.T) {
 	gotOrder := strings.Split(strings.TrimSpace(string(gotBytes)), "\n")
 	wantOrder := []string{
 		"uninstall:E",
+		"uninstall:Q",
 		"uninstall:D",
 		"uninstall:P",
-		"uninstall:Q",
 		"install:R",
-		"install:Q",
 		"install:P",
 		"install:D",
+		"install:Q",
 		"install:E",
 	}
 	if diff := cmp.Diff(wantOrder, gotOrder); diff != "" {
@@ -222,7 +222,7 @@ func TestRecoveryExactReverseScriptOrderAndStrictConflicts(t *testing.T) {
 		"#!/bin/sh\necho install:R2 >> \""+orderLog+"\"\n", "")
 	rm2 := client.RepoMap{srv.URL: client.Repo{Packages: []goolib.RepoSpec{overlapReplacer}}}
 	err = New(cacheDir, db, Options{StrictConflicts: true}).FromRepo(t.Context(), goolib.PackageInfo{Name: "R2"}, "", rm2, corpusArchs, downloader)
-	if err == nil || !strings.Contains(err.Error(), "file conflict:") || !strings.Contains(err.Error(), "reinstalled the packages that installing R2.noarch.1 had removed: Q.noarch.1, P.noarch.1, D.noarch.1, E.noarch.1") {
+	if err == nil || !strings.Contains(err.Error(), "file conflict:") || !strings.Contains(err.Error(), "reinstalled the packages that installing R2.noarch.1 had removed: P.noarch.1, D.noarch.1, Q.noarch.1, E.noarch.1") {
 		t.Fatalf("FromRepo(R2) = %v, want StrictConflicts file-conflict error and full recovery", err)
 	}
 	if b, err := os.ReadFile(sharedFile); err != nil || string(b) != "P.noarch.1" {

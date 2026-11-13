@@ -44,21 +44,49 @@ func selfExclusion(ps *goolib.PkgSpec) exclusions {
 	return exclusions{self: pkgKey(ps)}
 }
 
+// victimsIn returns every installed row in st that ps's Replaces entries select
+// via relation.Resolve, deduplicated by name.arch.
+func victimsIn(ps *goolib.PkgSpec, st client.GooGetState) ([]client.PackageState, error) {
+	if len(ps.Replaces) == 0 {
+		return nil, nil
+	}
+	specs := specsFromState(st)
+	byKey := make(map[string]client.PackageState, len(st))
+	for _, row := range st {
+		if row.PackageSpec != nil {
+			byKey[pkgKey(row.PackageSpec)] = row
+		}
+	}
+	seen := make(map[string]bool)
+	var out []client.PackageState
+	for _, raw := range ps.Replaces {
+		matches, err := relation.Resolve(relation.ParseRelation(raw), specs)
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range matches {
+			k := pkgKey(m)
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, byKey[k])
+			}
+		}
+	}
+	return out, nil
+}
+
 // repoExclusionsIn returns the initial exclusion set for installing ps from a
-// repository over the installed state st, covering ps itself and the single
-// row each Replaces entry picks.
+// repository over the installed state st, covering ps itself and every row ps's
+// Replaces entries select.
 func repoExclusionsIn(ps *goolib.PkgSpec, st client.GooGetState) (exclusions, error) {
 	ex := selfExclusion(ps)
-	for _, pkg := range ps.Replaces {
-		v, ok, err := minInstalledRowIn(relation.ParseRelation(pkg), st)
-		if err != nil {
-			return exclusions{}, err
-		}
-		if !ok {
-			continue
-		}
+	victims, err := victimsIn(ps, st)
+	if err != nil {
+		return exclusions{}, err
+	}
+	for _, v := range victims {
 		if ex.victims == nil {
-			ex.victims = make(map[string]bool)
+			ex.victims = make(map[string]bool, len(victims))
 		}
 		ex.victims[pkgKey(v.PackageSpec)] = true
 	}
