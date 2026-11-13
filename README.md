@@ -92,6 +92,12 @@ than 3.5.0, because older binaries exit with an unknown-flag usage error
 3. **Apply.** GooGet installs the packages in order, removing each package's
    replaced packages just before installing it.
 
+The confirmation prompt and `googet install -dry_run` show the plan: the
+packages that will be installed, in order, the installed packages that will be
+removed and why, and any conflict warnings. `-dry_run` exits with an error if
+the install would fail while it is planned, for example on a conflict.
+`googet update -dry_run` lists available updates without planning them.
+
 Archives fetched for an install that then fails stay in the cache directory,
 so a later attempt doesn't download them again. While an install runs, the
 cache holds the archives of every package it installs, plus those of the
