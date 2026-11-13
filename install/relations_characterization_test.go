@@ -21,6 +21,7 @@ package install
 // matching test, so that the change in semantics is visible in review.
 
 import (
+	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -251,11 +252,11 @@ func checksumOf(t *testing.T, path string) string {
 	return goolib.Checksum(fh)
 }
 
-// TestCharacterizeReplaceRemovesDependents pins that replacing a package
-// also removes the packages that depend on it, even when the replacing
-// package provides the name they depend on.
+// TestCharacterizeReplaceRemovesDependents checks that replacing a package
+// keeps installed dependents whose dependencies remain satisfied by the
+// replacing package's Provides entries.
 //
-// Known wrong: a fix should keep D installed, because R provides P.
+// Intended: D stays installed because R provides P=1.
 func TestCharacterizeReplaceRemovesDependents(t *testing.T) {
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{
@@ -268,11 +269,14 @@ func TestCharacterizeReplaceRemovesDependents(t *testing.T) {
 	if err := f.install(t, "R"); err != nil {
 		t.Fatalf("install R: %v", err)
 	}
-	if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+	if diff := cmp.Diff([]string{"D.noarch.1", "R.noarch.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages after replace (-want +got):\n%s", diff)
 	}
-	if f.fileExists("D") {
-		t.Errorf("D's file still exists; today the replace cascade uninstalls D")
+	if !f.fileExists("D") {
+		t.Errorf("D's file was removed even though R satisfies D's dependency on P")
+	}
+	if f.fileExists("P") {
+		t.Errorf("P's file still exists after replacement")
 	}
 }
 
@@ -441,12 +445,13 @@ func TestCharacterizeConflictsCheckedBeforeReplaces(t *testing.T) {
 	}
 }
 
-// TestCharacterizeReplaceDependentArchExact pins that an arch-less Replaces
-// entry misses dependents that name the replaced package with an arch, so
-// they stay installed with an unsatisfied dependency.
+// TestCharacterizeReplaceDependentArchExact checks that an arch-less Replaces
+// entry detects dependents that name the replaced package with an explicit
+// architecture, failing by default under OrphanFail and removing them under
+// OrphanRemove, even though legacy remove.EnumerateDeps({Name: "P"}) misses
+// arch-qualified keys when called with an empty Arch.
 //
-// Known wrong: a fix should treat D as a dependent of P.x86_64, whatever the
-// fix then decides to do with it.
+// Intended: replace evaluates concrete removed rows via relation.Unsatisfied.
 func TestCharacterizeReplaceDependentArchExact(t *testing.T) {
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{
@@ -454,19 +459,27 @@ func TestCharacterizeReplaceDependentArchExact(t *testing.T) {
 			{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P.x86_64": "1"}},
 		},
 		[]goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}})
-	// Replace looks up P's dependents the same way.
+	// Direct arch-less EnumerateDeps({Name: "P"}) remains unchanged for callers
+	// that pass an empty Arch.
 	deps, _, err := remove.EnumerateDeps(goolib.PackageInfo{Name: "P"}, f.db)
 	if err != nil {
 		t.Fatalf("EnumerateDeps(P): %v", err)
 	}
 	if _, ok := deps["D.noarch"]; ok {
-		t.Errorf("EnumerateDeps(P) = %v, want no D.noarch (today arch-qualified dependents are missed)", deps)
+		t.Errorf("EnumerateDeps(P) = %v, want no D.noarch when called with an empty arch", deps)
 	}
-	if err := f.install(t, "R"); err != nil {
-		t.Fatalf("install R: %v", err)
+	err = f.install(t, "R")
+	if !errors.Is(err, ErrOrphanedDependents) || !strings.Contains(err.Error(), "D.noarch.1 (requires P.x86_64 >= 1") {
+		t.Fatalf("install R (default OrphanFail) = %v, want ErrOrphanedDependents naming D.noarch.1", err)
 	}
-	if diff := cmp.Diff([]string{"D.noarch.1", "R.noarch.1"}, f.installed(t)); diff != "" {
-		t.Errorf("installed packages after replace (-want +got):\n%s (today D is missed)", diff)
+	if diff := cmp.Diff([]string{"D.noarch.1", "P.x86_64.1"}, f.installed(t)); diff != "" {
+		t.Errorf("installed packages after blocked replace (-want +got):\n%s", diff)
+	}
+	if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
+		t.Fatalf("install R (OrphanRemove): %v", err)
+	}
+	if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+		t.Errorf("installed packages after OrphanRemove replace (-want +got):\n%s", diff)
 	}
 }
 

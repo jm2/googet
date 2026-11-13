@@ -66,12 +66,12 @@ func TestDottedDependentsAgree(t *testing.T) {
 		t.Errorf("EnumerateDeps(P) map = %v, want a key for x.y.noarch", deps)
 	}
 
-	_, removed, err := replaceRows(&replacer, state)
+	out, err := planReplacement(&replacer, state)
 	if err != nil {
-		t.Fatalf("replaceRows(R): %v", err)
+		t.Fatalf("planReplacement(R): %v", err)
 	}
 	var simulated []string
-	for _, r := range removed {
+	for _, r := range out.removed {
 		simulated = append(simulated, pkgKey(r.PackageSpec))
 	}
 	if diff := cmp.Diff(append(slices.Clone(wantOrder), "P.noarch"), simulated); diff != "" {
@@ -79,8 +79,8 @@ func TestDottedDependentsAgree(t *testing.T) {
 	}
 
 	logs := testutil.CaptureLogs(t)
-	if err := f.install(t, "R"); err != nil {
-		t.Fatalf("install R: %v", err)
+	if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
+		t.Fatalf("install R (OrphanRemove): %v", err)
 	}
 	var executed []string
 	for _, l := range parseLogs(logs.String()) {

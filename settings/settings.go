@@ -2,6 +2,7 @@
 package settings
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -40,6 +41,12 @@ var (
 	// readConf only ever stores "" or a string accepted by
 	// install.ParseConflictMode.
 	PackageConflicts string
+	// OrphanedDependents controls how replacing a package handles installed
+	// packages whose dependencies would become unsatisfied. readConf normalizes
+	// valid values ("fail" or "remove") to lowercase and resets unset or invalid
+	// values to "", so readConf only ever stores "" or a string accepted by
+	// install.ParseOrphanMode.
+	OrphanedDependents string
 	// Progress enables the download progress bar and install spinner on
 	// interactive terminals; set from googet.conf (default true) and
 	// overridden by an explicit -progress flag.
@@ -59,6 +66,7 @@ func Snapshot() func() {
 	allowUnsafeURL := AllowUnsafeURL
 	strictConflicts := StrictConflicts
 	packageConflicts := PackageConflicts
+	orphanedDependents := OrphanedDependents
 	progress := Progress
 	return func() {
 		RootDir = rootDir
@@ -70,6 +78,7 @@ func Snapshot() func() {
 		AllowUnsafeURL = allowUnsafeURL
 		StrictConflicts = strictConflicts
 		PackageConflicts = packageConflicts
+		OrphanedDependents = orphanedDependents
 		Progress = progress
 	}
 }
@@ -119,14 +128,15 @@ func RepoDir() string {
 
 // conf represents a googet configuration file.
 type conf struct {
-	Archs            []string
-	CacheLife        string
-	LockFileMaxAge   string
-	StallTimeout     string
-	ProxyServer      string
-	AllowUnsafeURL   bool
-	StrictConflicts  bool
-	PackageConflicts string
+	Archs              []string
+	CacheLife          string
+	LockFileMaxAge     string
+	StallTimeout       string
+	ProxyServer        string
+	AllowUnsafeURL     bool
+	StrictConflicts    bool
+	PackageConflicts   string
+	OrphanedDependents string
 	// Progress is a pointer so an absent key keeps the default of true.
 	Progress *bool
 }
@@ -144,6 +154,7 @@ func unmarshalConfFile(filename string) (*conf, error) {
 // readConf initializes settings based on the configuration file at cf.
 func readConf(filename string) {
 	PackageConflicts = ""
+	OrphanedDependents = ""
 	gc, err := unmarshalConfFile(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -201,16 +212,46 @@ func readConf(filename string) {
 
 	AllowUnsafeURL = gc.AllowUnsafeURL
 	StrictConflicts = gc.StrictConflicts
-	if gc.PackageConflicts != "" {
-		switch pc := strings.ToLower(strings.TrimSpace(gc.PackageConflicts)); pc {
-		case "warn", "error", "ignore":
-			PackageConflicts = pc
-		default:
-			logger.Errorf("Invalid packageconflicts value %q in %s: want warn, error, or ignore; falling back to warn", gc.PackageConflicts, filename)
-		}
-	}
+	PackageConflicts = validatePolicySetting(gc.PackageConflicts, "packageconflicts", filename, "warn", NormalizeConflictMode)
+	OrphanedDependents = validatePolicySetting(gc.OrphanedDependents, "orphaneddependents", filename, "fail", NormalizeOrphanMode)
 	Progress = true
 	if gc.Progress != nil {
 		Progress = *gc.Progress
+	}
+}
+
+// validatePolicySetting normalizes a non-empty policy value from googet.conf
+// using normalize, logging an error and returning "" on invalid values.
+func validatePolicySetting(raw, key, filename, fallback string, normalize func(string) (string, error)) string {
+	if raw == "" {
+		return ""
+	}
+	v, err := normalize(raw)
+	if err != nil {
+		logger.Errorf("Invalid %s in %s: %v; falling back to %s", key, filename, err, fallback)
+		return ""
+	}
+	return v
+}
+
+// NormalizeConflictMode validates and lowercases a package conflict mode
+// ("warn", "error", or "ignore") after trimming surrounding whitespace.
+func NormalizeConflictMode(s string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(s)); m {
+	case "warn", "error", "ignore":
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid package conflict mode %q: want warn, error, or ignore", s)
+	}
+}
+
+// NormalizeOrphanMode validates and lowercases an orphaned-dependents mode
+// ("fail" or "remove") after trimming surrounding whitespace.
+func NormalizeOrphanMode(s string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(s)); m {
+	case "fail", "remove":
+		return m, nil
+	default:
+		return "", fmt.Errorf("invalid orphaned dependents mode %q: want fail or remove", s)
 	}
 }

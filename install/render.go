@@ -23,9 +23,10 @@ import (
 )
 
 // Plan describes what (*Installer).FromRepo would do to install one package:
-// the packages it installs, in order, and the installed packages that their
-// Replaces entries remove. It is unrelated to remove.Plan, which orders a
-// removal.
+// the packages it installs, in order, the installed packages removed by
+// Replaces entries or cascaded dependent removal, and any Provides-only
+// dependents left unsatisfied. It is unrelated to remove.Plan, which orders
+// a removal.
 //
 // The zero value and a nil *Plan describe an install that does nothing.
 type Plan struct {
@@ -48,7 +49,7 @@ func (ins *Installer) Plan(pi goolib.PackageInfo, repo string, rm client.RepoMap
 		return nil, err
 	}
 	sink := &recordingSink{}
-	p, err := buildPlan(planTarget{pi: pi, repo: repo}, rm, state, archs, planPolicy{conflicts: ins.opts.PackageConflicts}, sink)
+	p, err := buildPlan(planTarget{pi: pi, repo: repo}, rm, state, archs, planPolicy{conflicts: ins.opts.PackageConflicts, orphans: ins.opts.OrphanedDependents}, sink)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +90,8 @@ func (p *Plan) Removals() []goolib.PackageInfo {
 }
 
 // String describes the plan for a person: the packages it installs, then the
-// packages it removes and why, then any warnings. A plan that does nothing is
+// packages it removes and why, then any Provides-only dependents left with an
+// unsatisfied dependency, then any warnings. A plan that does nothing is
 // described by an empty string.
 func (p *Plan) String() string {
 	if p == nil || p.p == nil {
@@ -112,6 +114,7 @@ func (p *Plan) String() string {
 			fmt.Fprintf(&b, "  %s (%s)\n", r.PackageSpec, removalReason(s, r))
 		}
 	}
+	writeStepListedOrphans(&b, p.p.steps)
 	for _, w := range p.warnings {
 		fmt.Fprintln(&b, w)
 	}

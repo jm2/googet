@@ -65,6 +65,9 @@ func TestInstallConfirmationPrompt(t *testing.T) {
 		t.Helper()
 		t.Cleanup(settings.Snapshot())
 		rootDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(rootDir, "googet.conf"), []byte("orphaneddependents: remove\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
 		settings.Initialize(rootDir, true)
 
 		db, err := googetdb.NewDB(settings.DBFile())

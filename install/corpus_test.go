@@ -40,6 +40,7 @@ type corpusCase struct {
 	Available []goolib.PkgSpec
 	Target    string
 	Mode      ConflictMode
+	Orphans   OrphanMode
 	DBOnly    bool
 }
 
@@ -233,7 +234,7 @@ func runLive(t *testing.T, c corpusCase, f *relFixture) trace {
 	logs := testutil.CaptureLogs(t)
 	var err error
 	stdout := captureStdout(t, func() {
-		ins := New(f.cache, f.db, Options{DBOnly: c.DBOnly, PackageConflicts: c.Mode})
+		ins := New(f.cache, f.db, Options{DBOnly: c.DBOnly, PackageConflicts: c.Mode, OrphanedDependents: c.Orphans})
 		err = ins.FromRepo(t.Context(), goolib.PackageInfo{Name: c.Target}, "", f.rm, corpusArchs, f.downloader)
 	})
 	var tr trace
@@ -265,7 +266,7 @@ func runLive(t *testing.T, c corpusCase, f *relFixture) trace {
 // repositories and returns what the plan says will happen.
 func runPlan(c corpusCase, rm client.RepoMap, state client.GooGetState) trace {
 	sink := &recordingSink{}
-	p, err := buildPlan(planTarget{pi: goolib.PackageInfo{Name: c.Target}}, rm, state, corpusArchs, planPolicy{conflicts: c.Mode}, sink)
+	p, err := buildPlan(planTarget{pi: goolib.PackageInfo{Name: c.Target}}, rm, state, corpusArchs, planPolicy{conflicts: c.Mode, orphans: c.Orphans}, sink)
 	var tr trace
 	var stdout []string
 	for _, e := range sink.events {

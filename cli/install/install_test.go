@@ -59,13 +59,15 @@ func checkInstalled(t *testing.T, dir string, ps goolib.PkgSpec) bool {
 
 func TestInstall(t *testing.T) {
 	for _, tc := range []struct {
-		desc            string             // description of test case
-		args            []string           // args to install command
-		state           client.GooGetState // initial DB package state
-		packages        []goolib.PkgSpec   // which packages to provide in repo map
-		shouldReinstall bool               // whether to reinstall
-		wantInstalled   []string           // which packages were actually installed
-		wantState       []string           // abbreviated final DB package state
+		desc               string             // Description of test case.
+		args               []string           // Args to install command.
+		state              client.GooGetState // Initial DB package state.
+		packages           []goolib.PkgSpec   // Packages provided in repo map.
+		shouldReinstall    bool               // Whether to reinstall.
+		orphanedDependents string             // Optional orphaneddependents setting.
+		wantErr            string             // Expected substring in installFromRepo error.
+		wantInstalled      []string           // Packages actually installed.
+		wantState          []string           // Abbreviated final DB package state.
 	}{
 		{
 			desc: "single-install",
@@ -143,8 +145,24 @@ func TestInstall(t *testing.T) {
 			wantState:     []string{"B.noarch.2"},
 		},
 		{
-			desc: "remove-replaced-package-with-deps",
+			desc: "fail-on-orphaned-dependent-by-default",
 			args: []string{"B"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "5"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "5"},
+				{Name: "B", Arch: "noarch", Version: "2", Replaces: []string{"A.noarch.3"}},
+				{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}},
+			},
+			wantErr:   "replacing would leave installed packages with an unsatisfied dependency",
+			wantState: []string{"A.noarch.5", "C.noarch.3"},
+		},
+		{
+			desc:               "remove-replaced-package-with-deps",
+			args:               []string{"B"},
+			orphanedDependents: "remove",
 			state: client.GooGetState{
 				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "5"}},
 				{PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}}},
@@ -156,6 +174,21 @@ func TestInstall(t *testing.T) {
 			},
 			wantInstalled: []string{"B.noarch.2"},
 			wantState:     []string{"B.noarch.2"},
+		},
+		{
+			desc: "keep-dependent-satisfied-by-replacer-provides",
+			args: []string{"B"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "5"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "5"},
+				{Name: "B", Arch: "noarch", Version: "2", Replaces: []string{"A.noarch.3"}, Provides: []string{"A=5"}},
+				{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}},
+			},
+			wantInstalled: []string{"B.noarch.2"},
+			wantState:     []string{"B.noarch.2", "C.noarch.3"},
 		},
 		{
 			desc: "install-dep-satisfied-by-provider",
@@ -190,7 +223,9 @@ func TestInstall(t *testing.T) {
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			// Set up the installer.
+			t.Cleanup(settings.Snapshot())
 			settings.Initialize(t.TempDir(), false)
+			settings.OrphanedDependents = tc.orphanedDependents
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -237,7 +272,14 @@ func TestInstall(t *testing.T) {
 			// Install everything.
 			archs := []string{"noarch"}
 			for _, arg := range tc.args {
-				if err := i.installFromRepo(context.Background(), arg, archs); err != nil {
+				err := i.installFromRepo(context.Background(), arg, archs)
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("installFromRepo = %v, want error containing %q", err, tc.wantErr)
+					}
+					continue
+				}
+				if err != nil {
 					t.Fatalf("installFromRepo: %v", err)
 				}
 			}

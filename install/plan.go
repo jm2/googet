@@ -29,6 +29,9 @@ import (
 type planPolicy struct {
 	// conflicts is how reverse package conflicts are handled.
 	conflicts ConflictMode
+	// orphans is how name-based dependents left unsatisfied by a replacement
+	// are handled.
+	orphans OrphanMode
 }
 
 // planTarget names the package a plan installs: either a repository package,
@@ -55,9 +58,13 @@ type planStep struct {
 	// old is the installed package with spec's name and arch, which
 	// installing spec overwrites, or nil.
 	old *client.PackageState
-	// removed lists the installed packages that spec's Replaces entries
-	// remove before spec is installed, in removal order.
+	// removed lists the installed packages that spec's Replaces entries and
+	// cascaded dependent removal remove before spec is installed, in removal
+	// order.
 	removed []client.PackageState
+	// listed holds Provides-only dependents whose dependencies become
+	// unsatisfied when removed are uninstalled; they are reported and kept.
+	listed []relation.Orphan
 	// recheck holds the conflict checks that passed only because a package
 	// that removed lists was exempt; they must still pass once it is gone.
 	recheck deferredChecks
@@ -85,7 +92,12 @@ type plan struct {
 // order, then applying its replacements. Conflicts are deliberately checked
 // against that sequential state rather than against the final state, as
 // FromRepo checks them, so that a dependency is never exempted from a
-// conflict with a package that a later step replaces.
+// conflict with a package that a later step replaces. Dependents of replaced
+// packages are evaluated against the state immediately after the replacing
+// step completes; in OrphanFail mode, later steps are planned against the
+// OrphanRemove working state so the reported orphan list equals what
+// OrphanRemove removes, while any hard error anywhere in the plan takes
+// precedence and is returned alone.
 //
 // buildPlan doesn't log anything itself, but the client lookups it shares
 // with FromRepo log version comparison errors, as they do during an install.
@@ -100,6 +112,9 @@ func buildPlan(t planTarget, rm client.RepoMap, installed client.GooGetState, ar
 	if err != nil {
 		return nil, err
 	}
+	if len(p.orphans) > 0 {
+		return nil, &OrphanedDependentsError{Dependents: p.orphans}
+	}
 	return &plan{steps: p.steps, final: p.state}, nil
 }
 
@@ -110,8 +125,9 @@ type planner struct {
 	pol   planPolicy
 	sink  eventSink
 	// state is the installed state after the steps planned so far.
-	state client.GooGetState
-	steps []planStep
+	state   client.GooGetState
+	steps   []planStep
+	orphans []OrphanedDependent
 }
 
 // repoNode plans the install of pi from a repository. chain lists the packages, as name.arch, whose dependencies are being
@@ -138,11 +154,11 @@ func (p *planner) repoNode(pi goolib.PackageInfo, repo string, chain []string) e
 	if at := slices.Index(chain, key); at >= 0 {
 		return fmt.Errorf("cannot install %s: dependency cycle %s", chain[0], strings.Join(append(slices.Clone(chain[at:]), key), " -> "))
 	}
-	removed, recheck, err := p.depsAndReplacements(rs.PackageSpec, append(slices.Clone(chain), key))
+	rep, recheck, err := p.depsAndReplacements(rs.PackageSpec, append(slices.Clone(chain), key))
 	if err != nil {
 		return err
 	}
-	p.addStep(planStep{spec: rs, repo: repo, removed: removed, recheck: recheck}, client.PackageState{
+	p.addStep(planStep{spec: rs, repo: repo, removed: rep.removed, listed: rep.listed, recheck: recheck}, client.PackageState{
 		SourceRepo:  repo,
 		Checksum:    rs.Checksum,
 		PackageSpec: rs.PackageSpec,
@@ -151,25 +167,24 @@ func (p *planner) repoNode(pi goolib.PackageInfo, repo string, chain []string) e
 }
 
 // depsAndReplacements plans ps's conflict checks, dependencies and
-// replacements, and returns the installed packages that ps's Replaces entries
-// remove, in removal order, and the conflict checks that must still pass once
-// they are gone.
-func (p *planner) depsAndReplacements(ps *goolib.PkgSpec, chain []string) ([]client.PackageState, deferredChecks, error) {
+// replacements, and returns the replacement outcome and the conflict checks
+// that must still pass once the replacements are gone.
+func (p *planner) depsAndReplacements(ps *goolib.PkgSpec, chain []string) (replaceOutcome, deferredChecks, error) {
 	p.sink.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
 	ex, err := repoExclusionsIn(ps, p.state)
 	if err != nil {
-		return nil, deferredChecks{}, err
+		return replaceOutcome{}, deferredChecks{}, err
 	}
 	deferred, err := checkConflictsIn(ps, ex, p.pol.conflicts, p.state, p.sink)
 	if err != nil {
-		return nil, deferredChecks{}, err
+		return replaceOutcome{}, deferredChecks{}, err
 	}
 	for _, dep := range slices.Sorted(maps.Keys(ps.PkgDependencies)) {
 		ver := ps.PkgDependencies[dep]
 		r := relation.ParseDependency(dep, ver)
 		ok, err := satisfiedIn(r, p.state)
 		if err != nil {
-			return nil, deferredChecks{}, err
+			return replaceOutcome{}, deferredChecks{}, err
 		}
 		if ok {
 			p.sink.Infof("Dependency met: %s.%s with version greater than %s installed or provided", r.Name, r.Arch, ver)
@@ -178,28 +193,31 @@ func (p *planner) depsAndReplacements(ps *goolib.PkgSpec, chain []string) ([]cli
 		installedArch, isLocked := snapshot.LockState(r.Name, p.state)
 		spec, repo, _, err := client.FindRepoLatest(goolib.PackageInfo{Name: r.Name, Arch: r.Arch, Ver: ver}, p.rm, p.archs, installedArch, isLocked)
 		if err != nil {
-			return nil, deferredChecks{}, err
+			return replaceOutcome{}, deferredChecks{}, err
 		}
 		if spec.Name == ps.Name && spec.Arch == ps.Arch {
-			return nil, deferredChecks{}, fmt.Errorf("dependency %s of %s.%s resolves to the package itself", dep, ps.Name, ps.Arch)
+			return replaceOutcome{}, deferredChecks{}, fmt.Errorf("dependency %s of %s.%s resolves to the package itself", dep, ps.Name, ps.Arch)
 		}
 		p.sink.Infof("Dependency found: %s.%s %s (provides %s) is available", spec.Name, spec.Arch, spec.Version, r.Name)
 		if err := p.repoNode(goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, chain); err != nil {
-			return nil, deferredChecks{}, err
+			return replaceOutcome{}, deferredChecks{}, err
 		}
 	}
 	if err := deferred.recheckBeforeReplacementsIn(ps, p.pol.conflicts, p.state, p.sink); err != nil {
-		return nil, deferredChecks{}, err
+		return replaceOutcome{}, deferredChecks{}, err
 	}
-	post, removed, err := replaceRows(ps, p.state)
+	out, err := planReplacement(ps, p.state)
 	if err != nil {
-		return nil, deferredChecks{}, err
+		return replaceOutcome{}, deferredChecks{}, err
 	}
-	if err := deferred.recheckIn(ps, p.pol.conflicts, post, p.sink); err != nil {
-		return nil, deferredChecks{}, err
+	if p.pol.orphans == OrphanFail && len(out.orphans) > 0 {
+		p.orphans = append(p.orphans, out.orphans...)
 	}
-	p.state = post
-	return removed, deferred, nil
+	if err := deferred.recheckIn(ps, p.pol.conflicts, out.post, p.sink); err != nil {
+		return replaceOutcome{}, deferredChecks{}, err
+	}
+	p.state = out.post
+	return out, deferred, nil
 }
 
 // diskNode plans the install of the local package ps, as FromDisk performs
@@ -252,4 +270,11 @@ func (p *planner) addStep(step planStep, row client.PackageState) {
 	}
 	p.state = append(p.state, row)
 	p.steps = append(p.steps, step)
+}
+
+// satisfiedIn reports whether the dependency r is satisfied in the installed
+// state st: either some installed row meets r by package identity at r's
+// minimum version or later, or some installed package provides r.
+func satisfiedIn(r relation.Requirement, st client.GooGetState) (bool, error) {
+	return relation.Satisfied(r, specsFromState(st))
 }

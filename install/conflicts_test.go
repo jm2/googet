@@ -427,8 +427,8 @@ func TestForwardConflictRecheckAfterReplacements(t *testing.T) {
 		t.Errorf("deferred.recheck = %v, want exact error %q", err, wantPostErr)
 	}
 
-	// Arch-less Replaces ["P"] removes both installed P.x86_64 and newly
-	// installed dependency P.noarch along with X, leaving only R.noarch.1.
+	// A replacer that depends on its own replaced package without providing it
+	// fails with a self-orphan error before changing anything.
 	f2 := newRelFixture(t,
 		[]goolib.PkgSpec{
 			{Name: "P", Arch: "x86_64", Version: "1"},
@@ -445,11 +445,12 @@ func TestForwardConflictRecheckAfterReplacements(t *testing.T) {
 				PkgDependencies: map[string]string{"P.noarch": "1"},
 			},
 		})
-	if err := f2.install(t, "R"); err != nil {
-		t.Errorf("install R (arch-less Replaces removes both P arches): %v", err)
+	wantSelfOrphan := "cannot install R.noarch.1: it depends on P.noarch.1, which it replaces and doesn't provide; nothing was changed"
+	if err := f2.install(t, "R"); err == nil || err.Error() != wantSelfOrphan {
+		t.Errorf("install R (self-orphan) = %v, want exact error %q", err, wantSelfOrphan)
 	}
-	if diff := cmp.Diff([]string{"R.noarch.1"}, f2.installed(t)); diff != "" {
-		t.Errorf("installed packages after arch-less Replaces (-want +got):\n%s", diff)
+	if diff := cmp.Diff([]string{"P.x86_64.1", "X.noarch.1"}, f2.installed(t)); diff != "" {
+		t.Errorf("installed packages after self-orphan refusal (-want +got):\n%s", diff)
 	}
 
 	// When a pre-replacement FetchPkg pick (foo.x86_64 0.5.0) is below the
@@ -519,12 +520,11 @@ func TestRecheckBeforeReplacementsLogging(t *testing.T) {
 }
 
 // TestForwardPrecheckAllowsSequentialCascadeAndDuplicateReplaces checks that
-// the pre-replacement forward conflict recheck does not falsely reject installs
-// whose sequential Replaces removals (via dependent cascades or repeated
-// entries) uninstall every conflicting row. Note that resolveReplacements runs
-// after dependencies are installed and removes R's own freshly installed
-// P.noarch dependency as pre-existing behaviour, leaving only R.noarch.1.
+// a replacing package that also depends on the package it replaces without
+// providing it fails cleanly during planning with a self-orphan error and
+// leaves the installed state untouched.
 func TestForwardPrecheckAllowsSequentialCascadeAndDuplicateReplaces(t *testing.T) {
+	wantErr := "cannot install R.noarch.1: it depends on P.noarch.1, which it replaces and doesn't provide; nothing was changed"
 	t.Run("later Replaces cascade removes drifted arch", func(t *testing.T) {
 		f := newRelFixture(t,
 			[]goolib.PkgSpec{
@@ -543,10 +543,10 @@ func TestForwardPrecheckAllowsSequentialCascadeAndDuplicateReplaces(t *testing.T
 					PkgDependencies: map[string]string{"P.noarch": "1"},
 				},
 			})
-		if err := f.install(t, "R"); err != nil {
-			t.Fatalf("install R: %v", err)
+		if err := f.install(t, "R"); err == nil || err.Error() != wantErr {
+			t.Fatalf("install R = %v, want exact error %q", err, wantErr)
 		}
-		if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+		if diff := cmp.Diff([]string{"P.x86_64.1", "Q.noarch.1"}, f.installed(t)); diff != "" {
 			t.Errorf("installed packages (-want +got):\n%s", diff)
 		}
 	})
@@ -565,10 +565,10 @@ func TestForwardPrecheckAllowsSequentialCascadeAndDuplicateReplaces(t *testing.T
 					PkgDependencies: map[string]string{"P.noarch": "1"},
 				},
 			})
-		if err := f.install(t, "R"); err != nil {
-			t.Fatalf("install R: %v", err)
+		if err := f.install(t, "R"); err == nil || err.Error() != wantErr {
+			t.Fatalf("install R = %v, want exact error %q", err, wantErr)
 		}
-		if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+		if diff := cmp.Diff([]string{"P.x86_64.1"}, f.installed(t)); diff != "" {
 			t.Errorf("installed packages (-want +got):\n%s", diff)
 		}
 	})
@@ -1059,20 +1059,21 @@ func TestReverseConflictExclusionsAndDrift(t *testing.T) {
 				{Name: "X", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
 			},
 			[]goolib.PkgSpec{
-				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "P", Arch: "noarch", Version: "2"},
 				{
 					Name:            "R",
 					Arch:            "noarch",
 					Version:         "1",
+					Provides:        []string{"P=2"},
 					Replaces:        []string{"P"},
-					PkgDependencies: map[string]string{"P.noarch": "1"},
+					PkgDependencies: map[string]string{"P": "2"},
 				},
 			})
 		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
 		if err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader); err != nil {
-			t.Fatalf("FromRepo = %v, want nil because arch-less Replaces removes both P arches", err)
+			t.Fatalf("FromRepo = %v, want nil because arch-less Replaces removes both P arches and R provides P=2", err)
 		}
-		if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+		if diff := cmp.Diff([]string{"R.noarch.1", "X.noarch.1"}, f.installed(t)); diff != "" {
 			t.Errorf("installed packages (-want +got):\n%s", diff)
 		}
 		if strings.Contains(logs.String(), "package_conflict") {
@@ -1173,14 +1174,15 @@ func TestReverseConflictExclusionsAndDrift(t *testing.T) {
 				{Name: "P", Arch: "x86_64", Version: "1", Conflicts: []string{"R"}, PkgDependencies: map[string]string{"Q": "1"}},
 			},
 			[]goolib.PkgSpec{
-				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "P", Arch: "noarch", Version: "2"},
 				{Name: "Q", Arch: "noarch", Version: "1"},
 				{
 					Name:            "R",
 					Arch:            "noarch",
 					Version:         "1",
+					Provides:        []string{"P=2"},
 					Replaces:        []string{"P", "Q"},
-					PkgDependencies: map[string]string{"P.noarch": "1"},
+					PkgDependencies: map[string]string{"P": "2"},
 				},
 			})
 		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
@@ -1196,13 +1198,14 @@ func TestReverseConflictExclusionsAndDrift(t *testing.T) {
 		f := newRelFixture(t,
 			[]goolib.PkgSpec{{Name: "P", Arch: "x86_64", Version: "1", Conflicts: []string{"R"}}},
 			[]goolib.PkgSpec{
-				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "P", Arch: "noarch", Version: "2"},
 				{
 					Name:            "R",
 					Arch:            "noarch",
 					Version:         "1",
+					Provides:        []string{"P=2"},
 					Replaces:        []string{"P", "P"},
-					PkgDependencies: map[string]string{"P.noarch": "1"},
+					PkgDependencies: map[string]string{"P": "2"},
 				},
 			})
 		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
