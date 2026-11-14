@@ -150,10 +150,8 @@ func versionChange(s planStep) string {
 // step's Replaces entries names it at its minimum version or later, or it
 // depends on a package they name.
 func removalReason(s planStep, r client.PackageState) string {
-	for _, raw := range s.spec.PackageSpec.Replaces {
-		if ok, err := relation.ParseRelation(raw).MinInstalled(r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version); err == nil && ok {
-			return "replaced by " + s.spec.PackageSpec.String()
-		}
+	if relation.ReplacesInstalled(s.spec.PackageSpec.Replaces, r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version) {
+		return "replaced by " + s.spec.PackageSpec.String()
 	}
 	return "depends on a package " + s.spec.PackageSpec.String() + " replaces"
 }

@@ -309,3 +309,34 @@ func TestFormatHelpers(t *testing.T) {
 		t.Errorf("JoinSpecs(',') = %q, want %q", got, want)
 	}
 }
+
+// TestReplacesInstalled checks that a list of Replaces entries matches an
+// installed package by name, by arch when an entry names one, and at the
+// entry's minimum version or later, and that an entry whose version can't be
+// compared never matches but doesn't stop the later entries from matching.
+func TestReplacesInstalled(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		entries []string
+		pkg     goolib.PackageInfo
+		want    bool
+	}{
+		{name: "no entries", pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		{name: "bare name", entries: []string{"P"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, want: true},
+		{name: "other name", entries: []string{"Q"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		{name: "name is not a prefix match", entries: []string{"P"}, pkg: goolib.PackageInfo{Name: "PP", Arch: "x86_64", Ver: "1.0.0"}},
+		{name: "matching arch", entries: []string{"P.x86_64"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, want: true},
+		{name: "other arch", entries: []string{"P.x86_32"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		{name: "minimum version below", entries: []string{"P.x86_64.0.5.0"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, want: true},
+		{name: "minimum version equal", entries: []string{"P.x86_64.1.0.0"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, want: true},
+		{name: "minimum version above", entries: []string{"P.x86_64.2.0.0"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		{name: "any entry matches", entries: []string{"Q", "P.x86_32", "P"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, want: true},
+		{name: "unparseable entry version", entries: []string{"P.x86_64.bad"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		{name: "unparseable entry before a match", entries: []string{"P.x86_64.bad", "P"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, want: true},
+		{name: "unparseable installed version", entries: []string{"P"}, pkg: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "bad"}},
+	} {
+		if got := ReplacesInstalled(tc.entries, tc.pkg.Name, tc.pkg.Arch, tc.pkg.Ver); got != tc.want {
+			t.Errorf("%s: ReplacesInstalled(%q, %s) = %t, want %t", tc.name, tc.entries, tc.pkg, got, tc.want)
+		}
+	}
+}
