@@ -26,7 +26,9 @@ import (
 
 // renderUpdates writes plan for the user to w and emits its log lines, in the
 // order planning produced them: one line on w and one log line per action and
-// per skipped replacement, and each planning note at its level.
+// per skipped replacement, one informational log line per diagnostic, and
+// each planning note at its level. A dry run renders the same plan as a live
+// run.
 func renderUpdates(w io.Writer, plan updatePlan) {
 	fmt.Fprintln(w, "Searching for available updates...")
 	for _, e := range plan.entries {
@@ -35,6 +37,8 @@ func renderUpdates(w io.Writer, plan updatePlan) {
 			renderAction(w, *e.action)
 		case e.skip != nil:
 			renderSkip(w, *e.skip)
+		case e.diag != nil:
+			renderDiag(*e.diag)
 		case e.note != nil:
 			renderNote(*e.note)
 		}
@@ -98,6 +102,15 @@ func renderSkip(w io.Writer, s replaceSkip) {
 	if s.reason == reasonOrphans {
 		logSkippedOrphans(s.err)
 	}
+}
+
+// renderDiag logs d as a structured informational line.
+func renderDiag(d replaceDiag) {
+	line := fmt.Sprintf("%s package=%s replacer=%s", d.kind, d.pkg, d.replacer)
+	if len(d.others) > 0 {
+		line += " ignored=" + relation.JoinSpecs(d.others, ",")
+	}
+	logger.Info(line)
 }
 
 // renderNote emits n at its log level.

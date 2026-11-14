@@ -86,6 +86,10 @@ type skipReason string
 
 // The reasons a replacement is skipped.
 const (
+	// reasonMissingProvides means packages declare Replaces for the installed
+	// package but none of them also provides its name, as when a package is
+	// split into several.
+	reasonMissingProvides skipReason = "missing_provides"
 	// reasonPinnedPriority means the installed package's own best version
 	// outranks every replacing package, or no repository offers the
 	// installed package and every replacing package comes from a repository
@@ -116,10 +120,36 @@ type replaceSkip struct {
 	// reason says why the replacement is skipped.
 	reason skipReason
 	// candidates lists the competing replacing packages for
-	// reasonAmbiguous.
+	// reasonAmbiguous, or the packages that replace without providing for
+	// reasonMissingProvides.
 	candidates []*goolib.PkgSpec
 	// err is the planning error for reasonOrphans and reasonRejected.
 	err error
+}
+
+// diagKind names a structured diagnostic that planning records.
+type diagKind string
+
+// The diagnostics planning records.
+const (
+	// diagSplitIgnored means packages that replace the installed package
+	// without providing it were ignored in favour of one that does both.
+	diagSplitIgnored diagKind = "update_replace_split_ignored"
+	// diagCoexistingCurrent means the package that replaces and provides the
+	// installed package is installed at its best version already, so the
+	// installed package is left alone instead of being updated in place.
+	diagCoexistingCurrent diagKind = "update_replace_coexisting_current"
+)
+
+// replaceDiag is a structured diagnostic about a replacement.
+type replaceDiag struct {
+	kind diagKind
+	// pkg is the installed package.
+	pkg *goolib.PkgSpec
+	// replacer is the package that replaces and provides pkg.
+	replacer *goolib.PkgSpec
+	// others lists, for diagSplitIgnored, the ignored packages.
+	others []*goolib.PkgSpec
 }
 
 // noteLevel is the log level of a planning note.
@@ -141,12 +171,13 @@ type planNote struct {
 	pkg string
 }
 
-// planEntry is an action, a skipped replacement or a note. Entries keep the
-// order in which planning produced them, so that rendering emits them in
-// that order.
+// planEntry is an action, a skipped replacement, a diagnostic or a note.
+// Entries keep the order in which planning produced them, so that rendering
+// emits them in that order.
 type planEntry struct {
 	action *updateAction
 	skip   *replaceSkip
+	diag   *replaceDiag
 	note   *planNote
 }
 
@@ -168,16 +199,6 @@ func (p *updatePlan) actions() []updateAction {
 	return out
 }
 
-// packageInfos returns the name, arch and version of the package each action
-// installs, in the order they run, or nil if there are none.
-func (p *updatePlan) packageInfos() []goolib.PackageInfo {
-	var out []goolib.PackageInfo
-	for _, a := range p.actions() {
-		out = append(out, a.info())
-	}
-	return out
-}
-
 // addAction appends a to the plan.
 func (p *updatePlan) addAction(a updateAction) {
 	p.entries = append(p.entries, planEntry{action: &a})
@@ -186,6 +207,11 @@ func (p *updatePlan) addAction(a updateAction) {
 // addSkip appends s to the plan.
 func (p *updatePlan) addSkip(s replaceSkip) {
 	p.entries = append(p.entries, planEntry{skip: &s})
+}
+
+// addDiag appends d to the plan.
+func (p *updatePlan) addDiag(d replaceDiag) {
+	p.entries = append(p.entries, planEntry{diag: &d})
 }
 
 // addNote appends n to the plan.
@@ -211,6 +237,10 @@ type updateConfig struct {
 	// opts are the install options a replacement is planned with; only the
 	// package conflict and orphaned dependent policies matter.
 	opts install.Options
+	// followReplaces makes update replace an installed package that a
+	// repository still offers with a package that declares both Replaces and
+	// Provides for it.
+	followReplaces bool
 }
 
 // planUpdates works out, without side effects, which installed packages in
@@ -218,21 +248,24 @@ type updateConfig struct {
 // nor prints: it returns the actions, the skipped replacements and the log
 // lines that explain them for renderUpdates to emit.
 //
-// Planning runs in two passes. The first pass looks for replacements. When
-// no repository offers an installed package P for its arch any more and the
-// package that would replace it through its Provides also declares Replaces
-// for P, the replacement must pass every rule in selectReplacer, and its
-// install is planned with install.PlanState over the installed state as the
-// earlier replacements leave it. A replacement that passes is scheduled, and
-// every package it removes or installs is left out of the rest of the
-// planning; one that fails is skipped and recorded with its reason, and P is
-// left installed. Replacements are scheduled greedily in the order of state,
-// which googetdb lists by name and arch, so when two replacements exclude
-// each other the first one wins. Once the first pass ends, the skips and
-// notes it recorded for packages that a later replacement removes or
-// installs are dropped. The second pass plans in-place updates for the
-// remaining packages exactly as update always has, including moving to a
-// package that provides P without declaring Replaces for it.
+// Planning runs in two passes. The first pass looks for replacements of each
+// installed package P: always when no repository offers P for its arch any
+// more and the package that would replace it through its Provides also
+// declares Replaces for P, and for every P when cfg.followReplaces is set. A
+// replacement must pass every rule in selectReplacer, and its install is
+// planned with install.PlanState over the installed state as the earlier
+// replacements leave it. A replacement that passes is scheduled, and every
+// package it removes or installs is left out of the rest of the planning;
+// one that fails is skipped and recorded with its reason. Replacements are
+// scheduled greedily in the order of state, which googetdb lists by name and
+// arch, so when two replacements exclude each other the first one wins. Once
+// the first pass ends, the skips, diagnostics and notes it recorded for
+// packages that a later replacement removes or installs are dropped. The
+// second pass plans in-place updates for the remaining packages exactly as
+// update always has, including moving to a package that provides P without
+// declaring Replaces for it. A package whose replacement was skipped because
+// of the Provides fallback is left installed, while one whose replacement
+// cfg.followReplaces asked for is still updated in place.
 func planUpdates(state client.GooGetState, rm client.RepoMap, cfg updateConfig) updatePlan {
 	pl := newPlanner(state, rm, cfg)
 	for _, row := range state {
@@ -316,17 +349,22 @@ func newPlanner(state client.GooGetState, rm client.RepoMap, cfg updateConfig) *
 // p is replaced, and records the outcome in the plan.
 func (pl *planner) planReplacement(p *goolib.PkgSpec) {
 	legacy, ok, _ := latestFor(p, pl.repos)
-	if !ok || legacy.Spec.Name == p.Name || !replaces(legacy.Spec, p) {
+	fallback := ok && legacy.Spec.Name != p.Name && replaces(legacy.Spec, p)
+	if !fallback && !pl.cfg.followReplaces {
 		// Either a repository still offers p for its arch, or the package
 		// that would replace p through its Provides doesn't declare
 		// Replaces for it: the second pass updates p as before.
 		return
 	}
-	// The package that provides p also replaces it, so the update goes
-	// through the replacement rules and never falls back to installing
-	// that package unchecked.
-	pl.handled[pkgKey(p)] = true
-	winner, ok := pl.selectReplacer(p, legacy.Spec)
+	var fallbackSpec *goolib.PkgSpec
+	if fallback {
+		// The package that provides p also replaces it, so the update goes
+		// through the replacement rules and never falls back to installing
+		// that package unchecked.
+		pl.handled[pkgKey(p)] = true
+		fallbackSpec = legacy.Spec
+	}
+	winner, ok := pl.selectReplacer(p, fallbackSpec)
 	if !ok {
 		return
 	}
@@ -336,14 +374,26 @@ func (pl *planner) planReplacement(p *goolib.PkgSpec) {
 			// already. An installed replacing package with a pending
 			// update is replaced below, so that its update removes p and
 			// runs only once.
+			if pl.cfg.followReplaces && replaces(inst, p) && providesName(inst, p.Name) && !replaces(p, inst) {
+				// Updating p in place would only install a package that the
+				// installed replacing package replaces.
+				pl.suppressed[pkgKey(p)] = true
+				pl.plan.addDiag(replaceDiag{kind: diagCoexistingCurrent, pkg: p, replacer: inst})
+				return
+			}
 			pl.plan.addNote(planNote{level: noteInfo, text: fmt.Sprintf("%s.%s - %s already installed", winner.Spec.Name, winner.Spec.Arch, winner.Spec.Version), pkg: pkgKey(p)})
 			return
 		}
 	}
-	if _, ok, why := compareInstalled(winner, p); !ok {
-		why.pkg = pkgKey(p)
-		pl.plan.addNote(why)
-		return
+	// Following Replaces may move to a lower version, as when a renamed
+	// package restarts its numbering; the Provides fallback keeps requiring
+	// a higher priority or version.
+	if !pl.cfg.followReplaces {
+		if _, ok, why := compareInstalled(winner, p); !ok {
+			why.pkg = pkgKey(p)
+			pl.plan.addNote(why)
+			return
+		}
 	}
 	pl.scheduleReplacement(p, winner)
 }
@@ -358,28 +408,44 @@ func (pl *planner) planReplacement(p *goolib.PkgSpec) {
 // higher priority, and, when no repository offers p, the best priority isn't
 // below the default; and (d) neither p's best version for any arch, nor an
 // installed package, nor a chain of qualifying packages starting from it
-// replaces it in turn. It returns false whenever it picks nothing, and then
-// always records a skip that says why. fallback is the package the Provides
-// fallback would install for p, which replaces p; when no name qualifies,
-// the skip names it.
+// replaces it in turn. Names that replace p without providing it never
+// qualify: with cfg.followReplaces set, they are reported as a skip when
+// nothing qualifies, and as a diagnostic when something else does.
+//
+// fallback, if not nil, is the package the Provides fallback would install
+// for p, which replaces p. selectReplacer returns false when it picks
+// nothing, and then records a skip that says why, except when it was only
+// asked because cfg.followReplaces is set and no package replaces p at all.
 func (pl *planner) selectReplacer(p, fallback *goolib.PkgSpec) (repocmp.Candidate, bool) {
-	var full []repocmp.Candidate
+	var full, split []repocmp.Candidate
 	var pBest *repocmp.Candidate
 	for _, c := range pl.bestPerName(pl.admissible(p)) {
 		switch {
 		case c.Spec.Name == p.Name:
 			pBest = &c
-		case replaces(c.Spec, p) && providesName(c.Spec, p.Name):
+		case !replaces(c.Spec, p):
+			// A name that doesn't replace p plays no part.
+		case providesName(c.Spec, p.Name):
 			full = append(full, c)
+		default:
+			split = append(split, c)
 		}
 	}
 	if len(full) == 0 {
-		// No version of the provider that the rules consider still replaces
-		// and provides p, for example because its best version dropped
-		// them. p stays installed, and the skip says why.
-		pl.plan.addSkip(replaceSkip{pkg: p, replacer: fallback, reason: reasonRejected,
-			err: fmt.Errorf("the best version of %s offered for %s or noarch doesn't both replace and provide %s", fallback.Name, p.Arch, p.Name)})
+		switch {
+		case len(split) > 0 && pl.cfg.followReplaces:
+			pl.plan.addSkip(replaceSkip{pkg: p, reason: reasonMissingProvides, candidates: specsOf(split)})
+		case fallback != nil:
+			// No version of the provider that the rules consider still
+			// replaces and provides p, for example because its best version
+			// dropped them. p stays installed, and the skip says why.
+			pl.plan.addSkip(replaceSkip{pkg: p, replacer: fallback, reason: reasonRejected,
+				err: fmt.Errorf("the best version of %s offered for %s or noarch doesn't both replace and provide %s", fallback.Name, p.Arch, p.Name)})
+		}
 		return repocmp.Candidate{}, false
+	}
+	if len(split) > 0 {
+		pl.plan.addDiag(replaceDiag{kind: diagSplitIgnored, pkg: p, replacer: full[0].Spec, others: specsOf(split)})
 	}
 	maxPrio := full[0].Priority
 	for _, c := range full[1:] {
@@ -396,11 +462,7 @@ func (pl *planner) selectReplacer(p, fallback *goolib.PkgSpec) (repocmp.Candidat
 		return repocmp.Candidate{}, false
 	}
 	if len(top) > 1 {
-		var names []*goolib.PkgSpec
-		for _, c := range top {
-			names = append(names, c.Spec)
-		}
-		pl.plan.addSkip(replaceSkip{pkg: p, replacer: nil, reason: reasonAmbiguous, candidates: names})
+		pl.plan.addSkip(replaceSkip{pkg: p, reason: reasonAmbiguous, candidates: specsOf(top)})
 		return repocmp.Candidate{}, false
 	}
 	winner := top[0]
@@ -565,16 +627,20 @@ func (pl *planner) scheduleReplacement(p *goolib.PkgSpec, winner repocmp.Candida
 	}
 }
 
-// pruneStale drops the skips and notes recorded for installed packages that
-// a later replacement for another installed package removes or installs, so
-// that a package the update removes or installs is never also reported as
-// not replaced or as left alone. Which of two replacements that exclude each other is scheduled
+// pruneStale drops the skips, diagnostics and notes recorded for installed
+// packages that a later replacement for another installed package removes or
+// installs, so that a package the update removes or installs is never also
+// reported as not replaced or as left alone. A package's own replacement, or its
+// update_replace_coexisting_current diagnostic, never makes its entries
+// stale. Which of two replacements that exclude each other is scheduled
 // still follows the order of the installed packages.
 func (pl *planner) pruneStale() {
 	pl.plan.entries = slices.DeleteFunc(pl.plan.entries, func(e planEntry) bool {
 		switch {
 		case e.skip != nil:
 			return pl.stale[pkgKey(e.skip.pkg)]
+		case e.diag != nil:
+			return pl.stale[pkgKey(e.diag.pkg)]
 		case e.note != nil:
 			return pl.stale[e.note.pkg]
 		}
@@ -680,6 +746,15 @@ func providesName(ps *goolib.PkgSpec, name string) bool {
 // can't be compared don't count.
 func replaces(ps, target *goolib.PkgSpec) bool {
 	return relation.ReplacesInstalled(ps.Replaces, target.Name, target.Arch, target.Version)
+}
+
+// specsOf returns the specs of cands, in order.
+func specsOf(cands []repocmp.Candidate) []*goolib.PkgSpec {
+	out := make([]*goolib.PkgSpec, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.Spec)
+	}
+	return out
 }
 
 // pkgKey returns ps's name.arch key.
