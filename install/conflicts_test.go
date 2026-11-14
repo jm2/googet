@@ -890,7 +890,7 @@ func TestReverseConflictModes(t *testing.T) {
 					t.Errorf("installed packages (-want +got):\n%s", diff)
 				}
 
-				wantLine := conflictLine(tc.mode, tc.wantResult, &installedB, "A", &incomingA)
+				wantLine := conflictLine(revConflict, tc.mode, tc.wantResult, &installedB, "A", &incomingA)
 				var matchedTag bool
 				for _, line := range strings.Split(logs.String(), "\n") {
 					if strings.Contains(line, wantLine) && strings.HasPrefix(line, tc.wantTag) {
@@ -1099,13 +1099,16 @@ func TestReverseConflictExclusionsAndDrift(t *testing.T) {
 		f.corrupt(t, "R")
 		ins := New(f.cache, f.db, Options{PackageConflicts: ConflictError})
 		err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", f.rm, []string{"noarch", "x86_64"}, f.downloader)
-		if err == nil || !strings.Contains(err.Error(), "conflict with installed package P.x86_64.1") {
-			t.Fatalf("FromRepo = %v, want reverse conflict with surviving P.x86_64.1", err)
+		// D, installed earlier in the same plan, replaces the P.x86_64.1
+		// that E pulls in, so installing P.x86_64.1 already fails in error
+		// mode before R's own reverse conflict check is reached.
+		if err == nil || !strings.Contains(err.Error(), "cannot install P.x86_64.1: installed package D.noarch.1 replaces it") {
+			t.Fatalf("FromRepo = %v, want reverse Replaces failure for P.x86_64.1", err)
 		}
 		if diff := cmp.Diff([]string{"P.x86_64.2"}, f.installed(t)); diff != "" {
 			t.Errorf("installed packages (-want +got):\n%s", diff)
 		}
-		wantLine := `package_conflict direction=reverse mode=error result=failed installed=P.x86_64.1 entry="R" incoming=R.noarch.1`
+		wantLine := `package_conflict direction=reverse_replaces mode=error result=failed installed=D.noarch.1 entry="P.x86_64" incoming=P.x86_64.1`
 		if got := strings.Count(logs.String(), wantLine); got != 1 {
 			t.Errorf("count of %q = %d, want 1; logs:\n%s", wantLine, got, logs.String())
 		}

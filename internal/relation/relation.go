@@ -128,6 +128,19 @@ func (r Requirement) MinInstalled(name, arch, ver string) (bool, error) {
 	return c < 1, nil
 }
 
+// ReplacesInstalled reports whether any of the Replaces entries names an
+// installed package with the given name, arch and version, at the entry's
+// minimum version or later. An entry whose version can't be compared with
+// ver doesn't match.
+func ReplacesInstalled(entries []string, name, arch, ver string) bool {
+	for _, raw := range entries {
+		if ok, err := ParseRelation(raw).MinInstalled(name, arch, ver); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Satisfies reports whether version ver meets r's minimum version. An empty
 // minimum or an empty ver always does, without parsing either version.
 func (r Requirement) Satisfies(ver string) (bool, error) {
