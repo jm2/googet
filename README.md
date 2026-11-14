@@ -42,10 +42,12 @@ stalltimeout: 5m
 strictconflicts: false
 packageconflicts: warn
 orphaneddependents: fail
+followreplaces: false
 ```
 
 Configuration keys in `googet.conf` are lowercase (for example, `packageconflicts`,
-`orphaneddependents`, and `strictconflicts`; PascalCase keys are ignored).
+`orphaneddependents`, `followreplaces`, and `strictconflicts`; PascalCase keys
+are ignored).
 
 - `stalltimeout` (a Go duration such as `5m` or `30s`, default `2m`; zero or
   negative values keep the default) is how long googet waits for a server to
@@ -77,20 +79,29 @@ Configuration keys in `googet.conf` are lowercase (for example, `packageconflict
   Dependents satisfied by the replacing package's `Provides` or by another
   remaining provider stay installed. Dependents that relied only on a
   `Provides` entry of the replaced package are listed and never removed.
+- `followreplaces` (default `false`) controls whether `googet update` replaces
+  an installed package with another package that declares both `Replaces` and
+  `Provides` for it, as when a package is renamed. When it is `false`,
+  `googet update` upgrades installed packages in place, and moves to a package
+  that `Provides` an installed package's name only once no repository offers
+  the installed package any more.
 
 On `googet install` and `googet update`, CLI policy flags override
-`googet.conf`:
+`googet.conf` (`-follow_replaces` exists only on `googet update`):
 
 | Policy | CLI flag | `googet.conf` key | Default | Notes |
 | --- | --- | --- | --- | --- |
 | Reverse package conflicts and `Replaces` | `-package_conflicts=warn\|error\|ignore` | `packageconflicts: warn\|error\|ignore` | `warn` | Precedence: CLI flag > `googet.conf` > default. `-force` applies only to file overlaps (`strictconflicts`) and never affects `-package_conflicts`. |
 | Orphaned dependents on replace | `-orphaned_dependents=fail\|remove` | `orphaneddependents: fail\|remove` | `fail` | Precedence: CLI flag > `googet.conf` > default. `-force` never affects `-orphaned_dependents`. During `googet update`, `fail` skips the orphaning update instead of failing the run. |
+| Update follows `Replaces` | `-follow_replaces`, `-follow_replaces=true\|false` | `followreplaces: true\|false` | `false` | `googet update` only. Precedence: CLI flag > `googet.conf` > default, so `-follow_replaces=false` overrides `followreplaces: true`. `-force` never affects `-follow_replaces`. |
 
 Compatibility note: do not pass `-package_conflicts` to `googet` binaries older
-than 3.5.0, or `-orphaned_dependents` to `googet` binaries older than 3.6.0,
-because older binaries exit with an unknown-flag usage error (including when an
-older `googet` binary runs a self-upgrade). Setting `packageconflicts` or
-`orphaneddependents` in `googet.conf` is ignored by older binaries.
+than 3.5.0, `-orphaned_dependents` to `googet` binaries older than 3.6.0, or
+`-follow_replaces` to `googet` binaries older than 3.7.0, because older
+binaries exit with an unknown-flag usage error (including when an older
+`googet` binary runs a self-upgrade). Setting `packageconflicts`,
+`orphaneddependents` or `followreplaces` in `googet.conf` is ignored by older
+binaries.
 
 ## How an install proceeds
 

@@ -51,7 +51,7 @@ type updateCmd struct {
 func (*updateCmd) Name() string     { return "update" }
 func (*updateCmd) Synopsis() string { return "update all packages to the latest version available" }
 func (*updateCmd) Usage() string {
-	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore] [-orphaned_dependents fail|remove]\n", filepath.Base(os.Args[0]))
+	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore] [-orphaned_dependents fail|remove] [-follow_replaces]\n", filepath.Base(os.Args[0]))
 }
 
 func (cmd *updateCmd) SetFlags(f *flag.FlagSet) {
@@ -60,6 +60,7 @@ func (cmd *updateCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&cmd.dryRun, "dry_run", false, "check for updates and print them, but do not prompt to install")
 	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts or -orphaned_dependents)")
 	cmd.policyFlags.Register(f)
+	cmd.policyFlags.RegisterFollowReplaces(f)
 }
 
 func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
