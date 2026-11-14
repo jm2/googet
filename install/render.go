@@ -15,6 +15,8 @@ package install
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/google/googet/v2/client"
@@ -48,8 +50,19 @@ func (ins *Installer) Plan(pi goolib.PackageInfo, repo string, rm client.RepoMap
 	if err != nil {
 		return nil, err
 	}
+	return PlanState(pi, repo, rm, state, archs, ins.opts)
+}
+
+// PlanState works out what FromRepo would do to install pi from rm over the
+// installed state state, under the package conflict and orphaned dependent
+// policies in opts, without a database, downloads or changes of any kind. It
+// is what (*Installer).Plan does after reading the installed state, so a
+// caller can plan several installs in a row by passing each plan's State to
+// the next call. It never modifies state, and like Plan it writes nothing to
+// the log or the console.
+func PlanState(pi goolib.PackageInfo, repo string, rm client.RepoMap, state client.GooGetState, archs []string, opts Options) (*Plan, error) {
 	sink := &recordingSink{}
-	p, err := buildPlan(planTarget{pi: pi, repo: repo}, rm, state, archs, planPolicy{conflicts: ins.opts.PackageConflicts, orphans: ins.opts.OrphanedDependents}, sink)
+	p, err := buildPlan(planTarget{pi: pi, repo: repo}, rm, state, archs, planPolicy{conflicts: opts.PackageConflicts, orphans: opts.OrphanedDependents}, sink)
 	if err != nil {
 		return nil, err
 	}
@@ -60,6 +73,18 @@ func (ins *Installer) Plan(pi goolib.PackageInfo, repo string, rm client.RepoMap
 		}
 	}
 	return out, nil
+}
+
+// State returns the installed state the plan leaves once every step has run.
+// The rows, their package specs, the specs' relation lists and dependency
+// maps, and the rows' installed file maps are copies, so the caller may
+// modify them without changing the plan. The zero value and a nil *Plan
+// return nil.
+func (p *Plan) State() client.GooGetState {
+	if p == nil || p.p == nil {
+		return nil
+	}
+	return cloneState(p.p.final)
 }
 
 // Installs returns the packages the plan installs, in install order.
@@ -84,6 +109,24 @@ func (p *Plan) Removals() []goolib.PackageInfo {
 	for _, s := range p.p.steps {
 		for _, r := range s.removed {
 			out = append(out, specInfo(r.PackageSpec))
+		}
+	}
+	return out
+}
+
+// Replaced returns the installed packages that the Replaces entries of the
+// package removing them name, in removal order. Removals also lists the
+// dependents removed with them.
+func (p *Plan) Replaced() []goolib.PackageInfo {
+	if p == nil || p.p == nil {
+		return nil
+	}
+	var out []goolib.PackageInfo
+	for _, s := range p.p.steps {
+		for _, r := range s.removed {
+			if replacedBy(s, r) {
+				out = append(out, specInfo(r.PackageSpec))
+			}
 		}
 	}
 	return out
@@ -121,6 +164,28 @@ func (p *Plan) String() string {
 	return b.String()
 }
 
+// cloneState returns a copy of st whose rows, package specs, relation lists,
+// dependency maps and installed file maps don't share memory with st.
+func cloneState(st client.GooGetState) client.GooGetState {
+	if st == nil {
+		return nil
+	}
+	out := make(client.GooGetState, len(st))
+	for i, row := range st {
+		if row.PackageSpec != nil {
+			ps := *row.PackageSpec
+			ps.PkgDependencies = maps.Clone(ps.PkgDependencies)
+			ps.Replaces = slices.Clone(ps.Replaces)
+			ps.Conflicts = slices.Clone(ps.Conflicts)
+			ps.Provides = slices.Clone(ps.Provides)
+			row.PackageSpec = &ps
+		}
+		row.InstalledFiles = maps.Clone(row.InstalledFiles)
+		out[i] = row
+	}
+	return out
+}
+
 // specInfo returns ps's name, arch and version.
 func specInfo(ps *goolib.PkgSpec) goolib.PackageInfo {
 	return goolib.PackageInfo{Name: ps.Name, Arch: ps.Arch, Ver: ps.Version}
@@ -150,8 +215,14 @@ func versionChange(s planStep) string {
 // step's Replaces entries names it at its minimum version or later, or it
 // depends on a package they name.
 func removalReason(s planStep, r client.PackageState) string {
-	if relation.ReplacesInstalled(s.spec.PackageSpec.Replaces, r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version) {
+	if replacedBy(s, r) {
 		return "replaced by " + s.spec.PackageSpec.String()
 	}
 	return "depends on a package " + s.spec.PackageSpec.String() + " replaces"
+}
+
+// replacedBy reports whether one of the Replaces entries of step's package
+// names the installed package r at its minimum version or later.
+func replacedBy(s planStep, r client.PackageState) bool {
+	return relation.ReplacesInstalled(s.spec.PackageSpec.Replaces, r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version)
 }
