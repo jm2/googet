@@ -17,14 +17,21 @@ func captureStdout(f func()) string {
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
+	// Read while f runs, so that output larger than the pipe buffer never
+	// blocks f.
+	done := make(chan string)
+	go func() {
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		r.Close()
+		done <- buf.String()
+	}()
 
 	f()
 
 	w.Close()
 	os.Stdout = oldStdout
-	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	return buf.String()
+	return <-done
 }
 
 func TestUpdates(t *testing.T) {

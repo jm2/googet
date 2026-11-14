@@ -84,7 +84,8 @@ are ignored).
   `Provides` for it, as when a package is renamed. When it is `false`,
   `googet update` upgrades installed packages in place, and moves to a package
   that `Provides` an installed package's name only once no repository offers
-  the installed package any more.
+  the installed package any more. See
+  [How update follows Replaces](#how-update-follows-replaces).
 
 On `googet install` and `googet update`, CLI policy flags override
 `googet.conf` (`-follow_replaces` exists only on `googet update`):
@@ -129,8 +130,58 @@ packages that will be installed, in order, the installed packages that will be
 removed and why, any `Provides`-only dependents left with an unsatisfied
 dependency (not removed), and any conflict warnings. `-dry_run` exits with an
 error if the install would fail while it is planned, for example on a conflict
-or orphaned dependent. `googet update -dry_run` lists available updates without
-planning them.
+or orphaned dependent. `googet update -dry_run` prints the same updates,
+replacements and skipped replacements as a live run and exits without
+installing anything; it checks each replacement's install plan, but doesn't
+plan in-place upgrades in full, so it doesn't show whether one would fail.
+
+### How update follows Replaces
+
+`googet update` upgrades each installed package in place, but first it looks
+for packages that replace installed ones:
+
+- When no repository offers an installed package P for its arch any more,
+  `googet update` moves to the best package that `Provides` P, as it always
+  has. If that package also declares `Replaces` for P, the move has to pass
+  the rules below, whatever `followreplaces` says; if it doesn't, P stays
+  installed. As before, the package must have a higher priority or version
+  than P.
+- With `followreplaces: true` or `-follow_replaces`, `googet update` also
+  replaces P while it is still published, with a package that declares both
+  `Replaces` and `Provides` for P, if the rules below pass. The replacing
+  package may have a lower version than P, as when a renamed package restarts
+  its version numbering. A package that declares `Replaces` for P without
+  `Provides`, such as one of several packages P was split into, is never
+  followed.
+
+A package R replaces P only if all of these hold:
+
+1. R's best version replaces P at P's installed version and provides P's name.
+   Every package name counts once, at its best version for P's arch or
+   `noarch`, honouring `LockArch`.
+2. R is the only such package name at the best repository priority among
+   them, P's own best version doesn't come from a higher priority, and, if no
+   repository offers P, R's priority is at least the default (500).
+3. Neither P's best version for any arch, nor an installed package, nor a
+   chain of such replacing packages starting at R, replaces R in turn.
+4. Installing R plans cleanly over the packages installed at that point. With
+   `orphaneddependents: fail`, a replacement that would leave a dependent
+   unsatisfied is skipped, and so is one that fails to plan for any other
+   reason or would remove a package that an earlier replacement installs.
+
+Replacements run before in-place upgrades, and a package that a replacement
+removes or installs isn't upgraded separately, nor installed again to stand in
+for another package through `Provides`. Replacements are scheduled greedily in
+the order of the installed packages, by name and arch: when two replacements
+exclude each other, for example because one would remove what the other
+installs or install again what the other removes, the first one is scheduled
+and the second is skipped. If R is already installed at
+its best version next to P, `googet update` leaves P alone when it follows
+`Replaces`, and otherwise reports R as already installed. A skipped
+replacement is printed and logged as an `update_replace_skipped` line with one
+of the reasons `missing_provides`, `pinned_priority`, `ambiguous_replacers`,
+`replaces_cycle`, `orphaned_dependents` or `plan_rejected`; a skip that
+`followreplaces` asked for leaves P on its normal upgrade path.
 
 ### Replacing packages is best-effort
 
