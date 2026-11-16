@@ -250,7 +250,7 @@ func (p *planner) diskNode(ps *goolib.PkgSpec) error {
 			return err
 		}
 		if len(rows) > 0 {
-			return fmt.Errorf("cannot install, replaces installed package, remove first then try installation again: %s (installed: %s)", r.PackageInfo(), rows[0])
+			return fmt.Errorf("cannot install, replaces installed package, remove first then try installation again: %s (installed: %s)", r.Entry(), rows[0])
 		}
 	}
 	p.addStep(planStep{spec: goolib.RepoSpec{PackageSpec: ps}}, client.PackageState{PackageSpec: ps})

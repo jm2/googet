@@ -20,8 +20,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/googet/v2/internal/relsyntax"
 )
 
 // TestRelationProblemsClassificationAndOrder verifies fatal ErrRelationSyntax
@@ -281,5 +284,22 @@ func TestVerifyUnchangedForRelationSyntax(t *testing.T) {
 	}
 	if diff := cmp.Diff(ps, extracted); diff != "" {
 		t.Errorf("ExtractPkgSpec mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestHasForbiddenRelationCharExhaustive checks over every Unicode rune that
+// hasForbiddenRelationChar matches the literal operator and whitespace set.
+func TestHasForbiddenRelationCharExhaustive(t *testing.T) {
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		want := r == '<' || r == '>' || r == '=' || unicode.IsSpace(r)
+		if got := relsyntax.IsOpRune(r) || unicode.IsSpace(r); got != want {
+			t.Fatalf("IsOpRune(%U) || IsSpace(%U) = %t, want %t", r, r, got, want)
+		}
+		if !utf8.ValidRune(r) {
+			continue
+		}
+		if got := hasForbiddenRelationChar(string(r)); got != want {
+			t.Fatalf("hasForbiddenRelationChar(%q [%U]) = %t, want %t", string(r), r, got, want)
+		}
 	}
 }
