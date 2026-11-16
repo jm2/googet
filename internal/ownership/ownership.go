@@ -35,6 +35,7 @@ package ownership
 
 import (
 	"cmp"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -237,4 +238,127 @@ func (s PathSet) Has(path string) bool {
 	}
 	_, ok := s.set[fold(path)]
 	return ok
+}
+
+func (ix *Index) sep() byte {
+	if ix == nil || ix.rule.Sep == 0 {
+		return os.PathSeparator
+	}
+	return ix.rule.Sep
+}
+
+// Kept describes one path skipped during deletion because one or more other
+// installed rows still list it.
+type Kept struct {
+	Path   string
+	Owners []RowID
+}
+
+// DeletePlan partitions candidate deletion entries into unowned files, unowned
+// directories ordered deepest-first, and entries kept because another row owns
+// them.
+type DeletePlan struct {
+	Files []string
+	Dirs  []string
+	Kept  []Kept
+}
+
+// PlanDelete classifies and orders entries (path -> checksum) against ix.
+// Entries still owned by ix go to Kept; unowned entries with a non-empty
+// checksum go to Files sorted by key; unowned entries with an empty checksum
+// go to Dirs sorted by key separator depth descending and then key descending
+// so every descendant precedes its ancestor regardless of byte case.
+func PlanDelete(entries map[string]string, ix *Index) DeletePlan {
+	if len(entries) == 0 {
+		return DeletePlan{}
+	}
+	rawPaths := make([]string, 0, len(entries))
+	for p := range entries {
+		rawPaths = append(rawPaths, p)
+	}
+	slices.Sort(rawPaths)
+
+	var plan DeletePlan
+	for _, p := range rawPaths {
+		if owners := ix.Owners(p); len(owners) > 0 {
+			var ids []RowID
+			for _, o := range owners {
+				if len(ids) == 0 || ids[len(ids)-1] != o.Row {
+					ids = append(ids, o.Row)
+				}
+			}
+			plan.Kept = append(plan.Kept, Kept{Path: p, Owners: ids})
+			continue
+		}
+		if entries[p] != "" {
+			plan.Files = append(plan.Files, p)
+		} else {
+			plan.Dirs = append(plan.Dirs, p)
+		}
+	}
+
+	slices.SortFunc(plan.Files, func(a, b string) int {
+		return cmp.Or(strings.Compare(ix.key(a), ix.key(b)), strings.Compare(a, b))
+	})
+	sepStr := string(ix.sep())
+	slices.SortFunc(plan.Dirs, func(a, b string) int {
+		ka, kb := ix.key(a), ix.key(b)
+		da, db := strings.Count(ka, sepStr), strings.Count(kb, sepStr)
+		return cmp.Or(cmp.Compare(db, da), strings.Compare(kb, ka), strings.Compare(b, a))
+	})
+	slices.SortFunc(plan.Kept, func(a, b Kept) int {
+		return cmp.Or(strings.Compare(ix.key(a.Path), ix.key(b.Path)), strings.Compare(a.Path, b.Path))
+	})
+	return plan
+}
+
+// keptLine formats a structured informational log line for a skipped deletion
+// entry.
+func keptLine(op, pkg string, k Kept) string {
+	parts := make([]string, len(k.Owners))
+	for i, o := range k.Owners {
+		parts[i] = o.String()
+	}
+	return fmt.Sprintf("file_kept op=%s pkg=%s path=%q owners=%s", op, pkg, k.Path, strings.Join(parts, ","))
+}
+
+// Logger receives informational and error log lines during Execute.
+type Logger struct {
+	Infof  func(format string, args ...any)
+	Errorf func(format string, args ...any)
+}
+
+// Execute runs p using rm (client.RemoveOrRename in production) and logs via
+// lg for operation op ("remove" or "upgrade") on package pkg.
+func Execute(p DeletePlan, op, pkg string, rm func(string) (string, error), lg Logger) {
+	infof := lg.Infof
+	if infof == nil {
+		infof = func(string, ...any) {}
+	}
+	errorf := lg.Errorf
+	if errorf == nil {
+		errorf = func(string, ...any) {}
+	}
+
+	for _, k := range p.Kept {
+		infof("%s", keptLine(op, pkg, k))
+	}
+	for _, file := range p.Files {
+		if op == "upgrade" {
+			infof("Cleaning up old file %q", file)
+		} else {
+			infof("Removing %q", file)
+		}
+		if _, err := rm(file); err != nil {
+			errorf("%v", err)
+		}
+	}
+	for _, dir := range p.Dirs {
+		if op == "remove" {
+			infof("Removing %q", dir)
+		}
+		if _, err := rm(dir); err != nil {
+			infof("%v", err)
+		}
+	}
 }
