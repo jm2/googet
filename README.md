@@ -219,6 +219,55 @@ replaces them is recorded, plus the previous versions of upgraded packages
 until each upgrade completes. `googet clean` deletes cached archives
 that don't belong to an installed package.
 
+## Package relations
+
+Package specs declare relationships through `PkgDependencies`, `Provides`,
+`Conflicts` and `Replaces`:
+
+- `Conflicts` and `Replaces` entries accept either the dot-delimited form
+  `name[.arch[.version]]` (where `version`, if present, is a minimum `>=` bound)
+  or an operator form `name[.arch]OPversion` with `OP` one of `<`, `<=`, `=`,
+  `>=` or `>` (for example `foo<2.0.0` or `foo.noarch<2.0.0` in `Replaces`).
+  `PkgDependencies` keys still use `name[.arch]` with the minimum version in the
+  map value, and `Provides` entries use `name[=version]`.
+- Do not put whitespace around the operator (`foo < 2.0.0` is rejected by
+  `goopack`), and ensure every operator version parses as a valid GooGet
+  version; malformed operator strings and unparseable operator versions fail the
+  build.
+- In `Conflicts`, an operator entry must omit the architecture and must not use
+  a dotted package name (`foo.noarch<2.0.0` and `dotted.pkg<2.0.0` are rejected;
+  write `name OP version` instead). GooGet binaries older than 3.5.0 treat the
+  segment before the first dot as the package name and block installation
+  whenever any installed package `Provides` that name, whereas arch-less
+  non-dotted operator entries are ignored by older clients.
+- In `Replaces`, operator entries may include an architecture (for example
+  `foo.x86_64<2.0.0`), because older clients ignore operator `Replaces` entries.
+  When expressing a minimum version `>=` with an architecture in `Replaces`,
+  write the legacy `name.arch.version` form instead of `name.arch>=version` so
+  that clients older than 3.5.0 honour it too (`goopack` warns on
+  `name.arch>=version`).
+- Naming the same package in a legacy `Conflicts` entry and in `Replaces` warns
+  because GooGet binaries older than 3.5.0 check `Conflicts` before `Replaces`
+  and refuse the install. Operator-only `Conflicts` entries paired with
+  `Replaces` (such as `Conflicts: ["foo<2.0.0"]` and `Replaces: ["foo<2.0.0"]`)
+  are ignored on older clients and do not trigger that warning.
+- Version comparisons evaluate semantic version precedence first and then the
+  `@release` suffix:
+  - `=` compares the `@release` suffix strictly (`1.0.0` does not equal
+    `1.0.0@1`), while ignoring semver `+build` metadata (`1.0.0` equals
+    `1.0.0+build5`).
+  - Semver prereleases sort before the release (`2.0.0-rc1 < 2.0.0`), so
+    `foo<2.0.0` matches `2.0.0-rc1` and `foo>=2.0.0` does not. To match only
+    versions strictly older than the `2.0.0` prerelease line, write
+    `foo<2.0.0-0`.
+- An unversioned `Provides` entry (`Provides: ["foo"]`) satisfies every version
+  constraint on `foo`, including `<`, `<=`, `=`, `>=` and `>`, so any bounded
+  `Conflicts` on `foo` still matches an unversioned provider. Declare a
+  versioned `Provides` entry (`Provides: ["foo=2.0.0"]`) whenever operator
+  `Conflicts` or `Replaces` entries name `foo` (`goopack` warns when a package
+  combines an operator `Conflicts` on `foo` with an unversioned `Provides` of
+  `foo`).
+
 ## Repo file
 
 GooGet has the ability to use a repo file to change some repo specific settings.
