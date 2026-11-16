@@ -98,6 +98,11 @@ const (
 	// reasonAmbiguous means more than one package name replaces and provides
 	// the installed package at the best priority.
 	reasonAmbiguous skipReason = "ambiguous_replacers"
+	// reasonSuccessorOutOfRange means a newer version of the installed
+	// package is offered at default priority or higher and the replacing
+	// package's Replaces entries do not cover the installed package at that
+	// newer version.
+	reasonSuccessorOutOfRange skipReason = "successor_out_of_range"
 	// reasonCycle means the replacing package is itself replaced by the
 	// installed package's own best version, by an installed package, or by
 	// a chain of replacing packages that leads back to the installed one.
@@ -406,11 +411,14 @@ func (pl *planner) planReplacement(p *goolib.PkgSpec) {
 // qualifying package is chosen only if (c) it is the only qualifying name at
 // the best priority among them, p's own best version doesn't come from a
 // higher priority, and, when no repository offers p, the best priority isn't
-// below the default; and (d) neither p's best version for any arch, nor an
-// installed package, nor a chain of qualifying packages starting from it
-// replaces it in turn. Names that replace p without providing it never
-// qualify: with cfg.followReplaces set, they are reported as a skip when
-// nothing qualifies, and as a diagnostic when something else does.
+// below the default; whenever p's own best version is offered at default
+// priority or higher and is newer than p, the candidate's Replaces entries
+// still cover p at that newer version; and (d) neither p's best version for
+// any arch, nor an installed package, nor a chain of qualifying packages
+// starting from it replaces it in turn. Names that replace p without
+// providing it never qualify: with cfg.followReplaces set, they are reported
+// as a skip when nothing qualifies, and as a diagnostic when something else
+// does.
 //
 // fallback, if not nil, is the package the Provides fallback would install
 // for p, which replaces p. selectReplacer returns false when it picks
@@ -466,6 +474,16 @@ func (pl *planner) selectReplacer(p, fallback *goolib.PkgSpec) (repocmp.Candidat
 		return repocmp.Candidate{}, false
 	}
 	winner := top[0]
+	// Require pBest.Priority >= priority.Default so a below-default-priority
+	// repository that compareInstalled rejects cannot block a valid
+	// replacement, and check p's installed arch (not pBest.Spec.Arch, which
+	// may be "noarch") so an arch-qualified Replaces entry such as
+	// P.x86_64<2.0.0 still covers an in-range noarch successor.
+	if pBest != nil && pBest.Priority >= priority.Default && versionNewer(pBest.Spec.Version, p.Version) &&
+		!relation.ReplacesInstalled(winner.Spec.Replaces, p.Name, p.Arch, pBest.Spec.Version) {
+		pl.plan.addSkip(replaceSkip{pkg: p, replacer: winner.Spec, reason: reasonSuccessorOutOfRange})
+		return repocmp.Candidate{}, false
+	}
 	if pl.cyclic(p, winner.Spec) {
 		pl.plan.addSkip(replaceSkip{pkg: p, replacer: winner.Spec, reason: reasonCycle})
 		return repocmp.Candidate{}, false
@@ -741,6 +759,12 @@ func providesName(ps *goolib.PkgSpec, name string) bool {
 // whose versions can't be compared don't count.
 func replaces(ps, target *goolib.PkgSpec) bool {
 	return relation.ReplacesInstalled(ps.Replaces, target.Name, target.Arch, target.Version)
+}
+
+// versionNewer reports whether version a parses as strictly newer than b.
+func versionNewer(a, b string) bool {
+	c, err := goolib.Compare(a, b)
+	return err == nil && c > 0
 }
 
 // specsOf returns the specs of cands, in order.

@@ -161,7 +161,11 @@ A package R replaces P only if all of these hold:
    `noarch`, honouring `LockArch`.
 2. R is the only such package name at the best repository priority among
    them, P's own best version doesn't come from a higher priority, and, if no
-   repository offers P, R's priority is at least the default (500).
+   repository offers P, R's priority is at least the default (500). If a newer
+   version of P is offered at the default priority or higher (for P's arch or
+   `noarch`), R's `Replaces` entries must still cover P at that newer version;
+   an upper-bounded entry such as `P<2.0.0` stops replacing P once P `2.0.0`
+   is published.
 3. Neither P's best version for any arch, nor an installed package, nor a
    chain of such replacing packages starting at R, replaces R in turn.
 4. Installing R plans cleanly over the packages installed at that point. With
@@ -177,11 +181,13 @@ exclude each other, for example because one would remove what the other
 installs or install again what the other removes, the first one is scheduled
 and the second is skipped. If R is already installed at
 its best version next to P, `googet update` leaves P alone when it follows
-`Replaces`, and otherwise reports R as already installed. A skipped
+`Replaces` (unless a newer version of P outside R's `Replaces` range is
+offered), and otherwise reports R as already installed. A skipped
 replacement is printed and logged as an `update_replace_skipped` line with one
 of the reasons `missing_provides`, `pinned_priority`, `ambiguous_replacers`,
-`replaces_cycle`, `orphaned_dependents` or `plan_rejected`; a skip that
-`followreplaces` asked for leaves P on its normal upgrade path.
+`successor_out_of_range`, `replaces_cycle`, `orphaned_dependents` or
+`plan_rejected`; a skip that `followreplaces` asked for leaves P on its normal
+upgrade path.
 
 ### Replacing packages is best-effort
 
