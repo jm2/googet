@@ -35,6 +35,7 @@ import (
 	"unicode"
 
 	"github.com/blang/semver"
+	"github.com/google/googet/v2/internal/relsyntax"
 	"github.com/google/googet/v2/priority"
 	"github.com/olekukonko/tablewriter/pkg/twwarp"
 )
@@ -540,11 +541,12 @@ func (ps PkgSpec) PrettyPrint(w io.Writer, fromRepo string) {
 // syntax that build and upload tools must reject.
 var ErrRelationSyntax = errors.New("relation syntax")
 
-// hasForbiddenRelationChar reports whether s contains '<', '>', '=', or any
-// Unicode whitespace character.
+// hasForbiddenRelationChar reports whether s contains a version operator rune
+// ('<', '>' or '=', as relsyntax.IsOpRune defines them) or any Unicode
+// whitespace character.
 func hasForbiddenRelationChar(s string) bool {
 	for _, r := range s {
-		if r == '<' || r == '>' || r == '=' || unicode.IsSpace(r) {
+		if relsyntax.IsOpRune(r) || unicode.IsSpace(r) {
 			return true
 		}
 	}

@@ -15,8 +15,8 @@ limitations under the License.
 // a package spec declares: Conflicts, Replaces, PkgDependencies and Provides.
 //
 // Every relation that names a package is a Requirement: a name, an optional
-// arch and an optional minimum version. A Provides entry is a Provide: a name
-// the package also answers to, with an optional version.
+// arch and an optional version constraint. A Provides entry is a Provide: a
+// name the package also answers to, with an optional version.
 package relation
 
 import (
@@ -27,12 +27,35 @@ import (
 	"strings"
 
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relsyntax"
 )
 
-// Requirement names a package, and optionally an arch and a minimum version.
-// An empty Arch matches any arch.
+// Op is the version operator of a Requirement.
+type Op = relsyntax.Op
+
+// The version operators. OpMin is relsyntax.OpNone, the zero Op: no operator.
+// It means a minimum version, exactly like OpGE; the two differ only in how
+// Entry formats them.
+const (
+	OpMin = relsyntax.OpNone
+	OpLT  = relsyntax.OpLT
+	OpLE  = relsyntax.OpLE
+	OpEQ  = relsyntax.OpEQ
+	OpGE  = relsyntax.OpGE
+	OpGT  = relsyntax.OpGT
+)
+
+// Requirement names a package, and optionally an arch and a version
+// constraint: Op applied to Ver. An empty Arch matches any arch. The zero Op,
+// OpMin, makes Ver a minimum version, and an empty Ver allows any version.
+//
+// Requirement is comparable. PackageInfo drops Op, so use it only for an
+// identity lookup or to display an OpMin requirement; use Entry to display a
+// Conflicts or Replaces requirement.
 type Requirement struct {
-	Name, Arch, Ver string
+	Name, Arch string
+	Op         Op
+	Ver        string
 }
 
 // Provide is a name, and optionally a version, that a package provides in
@@ -42,7 +65,7 @@ type Provide struct {
 }
 
 // ParseRelation parses a Conflicts or Replaces entry of the form
-// name[.arch[.version]]. A version is a minimum.
+// name[.arch[.version]]. A version is a minimum, so the Op is OpMin.
 func ParseRelation(s string) Requirement {
 	pi := goolib.PkgNameSplit(s)
 	return Requirement{Name: pi.Name, Arch: pi.Arch, Ver: pi.Ver}
@@ -74,14 +97,39 @@ func SplitKey(key string) goolib.PackageInfo {
 	return goolib.PackageInfo{Name: key[:i], Arch: key[i+1:]}
 }
 
-// PackageInfo returns r's fields as a PackageInfo.
+// PackageInfo returns r's name, arch and version as a PackageInfo. It drops
+// Op, so use it only for an identity lookup or to display an OpMin
+// requirement.
 func (r Requirement) PackageInfo() goolib.PackageInfo {
 	return goolib.PackageInfo{Name: r.Name, Arch: r.Arch, Ver: r.Ver}
 }
 
-// String formats r as a human-readable requirement clause ("name[.arch][ >= ver]").
+// Entry returns the display form of a Conflicts or Replaces requirement. For
+// OpMin it is the legacy text r.PackageInfo().String(), which leaves out the
+// version when Arch is empty, so the entry "A..3" prints as "A". For any
+// other Op it is name[.arch]OPver, which round-trips through ParseRelation.
+func (r Requirement) Entry() string {
+	if r.Op == OpMin {
+		return r.PackageInfo().String()
+	}
+	name := r.Name
+	if r.Arch != "" {
+		name += "." + r.Arch
+	}
+	return name + r.Op.String() + r.Ver
+}
+
+// String formats r as a human-readable requirement clause: "name[.arch][ >= ver]"
+// for OpMin, and "name[.arch] OP ver" for any other Op.
 func (r Requirement) String() string {
-	return FormatPackageRequirement(r.PackageInfo())
+	if r.Op == OpMin {
+		return FormatPackageRequirement(r.PackageInfo())
+	}
+	name := r.Name
+	if r.Arch != "" {
+		name += "." + r.Arch
+	}
+	return name + " " + r.Op.String() + " " + r.Ver
 }
 
 // FormatPackageRequirement formats pi as a requirement clause ("name[.arch][ >= ver]").
@@ -114,9 +162,11 @@ func (r Requirement) SameIdentity(name, arch string) bool {
 }
 
 // MinInstalled reports whether an installed package with the given name, arch
-// and version is the package r names at r's minimum version or later. The
-// versions are always compared, with an empty version reading as 0.0.0, so it
-// returns an error if either version can't be parsed.
+// and version is the package r names, at a version that meets r's version
+// constraint for any Op. The name is historical: it predates Op, when the
+// constraint was always a minimum. The versions are always compared, with an
+// empty version reading as 0.0.0, so it returns an error if either version
+// can't be parsed.
 func (r Requirement) MinInstalled(name, arch, ver string) (bool, error) {
 	if !r.SameIdentity(name, arch) {
 		return false, nil
@@ -125,13 +175,13 @@ func (r Requirement) MinInstalled(name, arch, ver string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return c < 1, nil
+	return admitsSign(r.Op, -c), nil
 }
 
 // ReplacesInstalled reports whether any of the Replaces entries names an
-// installed package with the given name, arch and version, at the entry's
-// minimum version or later. An entry whose version can't be compared with
-// ver doesn't match.
+// installed package with the given name, arch and version, at a version that
+// meets the entry's version constraint. An entry whose version can't be
+// compared with ver doesn't match.
 func ReplacesInstalled(entries []string, name, arch, ver string) bool {
 	for _, raw := range entries {
 		if ok, err := ParseRelation(raw).MinInstalled(name, arch, ver); err == nil && ok {
@@ -141,8 +191,9 @@ func ReplacesInstalled(entries []string, name, arch, ver string) bool {
 	return false
 }
 
-// Satisfies reports whether version ver meets r's minimum version. An empty
-// minimum or an empty ver always does, without parsing either version.
+// Satisfies reports whether version ver meets r's version constraint. An
+// empty r.Ver or an empty ver always does, for every Op, without parsing
+// either version.
 func (r Requirement) Satisfies(ver string) (bool, error) {
 	if r.Ver == "" || ver == "" {
 		return true, nil
@@ -151,12 +202,32 @@ func (r Requirement) Satisfies(ver string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return c >= 0, nil
+	return admitsSign(r.Op, c), nil
+}
+
+// admitsSign reports whether a version that compares c (negative, zero or
+// positive) with a constraint's version meets the constraint under op. An op
+// that isn't one of the operators admits nothing.
+func admitsSign(op Op, c int) bool {
+	switch op {
+	case OpMin, OpGE:
+		return c >= 0
+	case OpGT:
+		return c > 0
+	case OpEQ:
+		return c == 0
+	case OpLE:
+		return c <= 0
+	case OpLT:
+		return c < 0
+	default:
+		return false
+	}
 }
 
 // SatisfiedBy reports whether provide p satisfies r: p has r's name and its
-// version satisfies r. r's arch is ignored, and a provide without a version
-// satisfies any minimum version.
+// version meets r's version constraint. r's arch is ignored, and a provide
+// without a version satisfies every constraint.
 func (r Requirement) SatisfiedBy(p Provide) (bool, error) {
 	if p.Name != r.Name {
 		return false, nil
@@ -164,10 +235,34 @@ func (r Requirement) SatisfiedBy(p Provide) (bool, error) {
 	return r.Satisfies(p.Ver)
 }
 
-// Resolve returns every spec in installed that r names at r's minimum version
-// or later, using MinInstalled, ordered by name and then arch. Nil specs are
-// skipped, and a spec listed more than once is returned once. It returns an
-// error if a version can't be compared.
+// ProvidedBy reports whether one of ps's Provides entries satisfies r, using
+// SatisfiedBy. A matching entry wins over any entry whose version can't be
+// compared; when none matches, it returns the first version comparison error.
+// A nil ps provides nothing.
+func ProvidedBy(ps *goolib.PkgSpec, r Requirement) (bool, error) {
+	if ps == nil {
+		return false, nil
+	}
+	var firstErr error
+	for _, raw := range ps.Provides {
+		ok, err := r.SatisfiedBy(ParseProvide(raw))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, firstErr
+}
+
+// Resolve returns every spec in installed that r names at a version that
+// meets r's version constraint, using MinInstalled, ordered by name and then
+// arch. Nil specs are skipped, and a spec listed more than once is returned
+// once. It returns an error if a version can't be compared.
 func Resolve(r Requirement, installed []*goolib.PkgSpec) ([]*goolib.PkgSpec, error) {
 	var out []*goolib.PkgSpec
 	for _, ps := range installed {
@@ -176,7 +271,7 @@ func Resolve(r Requirement, installed []*goolib.PkgSpec) ([]*goolib.PkgSpec, err
 		}
 		ok, err := r.MinInstalled(ps.Name, ps.Arch, ps.Version)
 		if err != nil {
-			return nil, fmt.Errorf("checking %s against %s: %v", ps, r.PackageInfo(), err)
+			return nil, fmt.Errorf("checking %s against %s: %v", ps, r.Entry(), err)
 		}
 		if ok && !slices.ContainsFunc(out, func(o *goolib.PkgSpec) bool { return o.Name == ps.Name && o.Arch == ps.Arch }) {
 			out = append(out, ps)
@@ -290,13 +385,8 @@ func Unsatisfied(removing, remaining []*goolib.PkgSpec) ([]Orphan, error) {
 // providesRequirement reports whether ps declares a Provides entry that
 // satisfies r without a version parse error.
 func providesRequirement(ps *goolib.PkgSpec, r Requirement) bool {
-	for _, raw := range ps.Provides {
-		ok, err := r.SatisfiedBy(ParseProvide(raw))
-		if err == nil && ok {
-			return true
-		}
-	}
-	return false
+	ok, _ := ProvidedBy(ps, r)
+	return ok
 }
 
 // uniqueSpecs returns the non-nil specs in in, keeping the first occurrence of
