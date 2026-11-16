@@ -36,6 +36,7 @@ import (
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/ownership"
 	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
@@ -1324,13 +1325,13 @@ func TestBuildConflictMap(t *testing.T) {
 		t.Fatalf("buildConflictMap: %v", err)
 	}
 
-	if _, ok := cm["/path/to/dir1"]; ok {
+	if _, ok := cm.owner("/path/to/dir1"); ok {
 		t.Errorf("buildConflictMap included directory /path/to/dir1")
 	}
-	if owner, ok := cm["/path/to/file1"]; !ok || owner != "pkgA" {
+	if owner, ok := cm.owner("/path/to/file1"); !ok || owner != "pkgA" {
 		t.Errorf("expected /path/to/file1 to map to pkgA, got %v", owner)
 	}
-	if _, ok := cm["/path/to/file2"]; ok {
+	if _, ok := cm.owner("/path/to/file2"); ok {
 		t.Errorf("buildConflictMap included file from excluded package pkgB")
 	}
 }
@@ -1351,9 +1352,12 @@ func TestMakeInstallFunction(t *testing.T) {
 	defer oswrap.RemoveAll(srcDir)
 
 	conflictPath := filepath.Join(dstDir, "conflicting_file")
-	cm := map[string]string{
-		conflictPath: "pkgOwner",
-	}
+	cm := newConflictMap(ownership.NewIndex(client.GooGetState{
+		{
+			PackageSpec:    &goolib.PkgSpec{Name: "pkgOwner", Arch: "noarch", Version: "1.0.0"},
+			InstalledFiles: map[string]string{conflictPath: "chksum"},
+		},
+	}, ownership.RowID{}), "currentPkg")
 
 	f, err := oswrap.Create(filepath.Join(srcDir, "conflicting_file"))
 	if err != nil {

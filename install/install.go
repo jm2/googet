@@ -31,6 +31,7 @@ import (
 	"github.com/google/googet/v2/download"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/ownership"
 	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/progress"
@@ -244,14 +245,14 @@ func extractSpec(pkgPath string) (*goolib.PkgSpec, error) {
 	return goolib.ExtractPkgSpec(f)
 }
 
-func makeInstallFunction(src, dst string, insFiles map[string]string, opts Options, conflictMap map[string]string, u *undo) func(string, os.FileInfo, error) error {
+func makeInstallFunction(src, dst string, insFiles map[string]string, opts Options, cm conflictMap, u *undo) func(string, os.FileInfo, error) error {
 	return func(path string, fi os.FileInfo, err error) (outerr error) {
 		if err != nil {
 			return err
 		}
 		outPath := filepath.Join(dst, strings.TrimPrefix(path, src))
 
-		if owner, ok := conflictMap[outPath]; ok && !fi.IsDir() {
+		if owner, ok := cm.owner(outPath); ok && !fi.IsDir() {
 			if opts.StrictConflicts && !opts.Force {
 				return fmt.Errorf("file conflict: %s is already owned by package %s", outPath, owner)
 			}
@@ -365,23 +366,40 @@ func cleanOldFiles(oldState client.PackageState, insFiles map[string]string) {
 	}
 }
 
-func buildConflictMap(db *googetdb.GooDB, currentPkg string) (map[string]string, error) {
-	conflictMap := make(map[string]string)
-	pkgs, err := db.FetchPkgs("")
-	if err != nil {
-		return nil, err
+// conflictMap looks up file-overlap owners for an incoming package against an
+// ownership.Index, ignoring rows with currentPkg's name and directory entries
+// with empty checksums.
+type conflictMap struct {
+	ix         *ownership.Index
+	currentPkg string
+}
+
+func newConflictMap(ix *ownership.Index, currentPkg string) conflictMap {
+	return conflictMap{ix: ix, currentPkg: currentPkg}
+}
+
+func (cm conflictMap) owner(path string) (string, bool) {
+	if cm.ix == nil {
+		return "", false
 	}
-	for _, p := range pkgs {
-		if p.PackageSpec == nil || p.PackageSpec.Name == currentPkg {
+	var owner string
+	var found bool
+	for _, o := range cm.ix.Owners(path) {
+		if o.Row.Name == cm.currentPkg || o.Checksum == "" {
 			continue
 		}
-		for f, hash := range p.InstalledFiles {
-			if hash != "" {
-				conflictMap[f] = p.PackageSpec.Name
-			}
-		}
+		owner = o.Row.Name
+		found = true
 	}
-	return conflictMap, nil
+	return owner, found
+}
+
+func buildConflictMap(db *googetdb.GooDB, currentPkg string) (conflictMap, error) {
+	pkgs, err := db.FetchPkgs("")
+	if err != nil {
+		return conflictMap{}, err
+	}
+	return newConflictMap(ownership.NewIndex(pkgs, ownership.RowID{}), currentPkg), nil
 }
 
 // errInstallInterrupted is the spinner status error used when an install

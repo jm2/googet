@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/ownership"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
 )
@@ -172,7 +173,12 @@ func TestMakeInstallFunctionUsesOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	owners := map[string]string{filepath.Join(dst, "shared"): "A"}
+	owners := newConflictMap(ownership.NewIndex(client.GooGetState{
+		{
+			PackageSpec:    &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"},
+			InstalledFiles: map[string]string{filepath.Join(dst, "shared"): "chksum"},
+		},
+	}, ownership.RowID{}), "B")
 
 	for _, tc := range []struct {
 		settings bool
