@@ -190,7 +190,7 @@ func (f *relFixture) installArchive(t *testing.T, name string, contents, files m
 	goo := filepath.Join(f.cache, name+".noarch.1.goo")
 	writeGoo(t, goo, contents)
 	ps := &goolib.PkgSpec{Name: name, Arch: "noarch", Version: "1", Files: files}
-	rc := newRecorder(f.db, client.PackageState{LocalPath: goo, PackageSpec: ps}, fromDiskPolicy(false), f.db.AddPkg)
+	rc := newRecorder(f.db, client.PackageState{LocalPath: goo, PackageSpec: ps}, fromDiskPolicy(false), f.db.AddPkgWithTransfers)
 	installed, err := installPkg(goo, ps, Options{}, f.db, rc.record)
 	if err != nil {
 		t.Fatalf("installPkg(%s): %v", name, err)
@@ -366,8 +366,9 @@ func TestCharacterizeConflictsOneWay(t *testing.T) {
 }
 
 // TestCharacterizeOverwrittenFileDeletedOnRemove checks that when B overwrites
-// a file that A installed, removing A keeps the file on disk with B's content
-// because B's database row still lists it.
+// a file that A installed with different content, ownership transfers from A's
+// row to B's row when B is recorded, and removing A keeps the file on disk
+// with B's content.
 func TestCharacterizeOverwrittenFileDeletedOnRemove(t *testing.T) {
 	f := newRelFixture(t, nil, nil)
 	shared := filepath.Join(f.dst, "shared")
@@ -375,6 +376,13 @@ func TestCharacterizeOverwrittenFileDeletedOnRemove(t *testing.T) {
 	f.installArchive(t, "B", map[string]string{"shared": "from B"}, map[string]string{"shared": shared})
 	if b, err := os.ReadFile(shared); err != nil || string(b) != "from B" {
 		t.Fatalf("shared file before removing A = %q, %v; want %q", b, err, "from B")
+	}
+	a, err := f.db.FetchPkg(goolib.PackageInfo{Name: "A", Arch: "noarch"})
+	if err != nil {
+		t.Fatalf("FetchPkg(A): %v", err)
+	}
+	if _, ok := a.InstalledFiles[shared]; ok {
+		t.Errorf("A's InstalledFiles = %v, want %s transferred to B", a.InstalledFiles, shared)
 	}
 
 	f.remove(t, "A")

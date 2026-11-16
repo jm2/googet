@@ -107,8 +107,8 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 		return err
 	}
 
-	rc := newRecorder(db, client.PackageState{LocalPath: dst, PackageSpec: zs}, fromDiskPolicy(ins.opts.DBOnly), func(row client.PackageState) error {
-		return addPkg(db, row)
+	rc := newRecorder(db, client.PackageState{LocalPath: dst, PackageSpec: zs}, fromDiskPolicy(ins.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
+		return addPkg(db, row, transfers)
 	})
 	if _, err := installPkg(dst, zs, ins.opts, db, rc.record); err != nil {
 		return err
@@ -368,7 +368,7 @@ var errInstallInterrupted = errors.New("install interrupted")
 
 // addPkg records an installed package in the database. Tests replace it to
 // make the update fail.
-var addPkg = (*googetdb.GooDB).AddPkg
+var addPkg = (*googetdb.GooDB).AddPkgWithTransfers
 
 // installPkg extracts and installs a package, rendering a spinner on
 // interactive terminals for the duration of the install.
