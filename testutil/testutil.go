@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -105,6 +107,92 @@ func GenGoo(t *testing.T, dir, dst string, ps goolib.PkgSpec) goolib.RepoSpec {
 		Checksum:    fmt.Sprintf("%x", h.Sum(nil)),
 		Source:      filepath.Base(f.Name()),
 		PackageSpec: &ps,
+	}
+}
+
+// BuildGoopack compiles the local goopack binary into a temporary directory
+// for end-to-end archive creation.
+func BuildGoopack(t *testing.T) string {
+	t.Helper()
+	binName := "goopack"
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+	binPath := filepath.Join(t.TempDir(), binName)
+	cmd := exec.Command("go", "build", "-o", binPath, "github.com/google/googet/v2/goopack")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building goopack failed: %v\n%s", err, out)
+	}
+	return binPath
+}
+
+// GenGooWithGoopack invokes goopackBin on a generated .goospec for ps so that
+// installing the built archive writes a payload file named ps.Name into
+// dstDir, and returns the resulting RepoSpec.
+func GenGooWithGoopack(t *testing.T, goopackBin, outDir, dstDir string, ps goolib.PkgSpec) goolib.RepoSpec {
+	t.Helper()
+	workDir := t.TempDir()
+	srcDir := filepath.Join(workDir, "src")
+	if err := os.MkdirAll(srcDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, ps.Name), []byte(ps.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	specMap := map[string]any{
+		"name":            ps.Name,
+		"version":         ps.Version,
+		"arch":            ps.Arch,
+		"replaces":        ps.Replaces,
+		"conflicts":       ps.Conflicts,
+		"provides":        ps.Provides,
+		"pkgDependencies": ps.PkgDependencies,
+		"files": map[string]string{
+			"payload/" + ps.Name: filepath.Join(dstDir, ps.Name),
+		},
+		"sources": []goolib.PkgSources{
+			{
+				Include: []string{ps.Name},
+				Target:  "payload",
+				Root:    srcDir,
+			},
+		},
+	}
+	specJSON, err := json.MarshalIndent(specMap, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	specPath := filepath.Join(workDir, ps.Name+".goospec")
+	if err := os.WriteFile(specPath, specJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(goopackBin, "-output_dir", outDir, specPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("goopack(%s) failed: %v\n%s", ps, err, out)
+	}
+
+	gooFile := ps.String() + ".goo"
+	gooPath := filepath.Join(outDir, gooFile)
+	f, err := os.Open(gooPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := goolib.Checksum(f)
+	if _, err := f.Seek(0, 0); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	extracted, err := goolib.ExtractPkgSpec(f)
+	f.Close()
+	if err != nil {
+		t.Fatalf("ExtractPkgSpec(%s) failed: %v", gooPath, err)
+	}
+	return goolib.RepoSpec{
+		Checksum:    sum,
+		Source:      gooFile,
+		PackageSpec: extracted,
 	}
 }
 
