@@ -15,6 +15,7 @@ package install
 
 import (
 	"github.com/google/googet/v2/client"
+	"github.com/google/googet/v2/internal/ownership"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/logger"
 )
@@ -73,6 +74,25 @@ func removeOldArchives(old client.PackageState) {
 	}
 }
 
+// planCleanup computes the ownership-aware deletion plan for entries in old
+// that insFiles no longer lists under ix's rule.
+func planCleanup(old, insFiles map[string]string, ix *ownership.Index) ownership.DeletePlan {
+	return ownership.PlanDelete(ownership.Dropped(old, insFiles, ix), ix)
+}
+
+// cleanOldFiles deletes dropped entries from oldState that no other installed
+// row in ix still owns, using rm and logging through lg.
+func cleanOldFiles(oldState client.PackageState, insFiles map[string]string, ix *ownership.Index, rm func(string) (string, error), lg ownership.Logger) {
+	if len(oldState.InstalledFiles) == 0 {
+		return
+	}
+	var pkg string
+	if oldState.PackageSpec != nil {
+		pkg = oldState.PackageSpec.String()
+	}
+	ownership.Execute(planCleanup(oldState.InstalledFiles, insFiles, ix), "upgrade", pkg, rm, lg)
+}
+
 // recorder records one install according to its policy. Its record method
 // is installPkg's record hook: it reads the installed rows at most once and
 // writes the installed package's row, before installPkg commits the
@@ -85,8 +105,10 @@ type recorder struct {
 	policy recordPolicy
 	write  func(client.PackageState) error
 	// old is the installed row with row's name and arch before the write,
-	// read only when the policy reconciles it.
+	// and ix indexes the other installed rows' files; both are read only
+	// when the policy reconciles the previous row.
 	old client.PackageState
+	ix  *ownership.Index
 	// written reports that write succeeded.
 	written bool
 }
@@ -105,9 +127,12 @@ func (rc *recorder) record(insFiles map[string]string) error {
 		if err != nil {
 			return err
 		}
+		var name, arch string
 		if rc.row.PackageSpec != nil {
-			rc.old = findExactRow(state, rc.row.PackageSpec.Name, rc.row.PackageSpec.Arch)
+			name, arch = rc.row.PackageSpec.Name, rc.row.PackageSpec.Arch
 		}
+		rc.old = findExactRow(state, name, arch)
+		rc.ix = ownership.NewIndex(state, ownership.RowID{Name: name, Arch: arch})
 	}
 	if err := rc.write(rc.row); err != nil {
 		return err
@@ -123,7 +148,10 @@ func (rc *recorder) finish() {
 		return
 	}
 	if rc.policy.cleanup {
-		cleanOldFiles(rc.old, rc.row.InstalledFiles)
+		cleanOldFiles(rc.old, rc.row.InstalledFiles, rc.ix, client.RemoveOrRename, ownership.Logger{
+			Infof:  logger.Infof,
+			Errorf: logger.Errorf,
+		})
 	}
 	if rc.policy.removeArchive {
 		removeOldArchives(rc.old)
