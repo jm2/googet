@@ -24,7 +24,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/google/googet/v2/client"
@@ -325,31 +324,6 @@ func resolveDst(dst string) string {
 		return "/" + dst
 	}
 	return dst
-}
-
-func cleanOldFiles(oldState client.PackageState, insFiles map[string]string) {
-	if len(oldState.InstalledFiles) == 0 {
-		return
-	}
-	var files []string
-	for file := range oldState.InstalledFiles {
-		if chksum, ok := insFiles[file]; !ok {
-			if chksum == "" {
-				files = append(files, file)
-				continue
-			}
-			logger.Infof("Cleaning up old file %q", file)
-			if _, err := client.RemoveOrRename(file); err != nil {
-				logger.Error(err)
-			}
-		}
-	}
-	sort.Sort(sort.Reverse(sort.StringSlice(files)))
-	for _, dir := range files {
-		if _, err := client.RemoveOrRename(dir); err != nil {
-			logger.Info(err)
-		}
-	}
 }
 
 // conflictMap looks up file-overlap owners for an incoming package against an

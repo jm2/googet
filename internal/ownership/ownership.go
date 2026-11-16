@@ -322,6 +322,25 @@ func keptLine(op, pkg string, k Kept) string {
 	return fmt.Sprintf("file_kept op=%s pkg=%s path=%q owners=%s", op, pkg, k.Path, strings.Join(parts, ","))
 }
 
+// Dropped returns the entries of old that keep does not list under ix's
+// path-equivalence rule, preserving each entry's original path and checksum.
+func Dropped(old, keep map[string]string, ix *Index) map[string]string {
+	if len(old) == 0 {
+		return nil
+	}
+	keepSet := ix.KeySet(keep)
+	var out map[string]string
+	for path, chksum := range old {
+		if !keepSet.Has(path) {
+			if out == nil {
+				out = make(map[string]string)
+			}
+			out[path] = chksum
+		}
+	}
+	return out
+}
+
 // Logger receives informational and error log lines during Execute.
 type Logger struct {
 	Infof  func(format string, args ...any)

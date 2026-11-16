@@ -42,6 +42,7 @@ import (
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
+	"github.com/google/logger"
 )
 
 // captureStdout returns what f writes to os.Stdout.
@@ -878,7 +879,10 @@ func TestCleanOldFiles(t *testing.T) {
 		},
 	}
 
-	cleanOldFiles(st, map[string]string{want: "", dst: ""})
+	cleanOldFiles(st, map[string]string{want: "", dst: ""}, ownership.NewIndex(nil, ownership.RowID{}), client.RemoveOrRename, ownership.Logger{
+		Infof:  logger.Infof,
+		Errorf: logger.Errorf,
+	})
 
 	for _, n := range []string{want, dontCare} {
 		if _, err := oswrap.Stat(n); err != nil {
