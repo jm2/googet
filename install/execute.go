@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/download"
+	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
@@ -221,15 +222,15 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 		Checksum:    s.spec.Checksum,
 		LocalPath:   a.path,
 		PackageSpec: ps,
-	}, applyStepPolicy(ri.opts.DBOnly), func(row client.PackageState) error {
-		if err := ri.addPkg(row); err != nil {
+	}, applyStepPolicy(ri.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
+		if err := ri.addPkg(row, transfers); err != nil {
 			if rec == nil {
 				return err
 			}
 			// Failing now rolls back the package's files and reinstalls the
 			// packages the step removed, so try once more to record it.
 			logger.Errorf("Recording %s failed, trying again: %v", ps, err)
-			return ri.addPkg(row)
+			return ri.addPkg(row, transfers)
 		}
 		return nil
 	})
@@ -252,13 +253,13 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 	return ri.atStage(stageCommitted, ps.String())
 }
 
-// addPkg records row in the database, unless the test hook fails the
-// stageAddPkg stage in its place.
-func (ri *repoInstall) addPkg(row client.PackageState) error {
+// addPkg records row and transfers in the database, unless the test hook fails
+// the stageAddPkg stage in its place.
+func (ri *repoInstall) addPkg(row client.PackageState, transfers []googetdb.FileTransfer) error {
 	if err := ri.atStage(stageAddPkg, row.PackageSpec.String()); err != nil {
 		return err
 	}
-	return addPkg(ri.db, row)
+	return addPkg(ri.db, row, transfers)
 }
 
 // checkRemovals fails, changing nothing, unless removing the packages step s

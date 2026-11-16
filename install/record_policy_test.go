@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/client"
+	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 )
 
@@ -37,31 +38,31 @@ func TestRecordPolicies(t *testing.T) {
 		{
 			name:         "apply_step_real_install",
 			got:          applyStepPolicy(false),
-			want:         recordPolicy{cleanup: true, removeArchive: true},
+			want:         recordPolicy{cleanup: true, removeArchive: true, transfers: true},
 			wantSnapshot: true,
 		},
 		{
 			name:         "apply_step_db_only",
 			got:          applyStepPolicy(true),
-			want:         recordPolicy{cleanup: false, removeArchive: true},
+			want:         recordPolicy{cleanup: false, removeArchive: true, transfers: false},
 			wantSnapshot: true,
 		},
 		{
 			name:         "from_disk_real_install",
 			got:          fromDiskPolicy(false),
-			want:         recordPolicy{cleanup: false, removeArchive: false},
-			wantSnapshot: false,
+			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: true},
+			wantSnapshot: true,
 		},
 		{
 			name:         "from_disk_db_only",
 			got:          fromDiskPolicy(true),
-			want:         recordPolicy{cleanup: false, removeArchive: false},
+			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: false},
 			wantSnapshot: false,
 		},
 		{
 			name:         "recover_reinstall",
 			got:          recoverPolicy(),
-			want:         recordPolicy{cleanup: false, removeArchive: false},
+			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: false},
 			wantSnapshot: false,
 		},
 	}
@@ -141,7 +142,7 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 		}
 
 		var written []client.PackageState
-		err := recordInstall(reader, newRow, applyStepPolicy(false), func(got client.PackageState) error {
+		err := recordInstall(reader, newRow, applyStepPolicy(false), func(got client.PackageState, _ []googetdb.FileTransfer) error {
 			written = append(written, got)
 			return nil
 		})
@@ -195,7 +196,7 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 		}
 
 		writeCalls := 0
-		if err := recordInstall(reader, newRow, applyStepPolicy(true), func(client.PackageState) error {
+		if err := recordInstall(reader, newRow, applyStepPolicy(true), func(client.PackageState, []googetdb.FileTransfer) error {
 			writeCalls++
 			return nil
 		}); err != nil {
@@ -217,11 +218,11 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 
 	t.Run("no_snapshot_policies_do_not_call_fetch_pkgs", func(t *testing.T) {
 		t.Parallel()
-		for _, p := range []recordPolicy{fromDiskPolicy(false), fromDiskPolicy(true), recoverPolicy()} {
+		for _, p := range []recordPolicy{fromDiskPolicy(true), recoverPolicy()} {
 			reader := &countingStateReader{err: errors.New("unexpected snapshot read")}
 			writeCalls := 0
 			row := client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "1"}}
-			if err := recordInstall(reader, row, p, func(client.PackageState) error {
+			if err := recordInstall(reader, row, p, func(client.PackageState, []googetdb.FileTransfer) error {
 				writeCalls++
 				return nil
 			}); err != nil {
@@ -242,7 +243,7 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 		reader := &countingStateReader{err: wantErr}
 		writeCalls := 0
 		row := client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "2"}}
-		err := recordInstall(reader, row, applyStepPolicy(false), func(client.PackageState) error {
+		err := recordInstall(reader, row, applyStepPolicy(false), func(client.PackageState, []googetdb.FileTransfer) error {
 			writeCalls++
 			return nil
 		})
