@@ -603,6 +603,74 @@ func checkRelationVersion(field, raw string, pi PackageInfo) error {
 	return nil
 }
 
+// malformedRelationError returns the fatal syntax error for a Conflicts or
+// Replaces entry that contains an operator rune without matching the operator
+// grammar.
+func malformedRelationError(field, raw string) error {
+	return fmt.Errorf("%w: %s %q is not a valid relation: use name[.arch], or name[.arch]OPversion with OP one of <, <=, =, >=, >", ErrRelationSyntax, field, raw)
+}
+
+// spacedOperatorError returns the fatal syntax error for a Conflicts or
+// Replaces operator entry that contains whitespace around its operator.
+func spacedOperatorError(field, raw string, op relsyntax.Op) error {
+	return fmt.Errorf("%w: %s %q must not contain whitespace around operator %q", ErrRelationSyntax, field, raw, op)
+}
+
+// invalidOperatorVersionError returns the fatal syntax error for a Conflicts
+// or Replaces operator entry whose version cannot be parsed.
+func invalidOperatorVersionError(field, raw, ver string, err error) error {
+	return fmt.Errorf("%w: %s %q has invalid version %q (%v)", ErrRelationSyntax, field, raw, ver, err)
+}
+
+// checkOperatorConflict validates a well-formed operator entry in Conflicts.
+func checkOperatorConflict(raw string, p relsyntax.Parts, unversionedProvides map[string]bool) []error {
+	if p.Spaced {
+		return []error{spacedOperatorError("Conflicts entry", raw, p.Op)}
+	}
+	if p.Arch != "" {
+		return []error{fmt.Errorf("%w: Conflicts entry %q specifies architecture or dotted segment %q with operator %q, which blocks installation on googet before 3.5.0 whenever any installed package provides %q; write %s%s%s", ErrRelationSyntax, raw, p.Arch, p.Op, p.Name, p.Name, p.Op, p.Ver)}
+	}
+	if _, err := ParseVersion(p.Ver); err != nil {
+		return []error{invalidOperatorVersionError("Conflicts entry", raw, p.Ver, err)}
+	}
+	if unversionedProvides[p.Name] {
+		return []error{fmt.Errorf("Conflicts entry %q bounds %q while Provides lists unversioned %q, which satisfies every version constraint; use Provides %q", raw, p.Name, p.Name, p.Name+"=<version>")}
+	}
+	return nil
+}
+
+// checkOperatorReplace validates a well-formed operator entry in Replaces,
+// returning any entry-level problems and whether spec-level cross-checks
+// should continue.
+func checkOperatorReplace(raw string, p relsyntax.Parts) (probs []error, ok bool) {
+	if p.Spaced {
+		return []error{spacedOperatorError("Replaces entry", raw, p.Op)}, false
+	}
+	if _, err := ParseVersion(p.Ver); err != nil {
+		return []error{invalidOperatorVersionError("Replaces entry", raw, p.Ver, err)}, false
+	}
+	if p.Arch != "" && !slices.Contains(validArch, p.Arch) {
+		probs = append(probs, fmt.Errorf("Replaces entry %q has unknown architecture %q (often a dotted package name); matches only a package with that literal architecture", raw, p.Arch))
+	}
+	return probs, true
+}
+
+// unversionedProvideNames returns the set of valid package names that ps lists
+// in Provides without a version.
+func unversionedProvideNames(ps *PkgSpec) map[string]bool {
+	var out map[string]bool
+	for _, raw := range ps.Provides {
+		name, _, hasEq := strings.Cut(raw, "=")
+		if !hasEq && name != "" && !hasForbiddenRelationChar(name) {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
 // RelationProblems reports problems in ps's name and relation fields that
 // verify does not check. Errors that wrap ErrRelationSyntax should fail a
 // build or upload; the rest are warnings. Order: Name, Conflicts, Replaces,
@@ -617,35 +685,62 @@ func (ps *PkgSpec) RelationProblems() []error {
 		probs = append(probs, fmt.Errorf("%w: package name %q must not contain '<', '>', '=' or whitespace", ErrRelationSyntax, ps.Name))
 	}
 
-	conflictNames := make(map[string]bool)
+	unversionedProvides := unversionedProvideNames(ps)
+	legacyConflictNames := make(map[string]bool)
 	for _, raw := range ps.Conflicts {
-		pi, entryProbs, ok := checkRelationEntry("Conflicts entry", raw)
-		probs = append(probs, entryProbs...)
-		if !ok {
-			continue
-		}
-		conflictNames[pi.Name] = true
-		if err := checkRelationVersion("Conflicts entry", raw, pi); err != nil {
-			probs = append(probs, err)
+		switch p := relsyntax.Split(raw); p.Form {
+		case relsyntax.Legacy:
+			pi, entryProbs, ok := checkRelationEntry("Conflicts entry", raw)
+			probs = append(probs, entryProbs...)
+			if !ok {
+				continue
+			}
+			legacyConflictNames[pi.Name] = true
+			if err := checkRelationVersion("Conflicts entry", raw, pi); err != nil {
+				probs = append(probs, err)
+			}
+		case relsyntax.Malformed:
+			probs = append(probs, malformedRelationError("Conflicts entry", raw))
+		case relsyntax.Operator:
+			probs = append(probs, checkOperatorConflict(raw, p, unversionedProvides)...)
 		}
 	}
 
 	warnedBoth := make(map[string]bool)
 	for _, raw := range ps.Replaces {
-		pi, entryProbs, ok := checkRelationEntry("Replaces entry", raw)
-		probs = append(probs, entryProbs...)
-		if !ok {
+		var name, arch string
+		p := relsyntax.Split(raw)
+		switch p.Form {
+		case relsyntax.Legacy:
+			pi, entryProbs, ok := checkRelationEntry("Replaces entry", raw)
+			probs = append(probs, entryProbs...)
+			if !ok {
+				continue
+			}
+			if err := checkRelationVersion("Replaces entry", raw, pi); err != nil {
+				probs = append(probs, err)
+			}
+			name, arch = pi.Name, pi.Arch
+		case relsyntax.Malformed:
+			probs = append(probs, malformedRelationError("Replaces entry", raw))
 			continue
+		case relsyntax.Operator:
+			entryProbs, ok := checkOperatorReplace(raw, p)
+			probs = append(probs, entryProbs...)
+			if !ok {
+				continue
+			}
+			name, arch = p.Name, p.Arch
 		}
-		if err := checkRelationVersion("Replaces entry", raw, pi); err != nil {
-			probs = append(probs, err)
+		if legacyConflictNames[name] && !warnedBoth[name] {
+			warnedBoth[name] = true
+			probs = append(probs, fmt.Errorf("Replaces and Conflicts both name %q: googet before 3.5.0 refuses to install this package while %s is installed", name, name))
 		}
-		if conflictNames[pi.Name] && !warnedBoth[pi.Name] {
-			warnedBoth[pi.Name] = true
-			probs = append(probs, fmt.Errorf("Replaces and Conflicts both name %q: googet before 3.5.0 refuses to install this package while %s is installed", pi.Name, pi.Name))
-		}
-		if ps.Name != "" && pi.Name == ps.Name && (pi.Arch == "" || pi.Arch == ps.Arch) {
+		if ps.Name != "" && name == ps.Name && (arch == "" || arch == ps.Arch) {
 			probs = append(probs, fmt.Errorf("Replaces entry %q names this package itself: upgrading removes the installed version and its dependents first", raw))
+		}
+		if p.Form == relsyntax.Operator && p.Op == relsyntax.OpGE && p.Arch != "" {
+			probs = append(probs, fmt.Errorf("Replaces entry %q uses \">=\" with architecture %q, which googet before 3.5.0 ignores; write %s.%s.%s so older clients honour it", raw, p.Arch, p.Name, p.Arch, p.Ver))
 		}
 	}
 

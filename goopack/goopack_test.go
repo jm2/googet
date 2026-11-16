@@ -253,11 +253,13 @@ func TestCheckRelations(t *testing.T) {
 
 	t.Run("fatal spec prints warnings and returns ErrRelationSyntax", func(t *testing.T) {
 		var buf bytes.Buffer
+		// Arch-qualified operator Conflicts remain fatal because older clients
+		// fail closed when an installed package provides the base name.
 		ps := &goolib.PkgSpec{
 			Name:      "foo",
 			Arch:      "noarch",
 			Version:   "1.0.0",
-			Conflicts: []string{"bar>=1.0", "dotted.pkg"},
+			Conflicts: []string{"bar.noarch>=1.0", "dotted.pkg"},
 		}
 		err := checkRelations(ps, &buf)
 		if !errors.Is(err, goolib.ErrRelationSyntax) {

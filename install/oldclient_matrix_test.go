@@ -14,6 +14,7 @@ limitations under the License.
 package install
 
 import (
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -309,5 +310,73 @@ func TestOldClientMatrixAgainstSQLite(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// hasFatalRelationSyntax reports whether any problem in probs wraps
+// goolib.ErrRelationSyntax.
+func hasFatalRelationSyntax(probs []error) bool {
+	for _, err := range probs {
+		if errors.Is(err, goolib.ErrRelationSyntax) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRelationProblemsPublishingGateFailOpen verifies across every matrix cell
+// that whenever PkgSpec.RelationProblems reports no fatal ErrRelationSyntax
+// error for an operator entry, both 3.4.x (oracle34) and v3.0.0 (oracle30)
+// return pass or noop across all matrix states, never blocking, removing, or
+// returning an error.
+func TestRelationProblemsPublishingGateFailOpen(t *testing.T) {
+	var o34 oracle34
+	var o30 oracle30
+
+	var allowedConflicts, allowedReplaces int
+	for _, cell := range oldClientMatrixCells() {
+		spaced := cell.wsL != "" || cell.wsR != ""
+		hasDotInLHS := strings.Contains(cell.lhs, ".")
+
+		psC := &goolib.PkgSpec{Name: "holder", Arch: "noarch", Version: "1.0.0", Conflicts: []string{cell.entry}}
+		cFatal := hasFatalRelationSyntax(psC.RelationProblems())
+		wantCFatal := spaced || hasDotInLHS
+		if cFatal != wantCFatal {
+			t.Errorf("Conflicts(%q) fatal=%t, want %t (probs=%v)", cell.entry, cFatal, wantCFatal, psC.RelationProblems())
+		}
+
+		psR := &goolib.PkgSpec{Name: "holder", Arch: "noarch", Version: "1.0.0", Replaces: []string{cell.entry}}
+		rFatal := hasFatalRelationSyntax(psR.RelationProblems())
+		wantRFatal := spaced
+		if rFatal != wantRFatal {
+			t.Errorf("Replaces(%q) fatal=%t, want %t (probs=%v)", cell.entry, rFatal, wantRFatal, psR.RelationProblems())
+		}
+
+		states := oldClientMatrixStates(cell)
+		if !cFatal {
+			allowedConflicts++
+			for _, ns := range states {
+				if got := o34.checkConflictsEntry(cell.entry, snapshotFetcher{state: ns.state}); !got.isFailOpen() {
+					t.Fatalf("non-fatal Conflicts(%q) on %s: oracle34=%s, want fail-open", cell.entry, ns.name, got)
+				}
+				if got := o30.checkConflictsEntry(cell.entry, ns.state); !got.isFailOpen() {
+					t.Fatalf("non-fatal Conflicts(%q) on %s: oracle30=%s, want fail-open", cell.entry, ns.name, got)
+				}
+			}
+		}
+		if !rFatal {
+			allowedReplaces++
+			for _, ns := range states {
+				if got := o34.checkReplacesEntry(cell.entry, snapshotFetcher{state: ns.state}); !got.isFailOpen() {
+					t.Fatalf("non-fatal Replaces(%q) on %s: oracle34=%s, want fail-open", cell.entry, ns.name, got)
+				}
+				if got := o30.checkReplacesEntry(cell.entry, ns.state); !got.isFailOpen() {
+					t.Fatalf("non-fatal Replaces(%q) on %s: oracle30=%s, want fail-open", cell.entry, ns.name, got)
+				}
+			}
+		}
+	}
+	if allowedConflicts == 0 || allowedReplaces == 0 {
+		t.Fatalf("expected non-zero allowed cells, got Conflicts=%d Replaces=%d", allowedConflicts, allowedReplaces)
 	}
 }
