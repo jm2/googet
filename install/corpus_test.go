@@ -287,7 +287,7 @@ func runPlan(c corpusCase, rm client.RepoMap, state client.GooGetState) trace {
 	}
 	for _, s := range p.steps {
 		for _, r := range s.removed {
-			tr.Removed = append(tr.Removed, fmt.Sprintf("%q", r.PackageSpec.Name))
+			tr.Removed = append(tr.Removed, fmt.Sprintf("%q", r.row.PackageSpec.Name))
 		}
 		tr.Installs = append(tr.Installs, s.spec.PackageSpec.String())
 	}

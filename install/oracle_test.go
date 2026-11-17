@@ -207,9 +207,9 @@ func (ri *repoInstall) resolveReplacements(ctx context.Context, ps *goolib.PkgSp
 	if err != nil {
 		return err
 	}
-	for _, row := range out.removed {
-		logger.Infof("%s replaces %s, removing", ps, row.PackageSpec)
-		if err := remove.UninstallRow(ctx, row, remove.Options{DBOnly: ri.opts.DBOnly, Downloader: ri.downloader}, db); err != nil {
+	for _, r := range out.removed {
+		logger.Infof("%s replaces %s, removing", ps, r.row.PackageSpec)
+		if err := remove.UninstallRow(ctx, r.row, remove.Options{DBOnly: ri.opts.DBOnly, Downloader: ri.downloader}, db); err != nil {
 			return err
 		}
 	}

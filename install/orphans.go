@@ -81,6 +81,15 @@ func (e *OrphanedDependentsError) Unwrap() error {
 	return ErrOrphanedDependents
 }
 
+// removal is one installed package a plan step removes.
+type removal struct {
+	// row is the installed package row uninstalled at this step.
+	row client.PackageState
+	// victim reports whether one of the step's Replaces entries names row
+	// directly; false indicates a dependent cascaded with the replaced packages.
+	victim bool
+}
+
 // replaceOutcome holds the pure planning result of applying one package's
 // Replaces entries over the working installed state.
 type replaceOutcome struct {
@@ -88,7 +97,7 @@ type replaceOutcome struct {
 	// name-based orphans (before addStep records the incoming package).
 	post client.GooGetState
 	// removed lists the installed rows uninstalled in topological removal order.
-	removed []client.PackageState
+	removed []removal
 	// orphans lists unsatisfied name-based dependency entries at this step.
 	orphans []OrphanedDependent
 	// listed holds Provides-only dependents whose dependencies become
@@ -220,9 +229,12 @@ func planReplacement(ps *goolib.PkgSpec, installed client.GooGetState) (replaceO
 	if err != nil {
 		return replaceOutcome{}, err
 	}
-	removed := make([]client.PackageState, 0, len(order))
+	removed := make([]removal, 0, len(order))
 	for _, k := range order {
-		removed = append(removed, byKey[k])
+		removed = append(removed, removal{
+			row:    byKey[k],
+			victim: slices.Contains(rootKeys, k),
+		})
 	}
 	orphans := make([]OrphanedDependent, 0, len(orphanOrder))
 	for _, rk := range orphanOrder {

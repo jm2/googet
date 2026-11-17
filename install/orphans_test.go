@@ -578,10 +578,10 @@ func TestOrphanFailMatchesOrphanRemoveProperty(t *testing.T) {
 			}
 			removedKeys := make(map[string]bool, len(step.removed))
 			for _, r := range step.removed {
-				rk := pkgKey(r.PackageSpec)
+				rk := pkgKey(r.row.PackageSpec)
 				removedKeys[rk] = true
 				if !victimKeys[rk] {
-					cascadedSet = append(cascadedSet, r.PackageSpec.String())
+					cascadedSet = append(cascadedSet, r.row.PackageSpec.String())
 				}
 			}
 			selfKey := pkgKey(step.spec.PackageSpec)
