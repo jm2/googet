@@ -61,7 +61,7 @@ type planStep struct {
 	// removed lists the installed packages that spec's Replaces entries and
 	// cascaded dependent removal remove before spec is installed, in removal
 	// order.
-	removed []client.PackageState
+	removed []removal
 	// listed holds Provides-only dependents whose dependencies become
 	// unsatisfied when removed are uninstalled; they are reported and kept.
 	listed []relation.Orphan

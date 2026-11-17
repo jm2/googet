@@ -72,7 +72,7 @@ func TestDottedDependentsAgree(t *testing.T) {
 	}
 	var simulated []string
 	for _, r := range out.removed {
-		simulated = append(simulated, pkgKey(r.PackageSpec))
+		simulated = append(simulated, pkgKey(r.row.PackageSpec))
 	}
 	if diff := cmp.Diff(append(slices.Clone(wantOrder), "P.noarch"), simulated); diff != "" {
 		t.Errorf("simulated removals (-want +got):\n%s", diff)

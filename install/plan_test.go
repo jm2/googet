@@ -191,7 +191,7 @@ func TestBuildPlanSteps(t *testing.T) {
 					if len(s.removed) > 0 {
 						var names []string
 						for _, r := range s.removed {
-							names = append(names, r.PackageSpec.String())
+							names = append(names, r.row.PackageSpec.String())
 						}
 						desc += " replacing " + strings.Join(names, ",")
 					}

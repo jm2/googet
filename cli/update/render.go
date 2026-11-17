@@ -16,7 +16,6 @@ package update
 import (
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 
 	"github.com/google/googet/v2/goolib"
@@ -57,18 +56,42 @@ func renderAction(w io.Writer, a updateAction) {
 	logger.Infof("%s for package %s.%s, %s installed and %s.%s, %s available from %s%s.", a.op, a.from.Name, a.from.Arch, a.from.Version, a.to.Name, a.to.Arch, a.to.Version, a.repo, suffix)
 }
 
-// replaceDetail describes what the replacement a removes, as
-// " (replaces P.arch.ver; removes orphaned D.arch.ver)".
+// replaceDetail describes what the replacement a removes, partitioning
+// a.removals into victims of a.to ("replaces ..."), victims of any dependency
+// steps ("<dep> replaces ..."), and cascaded dependents ("removes orphaned ...").
 func replaceDetail(a updateAction) string {
-	parts := []string{"replaces " + joinInfos(a.replaced)}
-	var cascaded []goolib.PackageInfo
-	for _, pi := range a.removed {
-		if !slices.Contains(a.replaced, pi) {
-			cascaded = append(cascaded, pi)
+	winner := specInfo(a.to)
+	var (
+		direct    []goolib.PackageInfo
+		depOrder  []goolib.PackageInfo
+		depByStep = make(map[goolib.PackageInfo][]goolib.PackageInfo)
+		cascaded  []goolib.PackageInfo
+	)
+	for _, r := range a.removals {
+		switch {
+		case r.ReplacedBy == nil:
+			cascaded = append(cascaded, r.Package)
+		case *r.ReplacedBy == winner:
+			direct = append(direct, r.Package)
+		default:
+			if _, seen := depByStep[*r.ReplacedBy]; !seen {
+				depOrder = append(depOrder, *r.ReplacedBy)
+			}
+			depByStep[*r.ReplacedBy] = append(depByStep[*r.ReplacedBy], r.Package)
 		}
+	}
+	var parts []string
+	if len(direct) > 0 {
+		parts = append(parts, "replaces "+joinInfos(direct))
+	}
+	for _, dep := range depOrder {
+		parts = append(parts, dep.Name+"."+dep.Arch+"."+dep.Ver+" replaces "+joinInfos(depByStep[dep]))
 	}
 	if len(cascaded) > 0 {
 		parts = append(parts, "removes orphaned "+joinInfos(cascaded))
+	}
+	if len(parts) == 0 {
+		return ""
 	}
 	return " (" + strings.Join(parts, "; ") + ")"
 }

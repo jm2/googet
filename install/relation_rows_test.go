@@ -71,7 +71,7 @@ func TestCharacterizeMultiArchRowSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("planReplacement(foo..2): %v", err)
 	}
-	if len(out.removed) != 1 || out.removed[0].PackageSpec.String() != "foo.noarch.3" {
-		t.Errorf("planReplacement(foo..2) removed %v, want [foo.noarch.3]", out.removed)
+	if len(out.removed) != 1 || !out.removed[0].victim || out.removed[0].row.PackageSpec.String() != "foo.noarch.3" {
+		t.Errorf("planReplacement(foo..2) removed %v, want [victim foo.noarch.3]", out.removed)
 	}
 }

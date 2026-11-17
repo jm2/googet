@@ -408,14 +408,18 @@ func TestRenderReplaceAndSkip(t *testing.T) {
 		Removed:    []goolib.PackageInfo{{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
 		ReplacedBy: goolib.PackageInfo{Name: "R", Arch: "x86_64", Ver: "2.0.0"},
 	}}}
+	rInfo := specInfo(r)
 	var plan updatePlan
 	plan.addAction(updateAction{op: opReplace, from: p, to: r, repo: "stable",
-		replaced: []goolib.PackageInfo{{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
-		removed:  []goolib.PackageInfo{{Name: "D", Arch: "noarch", Ver: "1.0.0"}, {Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		removals: []install.Removal{
+			{Package: goolib.PackageInfo{Name: "D", Arch: "noarch", Ver: "1.0.0"}},
+			{Package: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, ReplacedBy: &rInfo},
+		},
 	})
 	plan.addAction(updateAction{op: opReplace, from: p, to: r, repo: "stable",
-		replaced: []goolib.PackageInfo{{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
-		removed:  []goolib.PackageInfo{{Name: "P", Arch: "x86_64", Ver: "1.0.0"}},
+		removals: []install.Removal{
+			{Package: goolib.PackageInfo{Name: "P", Arch: "x86_64", Ver: "1.0.0"}, ReplacedBy: &rInfo},
+		},
 	})
 	plan.addAction(updateAction{op: opUpgrade, from: spec("Q.noarch.1.0.0"), to: spec("Q.noarch.2.0.0"), repo: "stable"})
 	plan.addSkip(replaceSkip{pkg: p, reason: reasonAmbiguous, candidates: []*goolib.PkgSpec{spec("R1.x86_64.2.0.0"), spec("R2.x86_64.2.0.0")}})
@@ -516,7 +520,7 @@ func TestRetiredProviderGateKeepsEarlierReplacement(t *testing.T) {
 			targets[pkgKey(a.to)] = true
 		}
 		for _, a := range plan.actions() {
-			for _, pi := range a.removed {
+			for _, pi := range a.removed() {
 				if targets[pi.Name+"."+pi.Arch] {
 					t.Errorf("%s: %s removes %s, which another action installs", tc.order, a.to, pi)
 				}

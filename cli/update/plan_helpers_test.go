@@ -94,6 +94,27 @@ func joinSpecs(specs []*goolib.PkgSpec) string {
 	return "[" + strings.Join(parts, ",") + "]"
 }
 
+func (a updateAction) replaced() []goolib.PackageInfo {
+	var out []goolib.PackageInfo
+	for _, r := range a.removals {
+		if r.ReplacedBy != nil {
+			out = append(out, r.Package)
+		}
+	}
+	return out
+}
+
+func (a updateAction) removed() []goolib.PackageInfo {
+	if len(a.removals) == 0 {
+		return nil
+	}
+	out := make([]goolib.PackageInfo, len(a.removals))
+	for i, r := range a.removals {
+		out[i] = r.Package
+	}
+	return out
+}
+
 // summarize describes the actions and skipped replacements of plan, in
 // order, one string each, leaving out diagnostics and notes.
 func summarize(plan updatePlan) []string {
@@ -104,7 +125,7 @@ func summarize(plan updatePlan) []string {
 			a := e.action
 			s := fmt.Sprintf("%s %s -> %s from %s", a.op, a.from, a.to, a.repo)
 			if a.op == opReplace {
-				s += fmt.Sprintf(" replaced=[%s] removed=[%s]", joinInfos(a.replaced), joinInfos(a.removed))
+				s += fmt.Sprintf(" replaced=[%s] removed=[%s]", joinInfos(a.replaced()), joinInfos(a.removed()))
 			}
 			out = append(out, s)
 		case e.skip != nil:

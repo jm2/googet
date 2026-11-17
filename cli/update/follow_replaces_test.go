@@ -401,7 +401,7 @@ func TestFollowReplacesMultiVictimOrder(t *testing.T) {
 								t.Errorf("%s: replacement is action %d, want it first", order, i)
 							}
 							want := []goolib.PackageInfo{{Name: "P1", Arch: "noarch", Ver: "1.0.0"}, {Name: "P2", Arch: "noarch", Ver: "1.0.0"}}
-							if diff := cmp.Diff(want, a.replaced); diff != "" {
+							if diff := cmp.Diff(want, a.replaced()); diff != "" {
 								t.Errorf("%s: replaced (-want +got):\n%s", order, diff)
 							}
 							continue

@@ -66,13 +66,11 @@ type updateAction struct {
 	to *goolib.PkgSpec
 	// repo is the repository that offers to.
 	repo string
-	// replaced lists, for a replacement, the installed packages that to's
-	// Replaces entries remove, in removal order.
-	replaced []goolib.PackageInfo
-	// removed lists, for a replacement, every installed package the
-	// replacement removes, in removal order: the replaced packages and any
-	// dependents removed with them.
-	removed []goolib.PackageInfo
+	// removals lists, for a replacement, every installed package the
+	// replacement removes, in removal order, together with the step package
+	// whose Replaces entry removes each victim (or a nil ReplacedBy for
+	// cascaded dependents).
+	removals []install.Removal
 }
 
 // info returns the name, arch and version of the package a installs.
@@ -604,7 +602,11 @@ func (pl *planner) scheduleReplacement(p *goolib.PkgSpec, winner repocmp.Candida
 		pl.plan.addSkip(replaceSkip{pkg: p, replacer: winner.Spec, reason: reason, err: err})
 		return
 	}
-	removed, installs := ip.Removals(), ip.Installs()
+	details, installs := ip.RemovalDetails(), ip.Installs()
+	removed := make([]goolib.PackageInfo, len(details))
+	for i, d := range details {
+		removed[i] = d.Package
+	}
 	// This guard is defensive: a winner that matched p's Replaces entry always
 	// removes p, but the replacement must never be scheduled unless it does.
 	if !slices.ContainsFunc(removed, func(pi goolib.PackageInfo) bool { return infoKey(pi) == pkgKey(p) }) {
@@ -627,7 +629,7 @@ func (pl *planner) scheduleReplacement(p *goolib.PkgSpec, winner repocmp.Candida
 			return
 		}
 	}
-	pl.plan.addAction(updateAction{op: opReplace, from: p, to: winner.Spec, repo: winner.Repo, replaced: ip.Replaced(), removed: removed})
+	pl.plan.addAction(updateAction{op: opReplace, from: p, to: winner.Spec, repo: winner.Repo, removals: details})
 	pl.working = ip.State()
 	pl.suppressed[pkgKey(p)] = true
 	for _, pi := range removed {

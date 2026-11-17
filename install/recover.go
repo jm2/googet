@@ -60,6 +60,9 @@ type recordEntry struct {
 	// archive is the path of the package's kept archive, as
 	// remove.LocalArchive resolved it, or "" if only the database changes.
 	archive string
+	// victim reports whether one of the step's Replaces entries named row
+	// directly rather than cascading it as a dependent.
+	victim bool
 }
 
 // removeReplaced uninstalls the installed packages step s replaces, in the
@@ -76,8 +79,8 @@ func (ri *repoInstall) removeReplaced(ctx context.Context, s planStep) (*replace
 	var todo []recordEntry
 	var rows, archives []string
 	for _, r := range s.removed {
-		key := r.PackageSpec.String()
-		row, err := ri.db.FetchPkg(goolib.PackageInfo{Name: r.PackageSpec.Name, Arch: r.PackageSpec.Arch, Ver: r.PackageSpec.Version})
+		key := r.row.PackageSpec.String()
+		row, err := ri.db.FetchPkg(goolib.PackageInfo{Name: r.row.PackageSpec.Name, Arch: r.row.PackageSpec.Arch, Ver: r.row.PackageSpec.Version})
 		if err != nil {
 			return rec, err
 		}
@@ -91,7 +94,7 @@ func (ri *repoInstall) removeReplaced(ctx context.Context, s planStep) (*replace
 			}
 			archives = append(archives, archive)
 		}
-		todo = append(todo, recordEntry{row: row, archive: archive})
+		todo = append(todo, recordEntry{row: row, archive: archive, victim: r.victim})
 		rows = append(rows, key)
 	}
 	line := fmt.Sprintf("replace_record replacer=%s rows=%s archives=%s", s.spec.PackageSpec, strings.Join(rows, ","), strings.Join(archives, ","))
