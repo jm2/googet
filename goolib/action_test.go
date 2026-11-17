@@ -14,6 +14,11 @@ limitations under the License.
 package goolib
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -83,5 +88,60 @@ func TestInstallerContextZeroValue(t *testing.T) {
 	}
 	if got := ic.Action.String(); got != "" {
 		t.Errorf("zero InstallerContext.Action.String() = %q, want empty string", got)
+	}
+}
+
+// TestActionStringMatchesREADMETokens verifies that the non-empty Action.String
+// values and the GOOGET_ACTION tokens documented in README.md are the same set.
+func TestActionStringMatchesREADMETokens(t *testing.T) {
+	readmeBytes, err := os.ReadFile(filepath.Join("..", "README.md"))
+	if err != nil {
+		t.Fatalf("ReadFile(../README.md): %v", err)
+	}
+	readme := string(readmeBytes)
+	const heading = "## Installer environment variables"
+	start := strings.Index(readme, heading)
+	if start < 0 {
+		t.Fatalf("README.md missing %q section", heading)
+	}
+	section := readme[start+len(heading):]
+	if next := strings.Index(section, "\n## "); next >= 0 {
+		section = section[:next]
+	}
+
+	var actionRow string
+	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "| `GOOGET_ACTION` |") {
+			actionRow = line
+			break
+		}
+	}
+	if actionRow == "" {
+		t.Fatalf("README.md section %q missing GOOGET_ACTION table row", heading)
+	}
+
+	codeRe := regexp.MustCompile("`([^`]+)`")
+	var readmeTokens []string
+	for _, m := range codeRe.FindAllStringSubmatch(actionRow, -1) {
+		tok := m[1]
+		if tok == "GOOGET_ACTION" {
+			continue
+		}
+		if !slices.Contains(readmeTokens, tok) {
+			readmeTokens = append(readmeTokens, tok)
+		}
+	}
+	slices.Sort(readmeTokens)
+
+	var codeTokens []string
+	for a := Action(-16); a <= Action(64); a++ {
+		if s := a.String(); s != "" && !slices.Contains(codeTokens, s) {
+			codeTokens = append(codeTokens, s)
+		}
+	}
+	slices.Sort(codeTokens)
+
+	if diff := cmp.Diff(codeTokens, readmeTokens); diff != "" {
+		t.Errorf("README GOOGET_ACTION token set mismatch against Action.String() (-code +readme):\n%s", diff)
 	}
 }
