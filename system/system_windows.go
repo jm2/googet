@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -83,8 +82,22 @@ var (
 		"BracketEnclosed":        `((?:\p{Ps}.*\p{Pe}|".*"))`,
 		"URIProtocol":            `((?:^\p{L})(?:http[s]?|ftp):\/\/)`,
 	}
-	msiSuccessCodes = []int{1641, 3010}
 )
+
+var windowsPaths = pathOps{
+	ext:    filepath.Ext,
+	base:   filepath.Base,
+	join:   filepath.Join,
+	exists: statExists,
+}
+
+// statExists reports whether path may exist. It treats any os.Stat error other
+// than os.ErrNotExist as existing, which keeps the earlier Uninstall behavior of
+// prefixing the extraction directory to the log path only for missing paths.
+func statExists(path string) bool {
+	_, err := os.Stat(path)
+	return !errors.Is(err, os.ErrNotExist)
+}
 
 func addUninstallEntry(dir string, ps *goolib.PkgSpec) error {
 	reg := uninstallBase + "GooGet - " + ps.Name
@@ -225,38 +238,28 @@ func uninstallString(regkey, extension string) string {
 		return ""
 	}
 	defer q.Close()
-	switch extension {
-	case "msi":
-		un, _, err := q.GetStringValue("UninstallString")
-		if err != nil {
-			logger.Error(err)
-			// UninstallString not found, move on
-			return ""
-		}
-		return un
-	default:
-		un, _, err := q.GetStringValue("QuietUninstallString")
-		if err != nil {
-			un, _, err = q.GetStringValue("UninstallString")
-			if err != nil {
-				// UninstallString not found, move on to next entry
-				return ""
-			}
-		}
-		return un
-	}
-
+	return arpUninstallString(extension, func(name string) (string, error) {
+		un, _, err := q.GetStringValue(name)
+		return un, err
+	})
 }
 
-// Install performs a system specfic install given a package extraction directory and a PkgSpec struct.
+// Install performs a system specific install given a package extraction directory and a PkgSpec struct.
 func Install(dir string, ps *goolib.PkgSpec) error {
-	in := ps.Install
-	if in.Path == "" {
+	return InstallWith(dir, ps, goolib.InstallerContext{})
+}
+
+// InstallWith performs a system specific install like Install, passing ic's
+// environment variables to the install command when ic.Action is non-zero.
+func InstallWith(dir string, ps *goolib.PkgSpec, ic goolib.InstallerContext) error {
+	cl, ok := installCmdline(dir, ps, windowsPaths)
+	if !ok {
 		return nil
 	}
 
-	logger.Infof("Running install command: %q", in.Path)
-	out, err := oswrap.Create(filepath.Join(dir, in.Path+".log"))
+	logger.Infof("Running install command: %q", cl.rawPath)
+	logInstallerContext("install", ic)
+	out, err := oswrap.Create(cl.logPath)
 	if err != nil {
 		return err
 	}
@@ -265,30 +268,11 @@ func Install(dir string, ps *goolib.PkgSpec) error {
 			logger.Error(err)
 		}
 	}()
-	s := filepath.Join(dir, in.Path)
-	msiLog := filepath.Join(dir, "msi_install.log")
-	ec := append(msiSuccessCodes, in.ExitCodes...)
-	switch filepath.Ext(s) {
-	case ".msi":
-		args := append([]string{"/i", s, "/qn", "/norestart", "/log", msiLog}, in.Args...)
-		err = goolib.Run(exec.Command("msiexec", args...), ec, out)
-	case ".msp":
-		args := append([]string{"/update", s, "/qn", "/norestart", "/log", msiLog}, in.Args...)
-		err = goolib.Run(exec.Command("msiexec", args...), ec, out)
-	case ".msu":
-		args := append([]string{s, "/quiet", "/norestart"}, in.Args...)
-		err = goolib.Run(exec.Command("wusa", args...), ec, out)
-	case ".exe":
-		err = goolib.Run(exec.Command(s, in.Args...), ec, out)
-	case ".msix", ".msixbundle":
-		// Add-AppxProvisionedPackage will install for all users.
-		installCmd := fmt.Sprintf("Add-AppxProvisionedPackage -online -PackagePath %v -SkipLicense", s)
-		args := append([]string{installCmd}, in.Args...)
-		err = goolib.Run(exec.Command("powershell", args...), ec, out)
-	default:
-		err = goolib.Exec(s, in.Args, in.ExitCodes, out)
-	}
+	cmd, err := buildCmd(cl, goolib.Command, ic)
 	if err != nil {
+		return err
+	}
+	if err := goolib.Run(cmd, cl.exitCodes, out); err != nil {
 		return err
 	}
 
@@ -299,51 +283,23 @@ func Install(dir string, ps *goolib.PkgSpec) error {
 	return nil
 }
 
-// Uninstall performs a system specfic uninstall given a packages PackageState.
+// Uninstall performs a system specific uninstall given a package's PackageState.
 func Uninstall(dir string, state *client.PackageState) error {
-	var filePath string
-	ps := state.PackageSpec
-	un := ps.Uninstall
-	r := regexp.MustCompile(`[^\s"]+|"([^"]*)"`)
-	// Automatically determine uninstall script if none is specified in spec.
-	if un.Path == "" {
-		switch filepath.Ext(ps.Install.Path) {
-		case ".msi":
-			u := uninstallString(state.InstalledApp.Reg, "msi")
-			if u == "" {
-				return nil
-			}
-			u = strings.ReplaceAll(u, `/I`, `/X`)
-			commands := r.FindAllString(u, -1)
-			un.Path = strings.Replace(commands[0], "\"", "", -1)
-			un.Args = []string{"/qn", "/norestart"}
-			un.Args = append(commands[1:], un.Args...)
-			filePath = un.Path
-		case ".msix", ".msixbundle":
-			un.Path = ps.Install.Path
-			filePath = un.Path
-		default:
-			u := uninstallString(state.InstalledApp.Reg, "")
-			commands := r.FindAllString(u, -1)
-			if len(commands) > 0 {
-				// Remove the quotes from the install string since we handle that below
-				un.Path = strings.Replace(commands[0], "\"", "", -1)
-				un.Args = commands[1:]
-				filePath = un.Path
-			}
-		}
-		if un.Path == "" {
-			return nil
-		}
+	return UninstallWith(dir, state, goolib.InstallerContext{})
+}
+
+// UninstallWith performs a system specific uninstall like Uninstall, passing
+// ic's environment variables to the uninstall command when ic.Action is
+// non-zero.
+func UninstallWith(dir string, state *client.PackageState, ic goolib.InstallerContext) error {
+	cl, ok := uninstallCmdline(dir, state, uninstallString, windowsPaths)
+	if !ok {
+		return nil
 	}
-	logger.Infof("Running uninstall command: %q", un.Path)
-	// logging is only useful for failed uninstall
-	// Only append the directory if the folder structure doesn't exist
-	logPath := fmt.Sprintf("%s.log", un.Path)
-	if _, err := os.Stat(un.Path); errors.Is(err, os.ErrNotExist) {
-		logPath = filepath.Join(dir, logPath)
-	}
-	out, err := oswrap.Create(logPath)
+
+	logger.Infof("Running uninstall command: %q", cl.rawPath)
+	logInstallerContext("uninstall", ic)
+	out, err := oswrap.Create(cl.logPath)
 	if err != nil {
 		return err
 	}
@@ -352,33 +308,15 @@ func Uninstall(dir string, state *client.PackageState) error {
 			logger.Error(err)
 		}
 	}()
-	if filePath == "" {
-		filePath = filepath.Join(dir, un.Path)
-	}
-	ec := append(msiSuccessCodes, un.ExitCodes...)
-	switch filepath.Ext(filePath) {
-	case ".msi":
-		msiLog := filepath.Join(dir, "msi_uninstall.log")
-		args := append([]string{"/x", filePath, "/qn", "/norestart", "/log", msiLog}, un.Args...)
-		err = goolib.Run(exec.Command("msiexec", args...), ec, out)
-	case ".msu":
-		args := append([]string{filePath, "/uninstall", "/quiet", "/norestart"}, un.Args...)
-		err = goolib.Run(exec.Command("wusa", args...), ec, out)
-	case ".exe":
-		err = goolib.Run(exec.Command(filePath, un.Args...), ec, out)
-	case ".msix", ".msixbundle":
-		s := strings.Split(filepath.Base(filePath), "_")[0]
-		removeCmd := fmt.Sprintf(`Get-AppxProvisionedPackage -online | Where {$_.DisplayName -match "%v*"} | Remove-AppProvisionedPackage -online -AllUsers`, s)
-		args := append([]string{removeCmd}, un.Args...)
-		err = goolib.Run(exec.Command("powershell", args...), ec, out)
-	default:
-		err = goolib.Exec(filepath.Join(dir, un.Path), un.Args, un.ExitCodes, out)
-	}
+	cmd, err := buildCmd(cl, goolib.Command, ic)
 	if err != nil {
 		return err
 	}
+	if err := goolib.Run(cmd, cl.exitCodes, out); err != nil {
+		return err
+	}
 
-	if err := removeUninstallEntry(ps.Name); err != nil {
+	if err := removeUninstallEntry(state.PackageSpec.Name); err != nil {
 		logger.Error(err)
 	}
 
