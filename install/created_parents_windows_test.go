@@ -168,7 +168,7 @@ func TestWindowsCreatedParentsLongPathAndPartialFailureRollback(t *testing.T) {
 				Version: "1.0.0",
 				Files:   map[string]string{"item.dll": target},
 			}
-			if _, err := installPkg(goo, &ps, Options{}, db, nil); err == nil {
+			if _, err := installPkg(goo, &ps, Options{}, goolib.InstallerContext{}, db, nil); err == nil {
 				t.Fatalf("installPkg(leaf=%q) = nil, want directory creation error", leaf)
 			}
 			entries, err := os.ReadDir(dstRoot)
