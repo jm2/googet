@@ -48,32 +48,45 @@ func scriptInterpreter(s string) (string, error) {
 	return "", fmt.Errorf("unknown extension %q", ext)
 }
 
-// Exec execs a script or binary on either Windows or Linux using the provided args.
-// The process is successful if the exit code matches any of those provided or '0'.
-// stdout and stderr are sent to the writer.
-func Exec(s string, args []string, ec []int, w io.Writer) error {
-	var c *exec.Cmd
-	switch runtime.GOOS {
+// Command returns the command Exec would run for the script or binary s with
+// args, without running it. It fails as Exec does on an unknown extension or
+// an unsupported OS.
+func Command(s string, args []string) (*exec.Cmd, error) {
+	return command(runtime.GOOS, s, args)
+}
+
+func command(goos, s string, args []string) (*exec.Cmd, error) {
+	switch goos {
 	case "windows":
 		cs := filepath.Clean(s)
 		ipr, err := scriptInterpreter(cs)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		switch ipr {
 		case "powershell":
 			// We are using `-Command` here instead of `-File` as this catches syntax errors in the script.
 			args = append([]string{"-ExecutionPolicy", "Bypass", "-NonInteractive", "-NoProfile", "-Command", cs}, args...)
-			c = exec.Command(ipr, args...)
+			return exec.Command(ipr, args...), nil
 		case "cmd":
-			c = exec.Command(cs, args...)
+			return exec.Command(cs, args...), nil
 		default:
-			return fmt.Errorf("unknown interpreter: %q", ipr)
+			return nil, fmt.Errorf("unknown interpreter: %q", ipr)
 		}
 	case "linux":
-		c = exec.Command(s, args...)
+		return exec.Command(s, args...), nil
 	default:
-		return fmt.Errorf("OS %q is not Windows or Linux", runtime.GOOS)
+		return nil, fmt.Errorf("OS %q is not Windows or Linux", goos)
+	}
+}
+
+// Exec execs a script or binary on either Windows or Linux using the provided args.
+// The process is successful if the exit code matches any of those provided or '0'.
+// stdout and stderr are sent to the writer.
+func Exec(s string, args []string, ec []int, w io.Writer) error {
+	c, err := Command(s, args)
+	if err != nil {
+		return err
 	}
 	return Run(c, ec, w)
 }
