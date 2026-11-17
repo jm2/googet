@@ -225,6 +225,26 @@ replaces them is recorded, plus the previous versions of upgraded packages
 until each upgrade completes. `googet clean` deletes cached archives
 that don't belong to an installed package.
 
+## Installer environment variables
+
+When GooGet runs a package's install or uninstall command, it sets:
+
+| Variable | Value |
+|---|---|
+| `GOOGET_ACTION` | Always set. Install commands: `install`, `upgrade`, `downgrade`, `reinstall`, `recover`. Uninstall commands: `remove`, `replace`, `remove-dependent`. |
+| `GOOGET_PACKAGE` | `name.arch.version` of the package whose command runs. Names may contain dots, so strip your package's known `name.arch.` prefix to get the version. |
+| `GOOGET_PREVIOUS_VERSION` | Always set. For `upgrade`, `downgrade` and `reinstall`: the version of the same `name.arch` installed when the command starts. Empty for every other action, including an install whose package replaces its own earlier version: that version was already removed with `replace`, so the install is fresh. Treat empty and unset alike. |
+| `GOOGET_REPLACED_BY` | Set only with `replace`: `name.arch.version` of the replacing package. |
+
+- `replace`: another package takes over this one, so an uninstall command can skip destructive cleanup such as configuration or user data.
+- `remove-dependent`: a package removed because a package it depends on was replaced and nothing else satisfies it. Treat it like `remove`.
+- `recover`: reinstalls a package that a failed replacement removed.
+- If `GOOGET_ACTION` is unset or has a value you don't recognize, treat it as `install` in an install command and as `remove` in an uninstall command. That's what earlier GooGet versions always meant.
+- The `GOOGET_` prefix is reserved. GooGet removes every inherited variable whose name starts with `GOOGET_` (in any case) from the install and uninstall commands it runs.
+- Verify commands, goopack build commands, and programs that call the `system` package directly get no variables from GooGet. They inherit GooGet's environment unchanged, including any `GOOGET_` variables already set in it.
+- With `-db_only`, no command runs.
+- The variables reach only the command GooGet starts and the processes it starts in turn. They don't reach Windows Installer custom actions (immediate or deferred), `wusa` or Appx deployment, services, or scheduled tasks.
+
 ## File ownership
 
 `strictconflicts` defaults to `false` in `googet.conf`: when a package installs

@@ -133,7 +133,7 @@ func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.Packa
 		if uninstallHookObserver != nil {
 			uninstallHookObserver(ic)
 		}
-		if err := system.UninstallWith(eDir, &ps, goolib.InstallerContext{}); err != nil {
+		if err := system.UninstallWith(eDir, &ps, ic); err != nil {
 			return err
 		}
 

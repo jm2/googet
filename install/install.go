@@ -641,7 +641,7 @@ func installPkgInner(pkg string, ps *goolib.PkgSpec, opts Options, ic goolib.Ins
 		if installHookObserver != nil {
 			installHookObserver(ic)
 		}
-		if err := system.InstallWith(dir, ps, goolib.InstallerContext{}); err != nil {
+		if err := system.InstallWith(dir, ps, ic); err != nil {
 			return nil, err
 		}
 		u.recordDirs(insFiles)
