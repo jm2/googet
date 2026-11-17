@@ -43,7 +43,7 @@ func TestInstallCaseVariantConflict(t *testing.T) {
 		Version: "1",
 		Files:   map[string]string{"Shared.dll": upperPath},
 	}
-	if _, err := installPkg(gooA, specA, Options{}, f.db, func(insFiles map[string]string) error {
+	if _, err := installPkg(gooA, specA, Options{}, goolib.InstallerContext{}, f.db, func(insFiles map[string]string) error {
 		return f.db.AddPkg(client.PackageState{
 			LocalPath:      gooA,
 			PackageSpec:    specA,
@@ -63,7 +63,7 @@ func TestInstallCaseVariantConflict(t *testing.T) {
 	}
 
 	// StrictConflicts without Force rejects the case-variant overlap.
-	_, err := installPkg(gooB, specB, Options{StrictConflicts: true}, f.db, nil)
+	_, err := installPkg(gooB, specB, Options{StrictConflicts: true}, goolib.InstallerContext{}, f.db, nil)
 	wantConflict := "file conflict: " + lowerPath + " is already owned by package A"
 	if err == nil || !strings.Contains(err.Error(), wantConflict) {
 		t.Fatalf("installPkg(B, StrictConflicts) = %v, want error containing %q", err, wantConflict)
@@ -76,7 +76,7 @@ func TestInstallCaseVariantConflict(t *testing.T) {
 	// The console copy goes through the progress package, which keeps the
 	// os.Stdout it saw at start-up, so only the logged warning is checked.
 	logs := testutil.CaptureLogs(t)
-	if _, err := installPkg(gooB, specB, Options{}, f.db, nil); err != nil {
+	if _, err := installPkg(gooB, specB, Options{}, goolib.InstallerContext{}, f.db, nil); err != nil {
 		t.Fatalf("installPkg(B, default) unexpected error: %v", err)
 	}
 	if !strings.Contains(logs.String(), "Warning: "+wantConflict) {

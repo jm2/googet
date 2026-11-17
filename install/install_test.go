@@ -246,7 +246,7 @@ func TestInstallPkg(t *testing.T) {
 	}
 
 	ps := goolib.PkgSpec{Files: map[string]string{"./": dst}}
-	got, err := installPkg(f.Name(), &ps, Options{}, db, nil)
+	got, err := installPkg(f.Name(), &ps, Options{}, goolib.InstallerContext{}, db, nil)
 	if err != nil {
 		t.Fatalf("Error running installPkg: %v", err)
 	}
@@ -376,7 +376,7 @@ func TestInstallPkgRollback(t *testing.T) {
 				ps.Files[src] = filepath.Join(dst, rel)
 			}
 
-			_, err = installPkg(pkg, &ps, Options{}, db, nil)
+			_, err = installPkg(pkg, &ps, Options{}, goolib.InstallerContext{}, db, nil)
 			want := tc.want
 			if want == nil {
 				want = before

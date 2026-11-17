@@ -234,7 +234,11 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 		}
 		return nil
 	})
-	if _, err := installPkg(a.path, ps, ri.opts, db, func(insFiles map[string]string) error {
+	var ic goolib.InstallerContext
+	if !ri.opts.DBOnly {
+		ic = installContext(s)
+	}
+	if _, err := installPkg(a.path, ps, ri.opts, ic, db, func(insFiles map[string]string) error {
 		if err := ri.atStage(stageAfterInstall, ps.String()); err != nil {
 			return err
 		}

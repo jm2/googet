@@ -98,7 +98,8 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 	if err != nil {
 		return err
 	}
-	if _, err := buildPlan(planTarget{spec: zs}, nil, state, nil, planPolicy{conflicts: ins.opts.PackageConflicts}, liveSink{}); err != nil {
+	p, err := buildPlan(planTarget{spec: zs}, nil, state, nil, planPolicy{conflicts: ins.opts.PackageConflicts}, liveSink{})
+	if err != nil {
 		return err
 	}
 
@@ -110,7 +111,11 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 	rc := newRecorder(db, client.PackageState{LocalPath: dst, PackageSpec: zs}, nil, fromDiskPolicy(ins.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
 		return addPkg(db, row, transfers)
 	})
-	if _, err := installPkg(dst, zs, ins.opts, db, rc.record); err != nil {
+	var ic goolib.InstallerContext
+	if !ins.opts.DBOnly {
+		ic = installContext(p.steps[0])
+	}
+	if _, err := installPkg(dst, zs, ins.opts, ic, db, rc.record); err != nil {
 		return err
 	}
 	rc.finish()
@@ -168,7 +173,7 @@ func Reinstall(ctx context.Context, ps client.PackageState, rd, force bool, down
 	// The reinstall is recorded before its file changes are committed, so a
 	// failure to record it puts back the files it overwrote.
 	rc := newRecorder(db, ps, nil, reinstallPolicy(), db.AddPkgWithTransfers)
-	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, OptionsFromSettings(false, force), db, rc.record); err != nil {
+	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, OptionsFromSettings(false, force), reinstallContext(ps), db, rc.record); err != nil {
 		return fmt.Errorf("error reinstalling package: %v", err)
 	}
 	rc.finish()
@@ -377,19 +382,24 @@ var addPkg = (*googetdb.GooDB).AddPkgWithTransfers
 // installPkg extracts and installs a package, rendering a spinner on
 // interactive terminals for the duration of the install.
 //
+// installPkg places the package's files, runs its install command with ic's
+// environment variables unless opts.DBOnly is set, adds the directories it
+// created to the installed files unless opts.DBOnly is set, and then calls
+// record, before it commits its file changes. With opts.DBOnly set it places
+// no files and runs no command, but still calls record.
+//
 // If record is not nil, it must persist the install, such as by recording it
-// in the database. It is called with the installed files after the files are
-// placed and the installer has succeeded. If it fails or panics, the placed
-// files are rolled back, but changes made by the installer are not. The
-// backups of overwritten files are kept until record succeeds.
-func installPkg(pkg string, ps *goolib.PkgSpec, opts Options, db *googetdb.GooDB, record func(insFiles map[string]string) error) (insFiles map[string]string, err error) {
+// in the database. If it fails or panics, the placed files are rolled back,
+// but changes made by the installer are not. The backups of overwritten files
+// are kept until record succeeds. Only tests pass a nil record.
+func installPkg(pkg string, ps *goolib.PkgSpec, opts Options, ic goolib.InstallerContext, db *googetdb.GooDB, record func(insFiles map[string]string) error) (insFiles map[string]string, err error) {
 	sp := progress.NewSpinner(fmt.Sprintf("Installing %s.%s.%s", ps.Name, ps.Arch, ps.Version))
 	// The spinner is stopped by a deferred call so that no exit path leaves it
 	// redrawing. A normal return overwrites err before the deferred call runs;
 	// a panic leaves errInstallInterrupted in place, so it renders "failed".
 	err = errInstallInterrupted
 	defer func() { sp.Stop(err) }()
-	return installPkgInner(pkg, ps, opts, db, record)
+	return installPkgInner(pkg, ps, opts, ic, db, record)
 }
 
 // backupInfix marks the backup of a file that an install overwrites.
@@ -593,7 +603,7 @@ func (u *undo) recordDirs(insFiles map[string]string) {
 // installPkgInner implements installPkg. It owns the journal of the
 // filesystem changes: if any step, including record, fails or panics, the
 // files it placed are removed and the files it overwrote are restored.
-func installPkgInner(pkg string, ps *goolib.PkgSpec, opts Options, db *googetdb.GooDB, record func(insFiles map[string]string) error) (map[string]string, error) {
+func installPkgInner(pkg string, ps *goolib.PkgSpec, opts Options, ic goolib.InstallerContext, db *googetdb.GooDB, record func(insFiles map[string]string) error) (map[string]string, error) {
 	dir, err := download.ExtractPkg(pkg)
 	if err != nil {
 		return nil, err
@@ -628,7 +638,10 @@ func installPkgInner(pkg string, ps *goolib.PkgSpec, opts Options, db *googetdb.
 	}
 
 	if !opts.DBOnly {
-		if err := system.Install(dir, ps); err != nil {
+		if installHookObserver != nil {
+			installHookObserver(ic)
+		}
+		if err := system.InstallWith(dir, ps, goolib.InstallerContext{}); err != nil {
 			return nil, err
 		}
 		u.recordDirs(insFiles)
