@@ -165,9 +165,13 @@ func Reinstall(ctx context.Context, ps client.PackageState, rd, force bool, down
 		}
 	}
 
-	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, OptionsFromSettings(false, force), db, nil); err != nil {
+	// The reinstall is recorded before its file changes are committed, so a
+	// failure to record it puts back the files it overwrote.
+	rc := newRecorder(db, ps, reinstallPolicy(), db.AddPkgWithTransfers)
+	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, OptionsFromSettings(false, force), db, rc.record); err != nil {
 		return fmt.Errorf("error reinstalling package: %v", err)
 	}
+	rc.finish()
 
 	logger.Infof("Reinstallation of %s.%s, version %s completed", spec.Name, spec.Arch, spec.Version)
 	fmt.Printf("Reinstallation of %s.%s %s completed\n", spec.Name, spec.Arch, spec.Version)

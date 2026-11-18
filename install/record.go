@@ -66,6 +66,13 @@ func recoverPolicy() recordPolicy {
 	return recordPolicy{}
 }
 
+func reinstallPolicy() recordPolicy {
+	return recordPolicy{
+		cleanup:   true,
+		transfers: true,
+	}
+}
+
 func (p recordPolicy) needsSnapshot() bool {
 	return p.cleanup || p.removeArchive || p.transfers
 }
