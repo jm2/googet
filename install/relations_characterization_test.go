@@ -22,10 +22,13 @@ package install
 
 import (
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -49,6 +52,10 @@ type relFixture struct {
 	cache      string
 	dst        string
 	downloader *client.Downloader
+
+	mu sync.Mutex
+	// gets counts the requests for each archive the repo serves.
+	gets map[string]int
 }
 
 // newRelFixture installs the installed packages by writing their files and
@@ -65,8 +72,16 @@ func newRelFixture(t *testing.T, installed, available []goolib.PkgSpec) *relFixt
 	if err != nil {
 		t.Fatalf("client.NewDownloader: %v", err)
 	}
-	f := &relFixture{db: db, gooDir: t.TempDir(), cache: t.TempDir(), dst: t.TempDir(), downloader: downloader}
-	srv := testutil.ServeGoo(t, f.gooDir)
+	f := &relFixture{db: db, gooDir: t.TempDir(), cache: t.TempDir(), dst: t.TempDir(), downloader: downloader, gets: map[string]int{}}
+	serve := testutil.GooHandler(t, f.gooDir)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			f.mu.Lock()
+			f.gets[strings.TrimPrefix(r.URL.Path, "/")]++
+			f.mu.Unlock()
+		}
+		serve.ServeHTTP(w, r)
+	}))
 	t.Cleanup(srv.Close)
 
 	var state client.GooGetState
@@ -97,6 +112,13 @@ func newRelFixture(t *testing.T, installed, available []goolib.PkgSpec) *relFixt
 	}
 	f.rm = client.RepoMap{srv.URL: client.Repo{Priority: priority.Default, Packages: specs}}
 	return f
+}
+
+// getCount returns how many times the archive named file was requested.
+func (f *relFixture) getCount(file string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gets[file]
 }
 
 // archive returns the path of the served archive for the available package
@@ -235,12 +257,12 @@ func TestCharacterizeReplaceRemovesDependents(t *testing.T) {
 	}
 }
 
-// TestCharacterizeReplaceBeforeDownload pins that the replaced package is
-// uninstalled, and its cached archive deleted, before the replacing package
-// is downloaded, so a failed download leaves neither package installed.
+// TestCharacterizeReplaceBeforeDownload pins that the replacing package is
+// downloaded and verified before the replaced package is uninstalled, so a
+// failed download leaves the replaced package installed, with its file and
+// its cached archive.
 //
-// Known wrong: a fix should download and verify R before removing anything,
-// leaving P installed with its file and cached archive.
+// Intended: nothing changes until every archive the install needs is cached.
 func TestCharacterizeReplaceBeforeDownload(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -265,14 +287,14 @@ func TestCharacterizeReplaceBeforeDownload(t *testing.T) {
 			if err := f.install(t, "R"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("install R = %v, want an error containing %q", err, tc.wantErr)
 			}
-			if got := f.installed(t); len(got) != 0 {
-				t.Errorf("installed packages after failed replace = %v, want none (today P is removed first)", got)
+			if diff := cmp.Diff([]string{"P.noarch.1"}, f.installed(t)); diff != "" {
+				t.Errorf("installed packages after failed replace (-want +got):\n%s", diff)
 			}
-			if f.fileExists("P") {
-				t.Errorf("P's file still exists; today P is uninstalled before R is downloaded")
+			if !f.fileExists("P") {
+				t.Errorf("P's file was removed although R couldn't be downloaded")
 			}
-			if _, err := os.Stat(p.LocalPath); !os.IsNotExist(err) {
-				t.Errorf("P's cached archive: Stat error = %v, want it deleted (today P's cache is removed with P)", err)
+			if _, err := os.Stat(p.LocalPath); err != nil {
+				t.Errorf("P's cached archive: %v, want it kept", err)
 			}
 		})
 	}

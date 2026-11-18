@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -69,45 +68,8 @@ func replaceVictim(r relation.Requirement, db *googetdb.GooDB) (client.PackageSt
 	return minInstalledRow(r, db)
 }
 
-// minInstalled reports whether the package r names is installed at r's
-// minimum version or later. It checks the single installed row that
-// db.FetchPkg picks for r.
-func minInstalled(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
-	_, ok, err := minInstalledRow(r, db)
-	return ok, err
-}
-
-// isSatisfied reports whether the package dependency is satisfied by an installed package
-// or a package that provides it.
-func isSatisfied(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
-	// First check if the package itself is installed.
-	ok, err := minInstalled(r, db)
-	if err != nil {
-		return false, err
-	}
-	if ok {
-		return true, nil
-	}
-
-	// Check if any installed package provides this dependency.
-	pkgs, err := db.FetchPkgs("")
-	if err != nil {
-		return false, err
-	}
-	for _, p := range pkgs {
-		if p.PackageSpec == nil {
-			continue
-		}
-		for _, prov := range p.PackageSpec.Provides {
-			if client.SatisfiesProvider(prov, r.Name, r.Ver) {
-				return true, nil
-			}
-		}
-	}
-	return false, nil
-}
-
-// minInstalledRowIn is minInstalledRow over the installed state st.
+// minInstalledRowIn returns the row of the installed state st that
+// snapshot.Pick selects for r if it meets r's minimum version.
 func minInstalledRowIn(r relation.Requirement, st client.GooGetState) (client.PackageState, bool, error) {
 	p, ok := snapshot.Pick(r.PackageInfo(), st)
 	if !ok {
@@ -120,9 +82,9 @@ func minInstalledRowIn(r relation.Requirement, st client.GooGetState) (client.Pa
 	return p, true, nil
 }
 
-// satisfiedIn is isSatisfied over the installed state st: it reports whether
-// the row snapshot.Pick selects for r meets r's minimum version, or else
-// whether any installed package provides r.
+// satisfiedIn reports whether the dependency r is satisfied in the installed
+// state st: either the row snapshot.Pick selects for r meets r's minimum
+// version, or some installed package provides r.
 func satisfiedIn(r relation.Requirement, st client.GooGetState) (bool, error) {
 	if _, ok, err := minInstalledRowIn(r, st); err != nil || ok {
 		return ok, err
@@ -217,6 +179,9 @@ type repoInstall struct {
 	rm         client.RepoMap
 	archs      []string
 	downloader *client.Downloader
+	// stageHook, if set, is called at each applyStage and can fail the
+	// install there. Only tests set it.
+	stageHook func(stage applyStage, step string) error
 }
 
 // resolveReplacements removes the installed packages that ps replaces, along
@@ -250,58 +215,6 @@ func (ri *repoInstall) resolveReplacements(ctx context.Context, ps *goolib.PkgSp
 	return nil
 }
 
-// installDeps installs the dependencies of ps and then removes the packages it
-// replaces. chain lists the packages, as name.arch, whose dependencies are
-// being installed further up the call stack.
-func (ri *repoInstall) installDeps(ctx context.Context, ps *goolib.PkgSpec, chain []string) error {
-	db := ri.db
-	logger.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
-	ex, err := repoExclusions(ps, db)
-	if err != nil {
-		return err
-	}
-	deferred, err := checkConflicts(ps, ex, ri.opts.PackageConflicts, db)
-	if err != nil {
-		return err
-	}
-	// Check for and install any dependencies, in a fixed order.
-	for _, p := range slices.Sorted(maps.Keys(ps.PkgDependencies)) {
-		ver := ps.PkgDependencies[p]
-		pi := relation.ParseDependency(p, ver)
-		ok, err := isSatisfied(pi, db)
-		if err != nil {
-			return err
-		} else if ok {
-			logger.Infof("Dependency met: %s.%s with version greater than %s installed or provided", pi.Name, pi.Arch, ver)
-			continue
-		}
-
-		installedArch, isLocked, _, _, err := db.InstalledLockState(pi.Name)
-		if err != nil {
-			logger.Infof("Error fetching installed package state: %v, proceeding without lock", err)
-		}
-		spec, repo, _, err := client.FindRepoLatest(goolib.PackageInfo{Name: pi.Name, Arch: pi.Arch, Ver: ver}, ri.rm, ri.archs, installedArch, isLocked)
-		if err != nil {
-			return err
-		}
-		if spec.Name == ps.Name && spec.Arch == ps.Arch {
-			return fmt.Errorf("dependency %s of %s.%s resolves to the package itself", p, ps.Name, ps.Arch)
-		}
-
-		logger.Infof("Dependency found: %s.%s %s (provides %s) is available", spec.Name, spec.Arch, spec.Version, pi.Name)
-		if err := ri.fromRepo(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, chain); err != nil {
-			return err
-		}
-	}
-	if err := deferred.recheckBeforeReplacements(ps, ri.opts.PackageConflicts, db); err != nil {
-		return err
-	}
-	if err := ri.resolveReplacements(ctx, ps); err != nil {
-		return err
-	}
-	return deferred.recheck(ps, ri.opts.PackageConflicts, db)
-}
-
 // FromRepo installs pi and its dependencies from rm.
 func (ins *Installer) FromRepo(ctx context.Context, pi goolib.PackageInfo, repo string, rm client.RepoMap, archs []string, downloader *client.Downloader) error {
 	ri := &repoInstall{
@@ -310,87 +223,12 @@ func (ins *Installer) FromRepo(ctx context.Context, pi goolib.PackageInfo, repo 
 		archs:      archs,
 		downloader: downloader,
 	}
-	return ri.fromRepo(ctx, pi, repo, nil)
+	return ri.fromRepo(ctx, pi, repo)
 }
 
 // FromRepo installs a package and all dependencies from a repository.
 func FromRepo(ctx context.Context, pi goolib.PackageInfo, repo, cache string, rm client.RepoMap, archs []string, dbOnly, force bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	return New(cache, db, OptionsFromSettings(dbOnly, force)).FromRepo(ctx, pi, repo, rm, archs, downloader)
-}
-
-// fromRepo is FromRepo for a package that is a dependency of the packages in
-// chain. A package that is already in chain depends on itself through a
-// cycle, which is an error: installing it would recurse forever.
-func (ri *repoInstall) fromRepo(ctx context.Context, pi goolib.PackageInfo, repo string, chain []string) error {
-	db, rm := ri.db, ri.rm
-	logger.Infof("Starting install of %s.%s.%s", pi.Name, pi.Arch, pi.Ver)
-	fmt.Printf("Installing %s.%s.%s and dependencies...\n", pi.Name, pi.Arch, pi.Ver)
-	// When a specific version is requested, look for an exact match in the repository.
-	// Virtual package resolution is not currently supported for specific versions.
-	// If no version is specified, resolve the latest version handling both
-	// direct matches and providers.
-	if pi.Ver == "" {
-		installedArch, isLocked, _, _, err := db.InstalledLockState(pi.Name)
-		if err != nil {
-			logger.Infof("Error fetching installed package state: %v, proceeding without lock", err)
-		}
-		spec, repoURL, _, err := client.FindRepoLatest(pi, rm, ri.archs, installedArch, isLocked)
-		if err != nil {
-			return err
-		}
-		repo = repoURL
-		// Use the resolved real package name and version.
-		pi.Name = spec.Name
-		pi.Arch = spec.Arch
-		pi.Ver = spec.Version
-	}
-
-	rs, err := client.FindRepoSpec(pi, rm[repo])
-	if err != nil {
-		return err
-	}
-	key := rs.PackageSpec.Name + "." + rs.PackageSpec.Arch
-	if at := slices.Index(chain, key); at >= 0 {
-		return fmt.Errorf("cannot install %s: dependency cycle %s", chain[0], strings.Join(append(slices.Clone(chain[at:]), key), " -> "))
-	}
-	if err := ri.installDeps(ctx, rs.PackageSpec, append(slices.Clone(chain), key)); err != nil {
-		return err
-	}
-
-	dst, pkgURL, err := download.FromRepo(ctx, rs, repo, ri.cache, ri.downloader)
-	if err != nil {
-		return err
-	}
-
-	// The version this install overwrites, if any, is the installed package
-	// with the same name and arch. Its state is read before the new version
-	// replaces it in the database.
-	old, err := db.FetchPkg(goolib.PackageInfo{Name: pi.Name, Arch: pi.Arch})
-	if err != nil {
-		return err
-	}
-	if old.PackageSpec == nil || old.PackageSpec.Name != pi.Name || old.PackageSpec.Arch != pi.Arch {
-		old = client.PackageState{}
-	}
-	insFiles, err := installPkg(dst, rs.PackageSpec, ri.opts, db, func(insFiles map[string]string) error {
-		return addPkg(db, client.PackageState{
-			SourceRepo:     repo,
-			DownloadURL:    pkgURL,
-			Checksum:       rs.Checksum,
-			LocalPath:      dst,
-			PackageSpec:    rs.PackageSpec,
-			InstalledFiles: insFiles,
-		})
-	})
-	if err != nil {
-		return err
-	}
-
-	logger.Infof("Installation of %s.%s.%s completed", pi.Name, pi.Arch, pi.Ver)
-	fmt.Printf("Installation of %s.%s.%s and all dependencies completed\n", pi.Name, pi.Arch, pi.Ver)
-	// The old version is cleaned up only once the new one is recorded.
-	cleanOld(old, insFiles, ri.opts.DBOnly)
-	return nil
 }
 
 // FromDisk installs a local .goo file.
@@ -939,7 +777,7 @@ func listDeps(pi goolib.PackageInfo, rm client.RepoMap, repo string, dl []goolib
 	for d, v := range rs.PackageSpec.PkgDependencies {
 		// Keep the required version so that FindRepoLatest only returns a
 		// package that meets it, either directly or through a versioned
-		// Provides entry, as installDeps does.
+		// Provides entry, as an install does.
 		di := relation.ParseDependency(d, v).PackageInfo()
 		installedArch, isLocked, _, _, err := db.InstalledLockState(di.Name)
 		if err != nil {
