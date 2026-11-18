@@ -65,6 +65,12 @@ func TestRecordPolicies(t *testing.T) {
 			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: false},
 			wantSnapshot: false,
 		},
+		{
+			name:         "reinstall",
+			got:          reinstallPolicy(),
+			want:         recordPolicy{cleanup: true, removeArchive: false, transfers: true},
+			wantSnapshot: true,
+		},
 	}
 
 	for _, tc := range tests {

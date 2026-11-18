@@ -17,6 +17,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,6 +30,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -643,18 +645,20 @@ func TestInstallAddPkg(t *testing.T) {
 	}
 }
 
-// TestReinstallRollback checks that Reinstall, which records nothing in the
-// database, deletes the backups when it succeeds and rolls the files back
-// exactly once when the installer fails.
+// TestReinstallRollback checks that Reinstall records the reinstalled package
+// and deletes the backups when it succeeds, and rolls the files back exactly
+// once, recording nothing, when the installer or recording it fails.
 func TestReinstallRollback(t *testing.T) {
 	before := map[string]string{"keep": "old"}
 	for _, tc := range []struct {
-		desc      string
-		installer string // A missing installer makes the reinstall fail.
-		want      map[string]string
+		desc        string
+		installer   string // A missing installer makes the reinstall fail.
+		recordFails bool   // A database trigger makes recording the reinstall fail.
+		want        map[string]string
 	}{
 		{desc: "success", want: map[string]string{"keep": "new", "sub": "/", "sub/added": "added"}},
 		{desc: "installer fails", installer: "missing-installer", want: before},
+		{desc: "record fails", recordFails: true, want: before},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			settings.Initialize(t.TempDir(), false)
@@ -685,13 +689,27 @@ func TestReinstallRollback(t *testing.T) {
 				},
 			}
 
+			if tc.recordFails {
+				raw, err := sql.Open("sqlite", settings.DBFile())
+				if err != nil {
+					t.Fatalf("sql.Open(DBFile): %v", err)
+				}
+				if _, err := raw.Exec(`CREATE TRIGGER abort_insert BEFORE INSERT ON InstalledPackages BEGIN SELECT RAISE(ABORT, 'simulated record failure'); END;`); err != nil {
+					raw.Close()
+					t.Fatalf("creating trigger: %v", err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatalf("closing raw database: %v", err)
+				}
+			}
+
 			logBuf := testutil.CaptureLogs(t)
 			out := captureStdout(t, func() {
 				err = Reinstall(t.Context(), ps, false, false, nil, db)
 			})
 			logs := logBuf.String()
 
-			if gotErr, wantErr := err != nil, tc.installer != ""; gotErr != wantErr {
+			if gotErr, wantErr := err != nil, tc.installer != "" || tc.recordFails; gotErr != wantErr {
 				t.Errorf("Reinstall() = %v, want error %t", err, wantErr)
 			}
 			if tc.installer != "" {
@@ -702,12 +720,12 @@ func TestReinstallRollback(t *testing.T) {
 					t.Errorf("Reinstall() = %v before running the installer, want installer failure", err)
 				}
 			}
-			if got, want := strings.Contains(out, "completed"), tc.installer == ""; got != want {
+			if got, want := strings.Contains(out, "completed"), tc.installer == "" && !tc.recordFails; got != want {
 				t.Errorf("Reinstall() printed a completion message = %t, want %t; output:\n%s", got, want, out)
 			}
 			// A second rollback would remove the restored file and then fail
 			// to restore it from the backup that is already gone.
-			if strings.Contains(logs, "Rollback:") || strings.Contains(logs, "in the database failed") {
+			if strings.Contains(logs, "Rollback:") || (!tc.recordFails && strings.Contains(logs, "in the database failed")) {
 				t.Errorf("Reinstall() logged an unexpected problem; log:\n%s", logs)
 			}
 			if diff := cmp.Diff(tc.want, tree(t, dst)); diff != "" {
@@ -717,8 +735,25 @@ func TestReinstallRollback(t *testing.T) {
 			if err != nil {
 				t.Fatalf("db.FetchPkgs: %v", err)
 			}
-			if len(pkgs) != 0 {
-				t.Errorf("Reinstall() recorded %v in the database, want nothing", pkgs)
+			// A successful reinstall records its row with the files it
+			// installed; a failed one records nothing.
+			if tc.installer != "" || tc.recordFails {
+				if len(pkgs) != 0 {
+					t.Errorf("Reinstall() recorded %v in the database, want nothing", pkgs)
+				}
+				return
+			}
+			if len(pkgs) != 1 || pkgs[0].PackageSpec.String() != "pkg.noarch.1.0.0@1" {
+				t.Fatalf("Reinstall() recorded %v in the database, want only pkg.noarch.1.0.0@1", pkgs)
+			}
+			var gotFiles []string
+			for f := range pkgs[0].InstalledFiles {
+				gotFiles = append(gotFiles, f)
+			}
+			slices.Sort(gotFiles)
+			wantFiles := []string{filepath.Join(dst, "keep"), filepath.Join(dst, "sub", "added")}
+			if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
+				t.Errorf("recorded InstalledFiles (-want +got):\n%s", diff)
 			}
 		})
 	}
