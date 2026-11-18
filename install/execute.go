@@ -215,28 +215,13 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 			return ri.recoverRemoved(ctx, rec, err)
 		}
 	}
-	// The version this install overwrites, if any, is the installed package
-	// with the same name and arch. Its state is read before the new version
-	// replaces it in the database.
-	old, err := db.FetchPkg(goolib.PackageInfo{Name: ps.Name, Arch: ps.Arch})
-	if err != nil {
-		return ri.recoverRemoved(ctx, rec, err)
-	}
-	if old.PackageSpec == nil || old.PackageSpec.Name != ps.Name || old.PackageSpec.Arch != ps.Arch {
-		old = client.PackageState{}
-	}
-	row := client.PackageState{
+	rc := newRecorder(db, client.PackageState{
 		SourceRepo:  s.repo,
 		DownloadURL: a.url,
 		Checksum:    s.spec.Checksum,
 		LocalPath:   a.path,
 		PackageSpec: ps,
-	}
-	insFiles, err := installPkg(a.path, ps, ri.opts, db, func(insFiles map[string]string) error {
-		if err := ri.atStage(stageAfterInstall, ps.String()); err != nil {
-			return err
-		}
-		row.InstalledFiles = insFiles
+	}, applyStepPolicy(ri.opts.DBOnly), func(row client.PackageState) error {
 		if err := ri.addPkg(row); err != nil {
 			if rec == nil {
 				return err
@@ -248,15 +233,21 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 		}
 		return nil
 	})
-	if err != nil {
+	if _, err := installPkg(a.path, ps, ri.opts, db, func(insFiles map[string]string) error {
+		if err := ri.atStage(stageAfterInstall, ps.String()); err != nil {
+			return err
+		}
+		return rc.record(insFiles)
+	}); err != nil {
 		// installPkg has already put back the files it changed.
 		return ri.recoverRemoved(ctx, rec, err)
 	}
 
 	logger.Infof("Installation of %s.%s.%s completed", ps.Name, ps.Arch, ps.Version)
 	fmt.Printf("Installation of %s.%s.%s and all dependencies completed\n", ps.Name, ps.Arch, ps.Version)
-	// The old version is cleaned up only once the new one is recorded.
-	cleanOld(old, insFiles, ri.opts.DBOnly)
+	// The version this install overwrote is cleaned up only once the new one
+	// is recorded.
+	rc.finish()
 	rec.commit(remaining)
 	return ri.atStage(stageCommitted, ps.String())
 }
