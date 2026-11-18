@@ -20,7 +20,6 @@ import (
 	"strings"
 
 	"github.com/google/googet/v2/client"
-	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/internal/snapshot"
@@ -46,17 +45,9 @@ func selfExclusion(ps *goolib.PkgSpec) exclusions {
 	return exclusions{self: pkgKey(ps)}
 }
 
-// repoExclusions returns the initial exclusion set for installing ps from a
-// repository, covering ps itself and the single row each Replaces entry picks.
-func repoExclusions(ps *goolib.PkgSpec, db *googetdb.GooDB) (exclusions, error) {
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return exclusions{}, err
-	}
-	return repoExclusionsIn(ps, state)
-}
-
-// repoExclusionsIn is repoExclusions over the installed state st.
+// repoExclusionsIn returns the initial exclusion set for installing ps from a
+// repository over the installed state st, covering ps itself and the single
+// row each Replaces entry picks.
 func repoExclusionsIn(ps *goolib.PkgSpec, st client.GooGetState) (exclusions, error) {
 	ex := selfExclusion(ps)
 	for _, pkg := range ps.Replaces {
@@ -89,15 +80,6 @@ func specsFromState(state client.GooGetState) []*goolib.PkgSpec {
 		}
 	}
 	return specs
-}
-
-// installedSpecs returns the non-nil package specs currently recorded in db.
-func installedSpecs(db *googetdb.GooDB) ([]*goolib.PkgSpec, error) {
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return nil, err
-	}
-	return specsFromState(state), nil
 }
 
 // nonExcluded returns the non-nil specs in installed whose name.arch key is
@@ -159,22 +141,10 @@ func checkForwardConflict(r relation.Requirement, pick *goolib.PkgSpec, installe
 	return false, exempted, nil
 }
 
-// resolveConflicts fails if any of ps.Conflicts matches an installed row not
-// excluded by ex. It returns the entries that passed only because a Replaces
-// victim was exempt; callers must recheck them after resolveReplacements runs.
-func resolveConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) ([]relation.Requirement, error) {
-	if len(ps.Conflicts) == 0 {
-		return nil, nil
-	}
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return nil, err
-	}
-	return resolveConflictsIn(ps, ex, state, liveSink{})
-}
-
-// resolveConflictsIn is resolveConflicts over the installed state st, sending
-// its log lines to sink.
+// resolveConflictsIn fails if any of ps.Conflicts matches a row of the
+// installed state st not excluded by ex, sending its log lines to sink. It
+// returns the entries that passed only because a Replaces victim was exempt;
+// callers must recheck them once the replacements are removed.
 func resolveConflictsIn(ps *goolib.PkgSpec, ex exclusions, st client.GooGetState, sink eventSink) ([]relation.Requirement, error) {
 	if len(ps.Conflicts) == 0 {
 		return nil, nil
@@ -338,19 +308,10 @@ func applyReverseConflicts(ps *goolib.PkgSpec, hits []reverseHit, mode ConflictM
 	return firstErr
 }
 
-// resolveReverseConflicts checks installed packages' Conflicts against ps
-// under ex and mode, and returns the name.arch keys of any excluded victim
-// rows that matched ps so they can be re-verified after replacements run.
-func resolveReverseConflicts(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, db *googetdb.GooDB) (map[string]bool, error) {
-	installed, err := installedSpecs(db)
-	if err != nil {
-		return nil, err
-	}
-	return resolveReverseConflictsIn(ps, ex, mode, installed, liveSink{})
-}
-
-// resolveReverseConflictsIn is resolveReverseConflicts over the installed
-// specs, sending its log lines and warnings to sink.
+// resolveReverseConflictsIn checks the installed specs' Conflicts against ps
+// under ex and mode, sending its log lines and warnings to sink, and returns
+// the name.arch keys of any excluded victim rows that matched ps so they can
+// be re-verified once the replacements are removed.
 func resolveReverseConflictsIn(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, installed []*goolib.PkgSpec, sink eventSink) (map[string]bool, error) {
 	if err := applyReverseConflicts(ps, reverseConflicts(ps, installed, ex), mode, sink); err != nil {
 		return nil, err
@@ -388,19 +349,10 @@ type deferredChecks struct {
 	rev map[string]bool
 }
 
-// checkConflicts evaluates both ps's forward Conflicts and installed packages'
-// reverse Conflicts under ex and mode, returning any checks deferred onto
-// Replaces removal.
-func checkConflicts(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, db *googetdb.GooDB) (deferredChecks, error) {
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return deferredChecks{}, err
-	}
-	return checkConflictsIn(ps, ex, mode, state, liveSink{})
-}
-
-// checkConflictsIn is checkConflicts over the installed state st, sending its
-// log lines and warnings to sink.
+// checkConflictsIn evaluates both ps's forward Conflicts and the installed
+// packages' reverse Conflicts over the installed state st under ex and mode,
+// sending log lines and warnings to sink, and returns any checks deferred
+// until the replacements are removed.
 func checkConflictsIn(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, st client.GooGetState, sink eventSink) (deferredChecks, error) {
 	fwd, err := resolveConflictsIn(ps, ex, st, sink)
 	if err != nil {
@@ -424,32 +376,13 @@ func (d deferredChecks) revSpecs(installed []*goolib.PkgSpec) []*goolib.PkgSpec 
 	return out
 }
 
-// recheckBeforeReplacements simulates resolveReplacements on the
-// post-dependency database snapshot and re-evaluates deferred forward entries
-// and (in ConflictError mode) deferred reverse victim rows against the
+// recheckBeforeReplacementsIn simulates ps's replacements over the
+// post-dependency installed state st and re-evaluates deferred forward
+// entries and (in ConflictError mode) deferred reverse victim rows against the
 // simulated post-replacement state with self-only exclusions, failing before
-// resolveReplacements removes any package whenever the post-replacement recheck
-// would fail. If simulation does not complete cleanly, it logs at info level
-// and defers to resolveReplacements and recheck.
-func (d deferredChecks) recheckBeforeReplacements(ps *goolib.PkgSpec, mode ConflictMode, db *googetdb.GooDB) error {
-	if !d.needsPrecheck(mode) {
-		return nil
-	}
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return err
-	}
-	return d.recheckBeforeReplacementsIn(ps, mode, state, liveSink{})
-}
-
-// needsPrecheck reports whether recheckBeforeReplacements has anything to
-// check under mode.
-func (d deferredChecks) needsPrecheck(mode ConflictMode) bool {
-	return len(d.fwd) > 0 || (mode == ConflictError && len(d.rev) > 0)
-}
-
-// recheckBeforeReplacementsIn is recheckBeforeReplacements over the
-// post-dependency installed state st, sending its log lines to sink.
+// any package would be removed whenever the post-replacement recheck would
+// fail. If the simulation can't complete, it logs to sink at info level and
+// leaves the checks to recheckIn.
 func (d deferredChecks) recheckBeforeReplacementsIn(ps *goolib.PkgSpec, mode ConflictMode, st client.GooGetState, sink eventSink) error {
 	needFwd := len(d.fwd) > 0
 	needRev := mode == ConflictError && len(d.rev) > 0
@@ -486,22 +419,10 @@ func (d deferredChecks) recheckBeforeReplacementsIn(ps *goolib.PkgSpec, mode Con
 	return applyReverseConflicts(ps, hits, ConflictError, sink)
 }
 
-// recheck re-evaluates deferred forward and reverse conflict checks with
-// self-only exclusions after resolveReplacements completes, ensuring no
-// exempted victim survived.
-func (d deferredChecks) recheck(ps *goolib.PkgSpec, mode ConflictMode, db *googetdb.GooDB) error {
-	if len(d.fwd) == 0 && len(d.rev) == 0 {
-		return nil
-	}
-	state, err := db.FetchPkgs("")
-	if err != nil {
-		return err
-	}
-	return d.recheckIn(ps, mode, state, liveSink{})
-}
-
-// recheckIn is recheck over the post-replacement installed state st, sending
-// its log lines and warnings to sink.
+// recheckIn re-evaluates deferred forward and reverse conflict checks with
+// self-only exclusions over the post-replacement installed state st, sending
+// its log lines and warnings to sink, to make sure no exempted victim
+// survived.
 func (d deferredChecks) recheckIn(ps *goolib.PkgSpec, mode ConflictMode, st client.GooGetState, sink eventSink) error {
 	if len(d.fwd) == 0 && len(d.rev) == 0 {
 		return nil

@@ -223,11 +223,44 @@ func TestGoldenInstalls(t *testing.T) {
 	if want := len(goldenScenarios()); len(cases) != want {
 		t.Fatalf("%s has %d scenarios, want %d", goldenFile, len(cases), want)
 	}
+	// FromRepo now plans an install completely before changing anything, so
+	// an install that fails while it is planned no longer leaves the
+	// dependencies it installed before the failure, or the packages it
+	// removed. These recorded scenarios did.
+	wantFlipped := []string{
+		"dependency installed before a later dependency fails to resolve",
+		"dependency installed before the next one's reverse conflict fails",
+		"dependency installs a row that a Replaces entry doesn't remove",
+	}
+	var flipped []string
 	for _, gc := range cases {
 		c := gc.Scenario.corpusCase()
+		want := gc.Trace
+		if want.Err != "" {
+			before := initialNames(c)
+			if len(want.Installs) > 0 || len(want.Removed) > 0 || !slices.Equal(want.Final, before) {
+				flipped = append(flipped, gc.Scenario.Name)
+			}
+			want.Installs, want.Removed, want.Final = nil, nil, before
+		}
 		got := runLive(t, c, newRelFixture(t, c.Installed, c.Available))
-		if diff := cmp.Diff(gc.Trace, got); diff != "" {
+		if diff := cmp.Diff(want, got); diff != "" {
 			t.Errorf("scenario %q seed %d: FromRepo differs from the recording (-recorded +now):\n%s", gc.Scenario.Name, gc.Scenario.Seed, diff)
 		}
 	}
+	slices.Sort(flipped)
+	if diff := cmp.Diff(wantFlipped, flipped); diff != "" {
+		t.Errorf("recorded failures that changed packages before failing (-want +got):\n%s", diff)
+	}
+}
+
+// initialNames returns name.arch.version for each package c installs before
+// the run, sorted, as trace.Final lists them.
+func initialNames(c corpusCase) []string {
+	var out []string
+	for _, ps := range c.Installed {
+		out = append(out, ps.String())
+	}
+	slices.Sort(out)
+	return out
 }

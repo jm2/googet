@@ -386,7 +386,9 @@ func TestForwardConflictRecheckAfterReplacements(t *testing.T) {
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("install R = %v, want exact error %q", err, wantErr)
 	}
-	if diff := cmp.Diff([]string{"P.noarch.1", "P.x86_64.1"}, f.installed(t)); diff != "" {
+	// The install fails while it is planned, so R's dependency P.x86_64 isn't
+	// installed either.
+	if diff := cmp.Diff([]string{"P.noarch.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages (-want +got):\n%s", diff)
 	}
 	if !f.fileExists("P") {
@@ -395,6 +397,9 @@ func TestForwardConflictRecheckAfterReplacements(t *testing.T) {
 
 	// Also verify the post-replace defence-in-depth recheck when a deferred
 	// requirement remains satisfied in the database.
+	if err := f.db.WriteStateToDB(client.GooGetState{{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "x86_64", Version: "1"}}}); err != nil {
+		t.Fatal(err)
+	}
 	rSpec := &goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"P"}, Replaces: []string{"P.noarch"}}
 	def := deferredChecks{fwd: []relation.Requirement{relation.ParseRelation("P")}}
 	err = def.recheck(rSpec, ConflictWarn, f.db)
@@ -426,7 +431,8 @@ func TestForwardConflictRecheckAfterReplacements(t *testing.T) {
 	if err == nil || err.Error() != wantErr {
 		t.Errorf("install R (arch-less Replaces with dependent X) = %v, want exact error %q", err, wantErr)
 	}
-	if diff := cmp.Diff([]string{"P.noarch.1", "P.x86_64.1", "X.noarch.1"}, f2.installed(t)); diff != "" {
+	// The dependency P.noarch isn't installed either.
+	if diff := cmp.Diff([]string{"P.x86_64.1", "X.noarch.1"}, f2.installed(t)); diff != "" {
 		t.Errorf("installed packages after arch-less Replaces conflict (-want +got):\n%s", diff)
 	}
 	if !f2.fileExists("X") {
@@ -1057,7 +1063,9 @@ func TestReverseConflictExclusionsAndDrift(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "conflict with installed package P.x86_64.1") {
 			t.Fatalf("FromRepo = %v, want reverse conflict with surviving P.x86_64.1", err)
 		}
-		if diff := cmp.Diff([]string{"P.noarch.1", "P.x86_64.1", "X.noarch.1"}, f.installed(t)); diff != "" {
+		// The install fails while it is planned, so R's dependency P.noarch
+		// isn't installed either.
+		if diff := cmp.Diff([]string{"P.x86_64.1", "X.noarch.1"}, f.installed(t)); diff != "" {
 			t.Errorf("installed packages (-want +got):\n%s", diff)
 		}
 		if !f.fileExists("X") {

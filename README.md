@@ -72,6 +72,33 @@ than 3.5.0, because older binaries exit with an unknown-flag usage error
 (including when an older `googet` binary runs a self-upgrade). Setting
 `packageconflicts` in `googet.conf` is ignored by older binaries.
 
+## How an install proceeds
+
+`googet install` and `googet update` install a package in three phases:
+
+1. **Plan.** GooGet works out every package it will install, in order, and
+   every installed package that a `Replaces` entry removes, and checks
+   conflicts and dependencies. If anything fails here, nothing changes. The
+   resolution messages for all packages are printed in this phase.
+2. **Fetch.** GooGet downloads and verifies the archive of every package it
+   will install. Unless `-db_only` is set, it also makes sure the cached
+   archive of every package it will remove is present, because uninstalling
+   a package runs scripts from its archive; a missing archive is downloaded
+   again from where it was installed from. If any archive can't be fetched,
+   nothing changes. If a replaced package's archive is gone from its
+   repository, the error names it: restore the archive, or remove that
+   package first with `googet remove -db_only <name>`, which doesn't run its
+   uninstall script.
+3. **Apply.** GooGet installs the packages in order, removing each package's
+   replaced packages just before installing it.
+
+Archives fetched for an install that then fails stay in the cache directory,
+so a later attempt doesn't download them again. While an install runs, the
+cache holds the archives of every package it installs, plus those of the
+installed packages it removes, plus the previous versions of upgraded
+packages until each upgrade completes. `googet clean` deletes cached archives
+that don't belong to an installed package.
+
 ## Repo file
 
 GooGet has the ability to use a repo file to change some repo specific settings.
