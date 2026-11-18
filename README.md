@@ -98,11 +98,40 @@ removed and why, and any conflict warnings. `-dry_run` exits with an error if
 the install would fail while it is planned, for example on a conflict.
 `googet update -dry_run` lists available updates without planning them.
 
+### Replacing packages is best-effort
+
+When a package's `Replaces` entries remove installed packages, GooGet first
+prints and logs a `replace_record` line naming them and their cached archives,
+and keeps those archives while the package is installed. If the install fails
+before the package is recorded in the database (an uninstall fails, its
+install script fails, its files can't be copied, or the database can't be
+written, even after a second attempt), GooGet removes the files the package
+placed and installs the removed packages again from the kept archives, in the
+reverse of the order it removed them, and reports both the failure and what
+it reinstalled. Recovery isn't a transaction: uninstall and install scripts,
+and installer side effects such as MSI changes, aren't undone, so a package
+whose install script ran before its database write failed keeps those
+changes, and recovery runs the replaced packages' install scripts again. A
+removed package that can't be installed again stays removed: GooGet prints and
+logs a `replace_record ... result=not_restored` line naming it and, when one
+was kept, its archive. If the database keeps failing, recovery can't record the
+replaced packages either, so the replacing package and the replaced packages
+all end up removed, and any archives they had are kept.
+
+The record lives only in memory. If GooGet is killed or interrupted (for
+example with Ctrl-C, or by a shutdown) while it replaces packages, the
+removed packages stay removed. Install them again from the archives the
+`replace_record` line names, before `googet clean` deletes those archives. A
+kill while a package's files are being placed can also leave them in place,
+unrecorded, with the files they overwrote kept as `name.googet-bak*` next to
+them.
+
 Archives fetched for an install that then fails stay in the cache directory,
 so a later attempt doesn't download them again. While an install runs, the
 cache holds the archives of every package it installs, plus those of the
-installed packages it removes, plus the previous versions of upgraded
-packages until each upgrade completes. `googet clean` deletes cached archives
+installed packages it removes, which are deleted once the package that
+replaces them is recorded, plus the previous versions of upgraded packages
+until each upgrade completes. `googet clean` deletes cached archives
 that don't belong to an installed package.
 
 ## Repo file
