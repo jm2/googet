@@ -14,10 +14,14 @@ limitations under the License.
 package install
 
 import (
+	"context"
+
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
+	"github.com/google/googet/v2/remove"
+	"github.com/google/logger"
 )
 
 // This file holds database-backed forms of install decisions that production
@@ -154,4 +158,63 @@ func isSatisfied(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// minInstalledRow returns the installed row db.FetchPkg picks for r if it
+// satisfies r's minimum version. Keep its selection and version gate in sync
+// with simulateReplacements (covered by
+// TestSimulateReplacementsMatchesResolveReplacements).
+func minInstalledRow(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
+	p, err := db.FetchPkg(r.PackageInfo())
+	if err != nil {
+		return client.PackageState{}, false, err
+	}
+	if p.PackageSpec == nil {
+		return client.PackageState{}, false, nil
+	}
+	ok, err := r.MinInstalled(p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version)
+	if err != nil {
+		return client.PackageState{}, false, err
+	}
+	if !ok {
+		return client.PackageState{}, false, nil
+	}
+	return p, true, nil
+}
+
+// replaceVictim returns the installed package that Replaces entry r removes:
+// the single row minInstalledRow selects for r.
+func replaceVictim(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
+	return minInstalledRow(r, db)
+}
+
+// resolveReplacements removes the installed packages that ps replaces, along
+// with the packages that depend on them. Keep this loop in sync with
+// simulateReplacements (covered by
+// TestSimulateReplacementsMatchesResolveReplacements).
+func (ri *repoInstall) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec) error {
+	db := ri.db
+	// Check for and remove any package this replaces.
+	// TODO(ajackura): Make sure no replacements are listed as
+	// dependencies or subdependancies.
+	for _, pkg := range ps.Replaces {
+		r := relation.ParseRelation(pkg)
+		_, ins, err := replaceVictim(r, db)
+		if err != nil {
+			return err
+		}
+		if !ins {
+			continue
+		}
+		pi := r.PackageInfo()
+		deps, _, err := remove.EnumerateDeps(pi, db)
+		if err != nil {
+			return err
+		}
+		logger.Infof("%s replaces %s, removing", ps, pi)
+		if err := remove.All(ctx, pi, deps, ri.opts.DBOnly, ri.downloader, db); err != nil {
+			return err
+		}
+	}
+	return nil
 }

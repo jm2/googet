@@ -46,15 +46,50 @@ func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downl
 	if ps.PackageSpec == nil {
 		return fmt.Errorf("package %q not found in state database", pi.Name)
 	}
-	return uninstallRow(ctx, pi, ps, dbOnly, downloader, db)
+	return uninstallRow(ctx, pi, ps, dbOnly, false, downloader, db)
+}
+
+// Options configures UninstallRow.
+type Options struct {
+	// DBOnly deletes only the package's database row, without running its
+	// uninstall script or removing its files.
+	DBOnly bool
+	// KeepCache leaves the package's cached archive in place, so that the
+	// package can be installed again from it.
+	KeepCache bool
+	// Downloader downloads the package's archive again if it isn't cached.
+	Downloader *client.Downloader
+}
+
+// UninstallRow uninstalls exactly the installed package row describes: the
+// package with its name, arch and version. It fails, changing nothing, if
+// that package is no longer installed. Unless opts.DBOnly is set, it runs the
+// package's uninstall script from its cached archive, which LocalArchive
+// finds or downloads again, removes the files the package installed and,
+// unless opts.KeepCache is set, deletes the archive. Then it deletes the
+// package's database row.
+func UninstallRow(ctx context.Context, row client.PackageState, opts Options, db *googetdb.GooDB) error {
+	spec := row.PackageSpec
+	if spec == nil {
+		return fmt.Errorf("cannot uninstall package: missing package spec")
+	}
+	logger.Infof("Executing removal of package %q", spec.Name)
+	ps, err := db.FetchPkg(goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch})
+	if err != nil {
+		return fmt.Errorf("package not found in state file: %v", err)
+	}
+	if ps.PackageSpec == nil || ps.PackageSpec.Name != spec.Name || ps.PackageSpec.Arch != spec.Arch || ps.PackageSpec.Version != spec.Version {
+		return fmt.Errorf("package %s is no longer installed", spec)
+	}
+	return uninstallRow(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, ps, opts.DBOnly, opts.KeepCache, opts.Downloader, db)
 }
 
 // uninstallRow uninstalls the installed package ps and deletes its database
 // row by name and arch. Unless dbOnly is set, it runs the package's uninstall
 // script from its cached archive, downloading the archive again if needed,
-// removes the files the package installed, and deletes the archive. label
-// names the package in messages.
-func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
+// removes the files the package installed, and, unless keepCache is set,
+// deletes the archive. label names the package in messages.
+func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, dbOnly, keepCache bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	if !dbOnly {
 		archive, err := localArchive(ctx, label, ps, downloader)
 		if err != nil {
@@ -92,8 +127,10 @@ func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.Packa
 				}
 			}
 		}
-		if err := oswrap.RemoveAll(archive); err != nil {
-			logger.Errorf("error removing package data from cache directory: %v", err)
+		if !keepCache {
+			if err := oswrap.RemoveAll(archive); err != nil {
+				logger.Errorf("error removing package data from cache directory: %v", err)
+			}
 		}
 	}
 	return db.RemovePkg(ps.PackageSpec.Name, ps.PackageSpec.Arch)

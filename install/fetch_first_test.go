@@ -478,7 +478,8 @@ func TestPlanningOutputPrecedesExecution(t *testing.T) {
 // TestDivergenceStopsWithoutFurtherChanges checks that when the installed
 // packages stop matching the plan, the install logs plan_divergence at error
 // level, naming the step and the check, and changes nothing after the point
-// where the divergence appeared. Steps completed before it stay.
+// where the divergence appeared, except that packages the failing step had
+// already removed are reinstalled. Steps completed before it stay.
 func TestDivergenceStopsWithoutFurtherChanges(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -490,6 +491,9 @@ func TestDivergenceStopsWithoutFurtherChanges(t *testing.T) {
 		change client.PackageState
 		check  string
 		want   []string
+		// recovered is set when the step had removed packages before the
+		// divergence, which are reinstalled.
+		recovered bool
 	}{
 		{
 			name: "removal set changes after an earlier step",
@@ -512,7 +516,8 @@ func TestDivergenceStopsWithoutFurtherChanges(t *testing.T) {
 			atStep:    "R.noarch.1",
 			change:    client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "x86_64", Version: "1"}},
 			check:     "conflict-recheck",
-			want:      []string{"P.x86_64.1"},
+			want:      []string{"P.noarch.1", "P.x86_64.1"},
+			recovered: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -537,7 +542,11 @@ func TestDivergenceStopsWithoutFurtherChanges(t *testing.T) {
 			if atChange.rows == nil {
 				t.Fatalf("the installed packages were never changed")
 			}
-			if diff := cmp.Diff(atChange, f.hostState(t), cmp.AllowUnexported(hostState{})); diff != "" {
+			if tc.recovered {
+				if !f.fileExists("P") {
+					t.Errorf("P's file is missing after recovery")
+				}
+			} else if diff := cmp.Diff(atChange, f.hostState(t), cmp.AllowUnexported(hostState{})); diff != "" {
 				t.Errorf("host state changed after the divergence (-at divergence +after):\n%s", diff)
 			}
 			if diff := cmp.Diff(tc.want, f.installed(t)); diff != "" {
@@ -584,17 +593,17 @@ func TestReplaceOfPackageInstalledEarlierInRun(t *testing.T) {
 }
 
 // TestReinstallThatReplacesItselfRecordsItsArchive checks that a package that
-// replaces its own installed copy at the same version downloads its archive
-// once more, after removing the copy deleted it, and records an archive that
-// exists.
+// replaces its own installed copy at the same version installs from the
+// copy's archive, which removing the copy keeps and which is the same
+// archive, without downloading it, and records an archive that exists.
 func TestReinstallThatReplacesItselfRecordsItsArchive(t *testing.T) {
 	spec := goolib.PkgSpec{Name: "X", Arch: "noarch", Version: "2", Replaces: []string{"X"}}
 	f := newRelFixture(t, []goolib.PkgSpec{spec}, []goolib.PkgSpec{spec})
 	if err := f.install(t, "X"); err != nil {
 		t.Fatalf("install X: %v", err)
 	}
-	if n := f.getCount("X.noarch.2.goo"); n != 1 {
-		t.Errorf("X's archive downloaded %d times, want 1", n)
+	if n := f.getCount("X.noarch.2.goo"); n != 0 {
+		t.Errorf("X's archive downloaded %d times, want 0", n)
 	}
 	row, err := f.db.FetchPkg(goolib.PackageInfo{Name: "X", Arch: "noarch"})
 	if err != nil {
@@ -605,11 +614,10 @@ func TestReinstallThatReplacesItselfRecordsItsArchive(t *testing.T) {
 	}
 }
 
-// TestInstallFailureKeepsEarlierSteps pins what happens today when a
-// package's install script fails after earlier steps of the same install ran:
-// the dependencies installed before it stay installed, and the packages it
-// replaced stay removed. Restoring the replaced packages is a deliberate
-// behaviour change that must update the replace case.
+// TestInstallFailureKeepsEarlierSteps checks what happens when a package's
+// install script fails after earlier steps of the same install ran: the
+// dependencies installed before it stay installed, and the packages it
+// replaced are reinstalled.
 func TestInstallFailureKeepsEarlierSteps(t *testing.T) {
 	failing := goolib.ExecFile{Path: "missing-install-script.exe"}
 	for _, tc := range []struct {
@@ -633,8 +641,8 @@ func TestInstallFailureKeepsEarlierSteps(t *testing.T) {
 				{Name: "T", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"D": "1"}, Replaces: []string{"P"}, Install: failing},
 				{Name: "D", Arch: "noarch", Version: "1"},
 			},
-			want: []string{"D.noarch.1"},
-			gone: []string{"T", "P"},
+			want: []string{"D.noarch.1", "P.noarch.1"},
+			gone: []string{"T"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
