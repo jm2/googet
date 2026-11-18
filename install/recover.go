@@ -170,13 +170,14 @@ func (ri *repoInstall) reinstall(ctx context.Context, e recordEntry, opts Option
 				return err
 			}
 		}
-		_, err := installPkg(e.archive, row.PackageSpec, opts, ri.db, func(files map[string]string) error {
-			row.InstalledFiles = files
-			return ri.db.AddPkg(row)
-		})
-		return err
+		rc := newRecorder(ri.db, row, recoverPolicy(), ri.db.AddPkg)
+		if _, err := installPkg(e.archive, row.PackageSpec, opts, ri.db, rc.record); err != nil {
+			return err
+		}
+		rc.finish()
+		return nil
 	}
-	return ri.db.AddPkg(row)
+	return recordInstall(ri.db, row, recoverPolicy(), ri.db.AddPkg)
 }
 
 // commit deletes the archives kept for the packages rec removed, now that the
