@@ -184,19 +184,19 @@ func TestInstallPkg(t *testing.T) {
 	}
 	defer db.Close()
 
-	dst, err := ioutil.TempDir("", "")
+	dstRoot, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatalf("Failed to create temp directory: %v", err)
 	}
-	dst += ("/this/is/an/extremely/long/filename/you/wouldnt/expect/to/see/it/" +
+	defer oswrap.RemoveAll(dstRoot)
+
+	dst := dstRoot + ("/this/is/an/extremely/long/filename/you/wouldnt/expect/to/see/it/" +
 		"in/the/wild/but/you/would/actually/be/surprised/at/some/of/the/" +
 		"stuff/that/pops/up/and/seriously/two/hundred/and/fify/five/chars" +
 		"is/quite/a/large/number/but/somehow/there/were/real/goo/packages" +
 		"which/exceeded/this/limit/hence/this/absurdly/long/string/in/" +
 		"this/unit/test")
 	dst = filepath.FromSlash(dst)
-
-	defer oswrap.RemoveAll(dst)
 
 	f, err := os.Create(filepath.Join(src, "test.goo"))
 	if err != nil {
@@ -208,7 +208,10 @@ func TestInstallPkg(t *testing.T) {
 	tw := tar.NewWriter(gw)
 
 	files := []string{"test1", "test2", "test3"}
-	want := map[string]string{dst: ""}
+	want := make(map[string]string)
+	for d := dst; d != dstRoot && filepath.Dir(d) != d; d = filepath.Dir(d) {
+		want[d] = ""
+	}
 	for _, n := range files {
 		f, err := oswrap.Create(filepath.Join(src, n))
 		if err != nil {
@@ -631,10 +634,13 @@ func TestInstallAddPkg(t *testing.T) {
 			if st.PackageSpec.Version != wantVer {
 				t.Errorf("installed version = %q, want %q", st.PackageSpec.Version, wantVer)
 			}
-			// The checksums that a dbOnly install records are not checked.
+			// The checksums that a dbOnly install records are not checked. The
+			// parent directory the install created is recorded with an empty
+			// checksum.
 			if tc.fault == addPkgOK && !tc.dbOnly {
 				wantFiles := map[string]string{
 					filepath.Join(dst, "keep"):         goolib.Checksum(strings.NewReader("new")),
+					filepath.Join(dst, "sub"):          "",
 					filepath.Join(dst, "sub", "added"): goolib.Checksum(strings.NewReader("added")),
 				}
 				if diff := cmp.Diff(wantFiles, st.InstalledFiles); diff != "" {
@@ -751,7 +757,7 @@ func TestReinstallRollback(t *testing.T) {
 				gotFiles = append(gotFiles, f)
 			}
 			slices.Sort(gotFiles)
-			wantFiles := []string{filepath.Join(dst, "keep"), filepath.Join(dst, "sub", "added")}
+			wantFiles := []string{filepath.Join(dst, "keep"), filepath.Join(dst, "sub"), filepath.Join(dst, "sub", "added")}
 			if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
 				t.Errorf("recorded InstalledFiles (-want +got):\n%s", diff)
 			}

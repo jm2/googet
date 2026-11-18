@@ -107,7 +107,7 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 		return err
 	}
 
-	rc := newRecorder(db, client.PackageState{LocalPath: dst, PackageSpec: zs}, fromDiskPolicy(ins.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
+	rc := newRecorder(db, client.PackageState{LocalPath: dst, PackageSpec: zs}, nil, fromDiskPolicy(ins.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
 		return addPkg(db, row, transfers)
 	})
 	if _, err := installPkg(dst, zs, ins.opts, db, rc.record); err != nil {
@@ -167,7 +167,7 @@ func Reinstall(ctx context.Context, ps client.PackageState, rd, force bool, down
 
 	// The reinstall is recorded before its file changes are committed, so a
 	// failure to record it puts back the files it overwrote.
-	rc := newRecorder(db, ps, reinstallPolicy(), db.AddPkgWithTransfers)
+	rc := newRecorder(db, ps, nil, reinstallPolicy(), db.AddPkgWithTransfers)
 	if _, err := installPkg(ps.LocalPath, ps.PackageSpec, OptionsFromSettings(false, force), db, rc.record); err != nil {
 		return fmt.Errorf("error reinstalling package: %v", err)
 	}
@@ -423,11 +423,14 @@ func isDir(path string) bool {
 }
 
 // missingAncestors returns the non-existent directory chain up to dir in
-// top-down creation order (outermost missing ancestor first, dir last).
+// top-down creation order (outermost missing ancestor first, dir last). It
+// walks up on any Lstat error so paths that fail Lstat with non-ENOENT errors
+// (such as ENAMETOOLONG or invalid leaf syntax) still capture outer missing
+// directories that MkdirAll creates before failing.
 func missingAncestors(dir string) []string {
 	var rev []string
 	for d := dir; ; d = filepath.Dir(d) {
-		if _, err := oswrap.Lstat(d); !os.IsNotExist(err) || filepath.Dir(d) == d {
+		if _, err := oswrap.Lstat(d); err == nil || filepath.Dir(d) == d {
 			break
 		}
 		rev = append(rev, d)
@@ -567,6 +570,26 @@ func (u *undo) commit() {
 	}
 }
 
+// recordDirs adds every directory u created that still exists as a directory
+// on disk to insFiles with an empty checksum, unless insFiles already lists an
+// equivalent path key.
+func (u *undo) recordDirs(insFiles map[string]string) {
+	if insFiles == nil {
+		return
+	}
+	var present ownership.PathSet
+	for p := range insFiles {
+		present.Add(p)
+	}
+	for _, c := range u.changes {
+		if !c.dir || present.Has(c.path) || !isDir(c.path) {
+			continue
+		}
+		present.Add(c.path)
+		insFiles[c.path] = ""
+	}
+}
+
 // installPkgInner implements installPkg. It owns the journal of the
 // filesystem changes: if any step, including record, fails or panics, the
 // files it placed are removed and the files it overwrote are restored.
@@ -608,6 +631,7 @@ func installPkgInner(pkg string, ps *goolib.PkgSpec, opts Options, db *googetdb.
 		if err := system.Install(dir, ps); err != nil {
 			return nil, err
 		}
+		u.recordDirs(insFiles)
 	}
 
 	if record != nil {
