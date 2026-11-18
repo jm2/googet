@@ -780,8 +780,8 @@ func TestUndo(t *testing.T) {
 			write := func(rel string) {
 				t.Helper()
 				p := filepath.Join(root, rel)
-				if err := u.mkdirAll(filepath.Dir(p), 0755); err != nil {
-					t.Fatalf("mkdirAll(%q) = %v", filepath.Dir(p), err)
+				if err := u.ensureParents(filepath.Dir(p)); err != nil {
+					t.Fatalf("ensureParents(%q) = %v", filepath.Dir(p), err)
 				}
 				if err := u.prepare(p); err != nil {
 					t.Fatalf("prepare(%q) = %v", p, err)
@@ -818,13 +818,13 @@ func perm(t *testing.T, path string) os.FileMode {
 	return fi.Mode().Perm()
 }
 
-func TestUndoMkdirAllModes(t *testing.T) {
+func TestUndoMkdirsModes(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not report Unix permission bits")
 	}
 	root := t.TempDir()
 	// The umask applies to the reference directories as it does to the
-	// directories that mkdirAll creates.
+	// directories that ensurePackageDir creates.
 	refParent, refDir := filepath.Join(root, "ref-parent"), filepath.Join(root, "ref-dir")
 	for ref, mode := range map[string]os.FileMode{refParent: 0755, refDir: 0500} {
 		if err := os.Mkdir(ref, mode); err != nil {
@@ -834,24 +834,25 @@ func TestUndoMkdirAllModes(t *testing.T) {
 	parent := filepath.Join(root, "a")
 	dir := filepath.Join(parent, "b")
 	var u undo
-	if err := u.mkdirAll(dir, 0500); err != nil {
-		t.Fatalf("mkdirAll(%q, 0500) = %v", dir, err)
+	if err := u.ensurePackageDir(dir, 0500); err != nil {
+		t.Fatalf("ensurePackageDir(%q, 0500) = %v", dir, err)
 	}
 	for path, ref := range map[string]string{parent: refParent, dir: refDir} {
 		if got, want := perm(t, path), perm(t, ref); got != want {
-			t.Errorf("mkdirAll(%q, 0500) created %q with mode %v, want %v", dir, path, got, want)
+			t.Errorf("ensurePackageDir(%q, 0500) created %q with mode %v, want %v", dir, path, got, want)
 		}
 	}
 }
 
-func TestUndoMkdirAllExisting(t *testing.T) {
+func TestUndoMkdirsExisting(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(file, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
 	// top is the ancestor of file just below the volume root, such as /tmp or
 	// C:\Users. On Windows, oswrap.MkdirAll panics on a volume root, so
-	// mkdirAll must not call it on an existing directory or its parent.
+	// the directory helpers must not call it on an existing directory or its
+	// parent.
 	top := file
 	for filepath.Dir(filepath.Dir(top)) != filepath.Dir(top) {
 		top = filepath.Dir(top)
@@ -865,12 +866,17 @@ func TestUndoMkdirAllExisting(t *testing.T) {
 		{dir: filepath.Dir(file)},
 		{dir: file, wantErr: true},
 	} {
-		var u undo
-		if err := u.mkdirAll(tc.dir, 0755); (err != nil) != tc.wantErr {
-			t.Errorf("mkdirAll(%q) = %v, want error %t", tc.dir, err, tc.wantErr)
-		}
-		if len(u.changes) != 0 {
-			t.Errorf("mkdirAll(%q) recorded %v, want no changes", tc.dir, u.changes)
+		for name, mkdirs := range map[string]func(*undo, string) error{
+			"ensureParents":    (*undo).ensureParents,
+			"ensurePackageDir": func(u *undo, dir string) error { return u.ensurePackageDir(dir, 0755) },
+		} {
+			var u undo
+			if err := mkdirs(&u, tc.dir); (err != nil) != tc.wantErr {
+				t.Errorf("%s(%q) = %v, want error %t", name, tc.dir, err, tc.wantErr)
+			}
+			if len(u.changes) != 0 {
+				t.Errorf("%s(%q) recorded %v, want no changes", name, tc.dir, u.changes)
+			}
 		}
 	}
 }

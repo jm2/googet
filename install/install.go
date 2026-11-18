@@ -284,9 +284,9 @@ func makeInstallFunction(src, dst string, insFiles map[string]string, opts Optio
 			logger.Infof("Creating folder %q", outPath)
 			// We designate directories by an empty hash.
 			insFiles[outPath] = ""
-			return u.mkdirAll(outPath, fi.Mode())
+			return u.ensurePackageDir(outPath, fi.Mode())
 		}
-		if err := u.mkdirAll(filepath.Dir(outPath), dirPerm); err != nil {
+		if err := u.ensureParents(filepath.Dir(outPath)); err != nil {
 			return err
 		}
 		if err := u.prepare(outPath); err != nil {
@@ -401,6 +401,8 @@ type change struct {
 	// backup is the path to the backup of path's old content, or empty if
 	// path was created.
 	backup string
+	// dir reports whether path was created as a directory by this install.
+	dir bool
 }
 
 // undo records the changes an install makes to the filesystem, in order, so
@@ -415,18 +417,43 @@ type undo struct {
 // matches download.ExtractPkg.
 const dirPerm os.FileMode = 0755
 
-// mkdirAll creates dir with the given mode and any missing parents with mode
-// dirPerm, recording each directory it creates. It creates only the missing
-// directories, so it never calls oswrap.MkdirAll on an existing path such as
-// a Windows volume root, which panics.
-func (u *undo) mkdirAll(dir string, mode os.FileMode) error {
-	var missing []string
+func isDir(path string) bool {
+	fi, err := oswrap.Lstat(path)
+	return err == nil && fi.IsDir()
+}
+
+// missingAncestors returns the non-existent directory chain up to dir in
+// top-down creation order (outermost missing ancestor first, dir last).
+func missingAncestors(dir string) []string {
+	var rev []string
 	for d := dir; ; d = filepath.Dir(d) {
 		if _, err := oswrap.Lstat(d); !os.IsNotExist(err) || filepath.Dir(d) == d {
 			break
 		}
-		missing = append(missing, d)
+		rev = append(rev, d)
 	}
+	slices.Reverse(rev)
+	return rev
+}
+
+// recordCreated appends a directory change in top-down order for every path in
+// missing that now exists on disk as a directory, whether or not directory
+// creation failed part-way.
+func (u *undo) recordCreated(missing []string) {
+	for _, d := range missing {
+		if isDir(d) {
+			u.changes = append(u.changes, change{path: d, dir: true})
+		}
+	}
+}
+
+// mkdirs creates dir with mode and any missing ancestors with mode dirPerm,
+// recording every directory actually created. It creates only the missing
+// directories, so it never calls oswrap.MkdirAll on an existing path such as
+// a Windows volume root, which panics. An existing dir that isn't a
+// directory is an error and changes nothing.
+func (u *undo) mkdirs(dir string, mode os.FileMode) error {
+	missing := missingAncestors(dir)
 	if len(missing) == 0 {
 		fi, err := oswrap.Stat(dir)
 		if err != nil {
@@ -437,15 +464,28 @@ func (u *undo) mkdirAll(dir string, mode os.FileMode) error {
 		}
 		return nil
 	}
-	for i := len(missing) - 1; i >= 0; i-- {
-		u.changes = append(u.changes, change{path: missing[i]})
-	}
+	var err error
 	if len(missing) > 1 {
-		if err := oswrap.MkdirAll(missing[1], dirPerm); err != nil {
-			return err
-		}
+		err = oswrap.MkdirAll(missing[len(missing)-2], dirPerm)
 	}
-	return oswrap.MkdirAll(dir, mode)
+	if err == nil {
+		err = oswrap.MkdirAll(dir, mode)
+	}
+	u.recordCreated(missing)
+	return err
+}
+
+// ensureParents creates the parent directory dir of a file and any missing
+// ancestors with mode dirPerm, recording every directory actually created.
+func (u *undo) ensureParents(dir string) error {
+	return u.mkdirs(dir, dirPerm)
+}
+
+// ensurePackageDir creates a directory the package ships, dir, with the
+// archive's mode, and any missing ancestors with mode dirPerm, recording
+// every directory actually created.
+func (u *undo) ensurePackageDir(dir string, mode os.FileMode) error {
+	return u.mkdirs(dir, mode)
 }
 
 // prepare makes path ready to be written. An existing file is renamed to a
