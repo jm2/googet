@@ -222,7 +222,7 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fe
 		Checksum:    s.spec.Checksum,
 		LocalPath:   a.path,
 		PackageSpec: ps,
-	}, applyStepPolicy(ri.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
+	}, nil, applyStepPolicy(ri.opts.DBOnly), func(row client.PackageState, transfers []googetdb.FileTransfer) error {
 		if err := ri.addPkg(row, transfers); err != nil {
 			if rec == nil {
 				return err

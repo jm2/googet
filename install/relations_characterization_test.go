@@ -190,7 +190,7 @@ func (f *relFixture) installArchive(t *testing.T, name string, contents, files m
 	goo := filepath.Join(f.cache, name+".noarch.1.goo")
 	writeGoo(t, goo, contents)
 	ps := &goolib.PkgSpec{Name: name, Arch: "noarch", Version: "1", Files: files}
-	rc := newRecorder(f.db, client.PackageState{LocalPath: goo, PackageSpec: ps}, fromDiskPolicy(false), f.db.AddPkgWithTransfers)
+	rc := newRecorder(f.db, client.PackageState{LocalPath: goo, PackageSpec: ps}, nil, fromDiskPolicy(false), f.db.AddPkgWithTransfers)
 	installed, err := installPkg(goo, ps, Options{}, f.db, rc.record)
 	if err != nil {
 		t.Fatalf("installPkg(%s): %v", name, err)
@@ -398,35 +398,31 @@ func TestCharacterizeOverwrittenFileDeletedOnRemove(t *testing.T) {
 	}
 }
 
-// TestCharacterizeCreatedParentDirsNotRecorded pins that parent directories
-// that install creates above a package's destination aren't recorded in its
-// InstalledFiles, so removing the package leaves them behind.
-//
-// The package ships a directory rather than a lone file. Install creates the
-// missing parents of a lone file with the file's own mode (for example 0644),
-// which on Linux and macOS leaves them untraversable and makes non-root
-// installs into nested destinations fail. That is a separate bug, not pinned
-// here.
-//
-// Known wrong: a fix should record the created parents and remove them, when
-// they are empty, along with the package.
+// TestCharacterizeCreatedParentDirsNotRecorded checks that parent directories
+// created above a package's destination are recorded in InstalledFiles as
+// empty-checksum entries and removed, deepest-first when empty and unowned,
+// when the package is removed, while pre-existing ancestors stay on disk.
 func TestCharacterizeCreatedParentDirsNotRecorded(t *testing.T) {
 	f := newRelFixture(t, nil, nil)
-	parent := filepath.Join(f.dst, "vendor", "app")
+	vendor := filepath.Join(f.dst, "vendor")
+	parent := filepath.Join(vendor, "app")
 	target := filepath.Join(parent, "bin")
 
 	files := f.installArchive(t, "A", map[string]string{"bin/tool": "from A"}, map[string]string{"bin": target})
-	want := []string{target, filepath.Join(target, "tool")}
+	want := []string{vendor, parent, target, filepath.Join(target, "tool")}
+	slices.Sort(want)
 	if diff := cmp.Diff(want, slices.Sorted(maps.Keys(files))); diff != "" {
 		t.Errorf("InstalledFiles (-want +got):\n%s", diff)
 	}
 
 	f.remove(t, "A")
-	if _, err := os.Stat(target); !os.IsNotExist(err) {
-		t.Errorf("%s: Stat error = %v, want it removed with A", target, err)
+	for _, removedDir := range []string{target, parent, vendor} {
+		if _, err := os.Stat(removedDir); !os.IsNotExist(err) {
+			t.Errorf("%s: Stat error = %v, want it removed with A", removedDir, err)
+		}
 	}
-	if _, err := os.Stat(parent); err != nil {
-		t.Errorf("created parent directory: Stat error = %v, want it left behind (today parents aren't recorded)", err)
+	if _, err := os.Stat(f.dst); err != nil {
+		t.Errorf("pre-existing destination root %s: Stat error = %v, want it kept", f.dst, err)
 	}
 }
 
