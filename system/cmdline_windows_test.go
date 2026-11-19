@@ -27,6 +27,9 @@ import (
 func TestUninstallCmdlineWindowsBackslashPaths(t *testing.T) {
 	regEntries := map[string]map[string]string{
 		`HKLM\Script\DrivePath`: {
+			"QuietUninstallString": `C:\Vendor\uninstall.ps1 -Silent`,
+		},
+		`HKLM\Script\UnquotedSpaces`: {
 			"QuietUninstallString": `C:\Program Files\Vendor\uninstall.ps1 -Silent`,
 		},
 		`HKLM\EXE\QuotedSpacesAndDottedDir`: {
@@ -54,12 +57,33 @@ func TestUninstallCmdlineWindowsBackslashPaths(t *testing.T) {
 				InstalledApp: client.InstalledApplication{Reg: `HKLM\Script\DrivePath`},
 			},
 			want: cmdline{
-				name:      `C:\ProgramData\GooGet\extract\C:\Program Files\Vendor\uninstall.ps1`,
+				name:      `C:\ProgramData\GooGet\extract\C:\Vendor\uninstall.ps1`,
 				args:      []string{"-Silent"},
 				script:    true,
 				exitCodes: nil,
-				logPath:   `C:\ProgramData\GooGet\extract\C:\Program Files\Vendor\uninstall.ps1.log`,
-				rawPath:   `C:\Program Files\Vendor\uninstall.ps1`,
+				logPath:   `C:\ProgramData\GooGet\extract\C:\Vendor\uninstall.ps1.log`,
+				rawPath:   `C:\Vendor\uninstall.ps1`,
+			},
+		},
+		{
+			// An unquoted registry path is split at whitespace, so a path
+			// containing spaces is cut at its first space and the rest becomes
+			// arguments, as in the earlier implementation.
+			name: "arp_unquoted_path_with_spaces_splits_at_first_space",
+			dir:  `C:\ProgramData\GooGet\extract`,
+			state: client.PackageState{
+				PackageSpec: &goolib.PkgSpec{
+					Install: goolib.ExecFile{Path: `scripts\install.ps1`},
+				},
+				InstalledApp: client.InstalledApplication{Reg: `HKLM\Script\UnquotedSpaces`},
+			},
+			want: cmdline{
+				name:      `C:\ProgramData\GooGet\extract\C:\Program`,
+				args:      []string{`Files\Vendor\uninstall.ps1`, "-Silent"},
+				script:    true,
+				exitCodes: nil,
+				logPath:   `C:\ProgramData\GooGet\extract\C:\Program.log`,
+				rawPath:   `C:\Program`,
 			},
 		},
 		{

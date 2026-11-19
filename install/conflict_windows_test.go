@@ -72,18 +72,12 @@ func TestInstallCaseVariantConflict(t *testing.T) {
 		t.Errorf("Shared.dll after rejected StrictConflicts install = %q, %v; want %q", got, readErr, "from A")
 	}
 
-	// Default options allow the overwrite and emit the unchanged warning text.
+	// Default options allow the overwrite and log the unchanged warning text.
+	// The console copy goes through the progress package, which keeps the
+	// os.Stdout it saw at start-up, so only the logged warning is checked.
 	logs := testutil.CaptureLogs(t)
-	var warnErr error
-	stdout := captureStdout(t, func() {
-		_, warnErr = installPkg(gooB, specB, Options{}, goolib.InstallerContext{}, f.db, nil)
-	})
-	if warnErr != nil {
-		t.Fatalf("installPkg(B, default) unexpected error: %v", warnErr)
-	}
-	wantConsole := "Warning: " + wantConflict + ", overwriting...\n"
-	if !strings.Contains(stdout, wantConsole) {
-		t.Errorf("console output = %q, want substring %q", stdout, wantConsole)
+	if _, err := installPkg(gooB, specB, Options{}, goolib.InstallerContext{}, f.db, nil); err != nil {
+		t.Fatalf("installPkg(B, default) unexpected error: %v", err)
 	}
 	if !strings.Contains(logs.String(), "Warning: "+wantConflict) {
 		t.Errorf("logs = %q, want substring %q", logs.String(), "Warning: "+wantConflict)

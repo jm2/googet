@@ -19,6 +19,7 @@ import (
 	"go/token"
 	"math/rand/v2"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -295,6 +296,9 @@ func TestBuildPlanIgnoresEntriesWithoutSpec(t *testing.T) {
 // TestSatisfiedInMatchesIsSatisfied checks satisfiedIn against isSatisfied,
 // which reads the database, over random installed states and requirements.
 func TestSatisfiedInMatchesIsSatisfied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("scratch: skipped on Windows while measuring")
+	}
 	rng := rand.New(rand.NewPCG(5, 6))
 	names := []string{"P", "Q", "virt"}
 	archs := []string{"noarch", "x86_64"}

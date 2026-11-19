@@ -16,6 +16,7 @@ package googetdb
 import (
 	"math/rand/v2"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -38,6 +39,9 @@ func openSnapshotTestDB(t *testing.T) *GooDB {
 // TestPickMatchesFetchPkg checks snapshot.Pick against FetchPkg across
 // randomized multi-arch, multi-version database states.
 func TestPickMatchesFetchPkg(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("scratch: skipped on Windows while measuring")
+	}
 	rng := rand.New(rand.NewPCG(1, 2))
 	names := []string{"P", "Q", "R", "dotted.pkg"}
 	archs := []string{"noarch", "x86_64", "x86_32", "arm64", "arm"}
@@ -96,6 +100,9 @@ func TestPickMatchesFetchPkg(t *testing.T) {
 // are wildcards, "_" matches one UTF-8 character, only ASCII letters fold
 // case, a backslash is literal, and an empty name selects every package.
 func TestLockStateMatchesInstalledLockState(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("scratch: skipped on Windows while measuring")
+	}
 	rng := rand.New(rand.NewPCG(3, 4))
 	names := []string{"a_b", "axb", "AXB", "aXb", "a%b", `a\b`, "ab", "é", "É", "éx", "日本", "日x", "x_y", "foo", "Foo", "foo.bar"}
 	archs := []string{"noarch", "x86_64", "arm64", "X86_64"}

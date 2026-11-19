@@ -18,6 +18,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -175,7 +176,11 @@ func TestUninstallRowMultiArchAndOptions(t *testing.T) {
 		dir := t.TempDir()
 		unpackDir := filepath.Join(dir, "legacy")
 		archive := unpackDir + ".goo"
-		writeUninstallScriptGoo(t, archive, "uninstall.sh", "#!/bin/sh\nexit 1\n")
+		script, fail, succeed := "uninstall.sh", "#!/bin/sh\nexit 1\n", "#!/bin/sh\nexit 0\n"
+		if runtime.GOOS == "windows" {
+			script, fail, succeed = "uninstall.cmd", "@exit /b 1\r\n", "@exit /b 0\r\n"
+		}
+		writeUninstallScriptGoo(t, archive, script, fail)
 
 		db, err := googetdb.NewDB(filepath.Join(dir, "googet.db"))
 		if err != nil {
@@ -184,7 +189,7 @@ func TestUninstallRowMultiArchAndOptions(t *testing.T) {
 		t.Cleanup(func() { db.Close() })
 
 		row := client.PackageState{
-			PackageSpec: &goolib.PkgSpec{Name: "legacy", Arch: "noarch", Version: "1", Uninstall: goolib.ExecFile{Path: "uninstall.sh"}},
+			PackageSpec: &goolib.PkgSpec{Name: "legacy", Arch: "noarch", Version: "1", Uninstall: goolib.ExecFile{Path: script}},
 			UnpackDir:   unpackDir,
 		}
 		if err := db.WriteStateToDB(client.GooGetState{row}); err != nil {
@@ -206,7 +211,7 @@ func TestUninstallRowMultiArchAndOptions(t *testing.T) {
 		}
 
 		// Replace archive with a succeeding script and verify KeepCache: false removes UnpackDir+".goo".
-		writeUninstallScriptGoo(t, archive, "uninstall.sh", "#!/bin/sh\nexit 0\n")
+		writeUninstallScriptGoo(t, archive, script, succeed)
 		if err := UninstallRow(t.Context(), row, Options{KeepCache: false}, db); err != nil {
 			t.Fatalf("UninstallRow(KeepCache: false): %v", err)
 		}

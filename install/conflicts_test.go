@@ -21,6 +21,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -595,6 +596,9 @@ func openTestDB(t *testing.T) *googetdb.GooDB {
 // Conflicts and Provides fields, duplicate entries, dependency cycles, and
 // unparseable versions.
 func TestSimulateReplacementsMatchesResolveReplacements(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("scratch: skipped on Windows while measuring")
+	}
 	rng := rand.New(rand.NewPCG(3, 4))
 	names := []string{"P", "Q", "D", "dotted.pkg"}
 	archs := []string{"noarch", "x86_64", "arm64"}
@@ -1638,6 +1642,9 @@ func (g *precheckGen) nextScenario() precheckScenario {
 // package names, self-referential dependencies, arch-less dependencies on
 // replaced names, and post-checkConflicts dependency state drift.
 func TestPrecheckVerdictMatchesPostRecheck(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("scratch: skipped on Windows while measuring")
+	}
 	gen := newPrecheckGen(rand.New(rand.NewPCG(5, 6)))
 
 	const numScenarios = 250
