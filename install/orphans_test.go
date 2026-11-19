@@ -518,7 +518,9 @@ func TestDependentSatisfiedOnlyByLaterStepStillFailsPerStep(t *testing.T) {
 func TestOrphanFailMatchesOrphanRemoveProperty(t *testing.T) {
 	rng := rand.New(rand.NewPCG(316, 2026))
 	var orphanHits, hardErrs, cleanSuccess int
-	for iter := range testutil.ScaledIterations(300) {
+	const fullIterations = 300
+	iterations := testutil.ScaledIterations(fullIterations)
+	for iter := range iterations {
 		seed := rng.Uint64()
 		c := genCorpusCase(seed)
 		f := newRelFixture(t, c.Installed, c.Available)
@@ -596,7 +598,9 @@ func TestOrphanFailMatchesOrphanRemoveProperty(t *testing.T) {
 			t.Fatalf("iter %d seed %d: OrphanFail listed dependents vs OrphanRemove cascaded removals (-listed +removed):\n%s", iter, seed, diff)
 		}
 	}
-	if orphanHits == 0 || hardErrs == 0 || cleanSuccess == 0 {
+	// A scaled-down run, as on Windows, can miss a outcome; the full
+	// run must reach every one.
+	if iterations == fullIterations && (orphanHits == 0 || hardErrs == 0 || cleanSuccess == 0) {
 		t.Fatalf("degenerate property distribution: orphanHits=%d hardErrs=%d cleanSuccess=%d", orphanHits, hardErrs, cleanSuccess)
 	}
 }

@@ -607,7 +607,8 @@ func TestSimulateReplacementsMatchesResolveReplacements(t *testing.T) {
 		"P.noarch.2", "Q.x86_64.2.0.0",
 	}
 
-	numScenarios := testutil.ScaledIterations(300)
+	const fullScenarios = 300
+	numScenarios := testutil.ScaledIterations(fullScenarios)
 	var okRemoved, multiRemoved, failedCases, selfRefCases, dottedCases, archlessReplacedDepCases int
 
 	for i := range numScenarios {
@@ -741,7 +742,9 @@ func TestSimulateReplacementsMatchesResolveReplacements(t *testing.T) {
 			multiRemoved++
 		}
 	}
-	if okRemoved == 0 || multiRemoved == 0 || failedCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0 {
+	// A scaled-down corpus, as on Windows, can miss a case class; the full
+	// corpus must reach every one.
+	if numScenarios == fullScenarios && (okRemoved == 0 || multiRemoved == 0 || failedCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0) {
 		t.Errorf("degenerate differential corpus: okRemoved=%d, multiRemoved=%d, failedCases=%d, selfRef=%d, dotted=%d, archlessReplacedDep=%d; want all > 0",
 			okRemoved, multiRemoved, failedCases, selfRefCases, dottedCases, archlessReplacedDepCases)
 	}
@@ -1640,7 +1643,8 @@ func (g *precheckGen) nextScenario() precheckScenario {
 func TestPrecheckVerdictMatchesPostRecheck(t *testing.T) {
 	gen := newPrecheckGen(rand.New(rand.NewPCG(5, 6)))
 
-	numScenarios := testutil.ScaledIterations(250)
+	const fullScenarios = 250
+	numScenarios := testutil.ScaledIterations(fullScenarios)
 	var (
 		subtestsRun              int
 		evaluated                int
@@ -1779,7 +1783,9 @@ func TestPrecheckVerdictMatchesPostRecheck(t *testing.T) {
 	if noDriftFwdFails != 0 {
 		t.Errorf("checkConflicts missed %d zero-drift multi-arch forward conflicts before recheckBeforeReplacements", noDriftFwdFails)
 	}
-	if evaluated == 0 || fwdFails == 0 || revErrorFails == 0 || warnSurvivingRevPasses == 0 || cleanPasses == 0 || repErrCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0 {
+	// A scaled-down corpus, as on Windows, can miss a case class; the full
+	// corpus must reach every one.
+	if numScenarios == fullScenarios && (evaluated == 0 || fwdFails == 0 || revErrorFails == 0 || warnSurvivingRevPasses == 0 || cleanPasses == 0 || repErrCases == 0 || selfRefCases == 0 || dottedCases == 0 || archlessReplacedDepCases == 0) {
 		t.Errorf("degenerate pre-check differential corpus: evaluated=%d fwdFails=%d revErrorFails=%d warnSurvivingRevPasses=%d cleanPasses=%d repErrCases=%d selfRef=%d dotted=%d archlessReplacedDep=%d; want all > 0",
 			evaluated, fwdFails, revErrorFails, warnSurvivingRevPasses, cleanPasses, repErrCases, selfRefCases, dottedCases, archlessReplacedDepCases)
 	}
