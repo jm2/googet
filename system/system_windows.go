@@ -143,6 +143,18 @@ func AppAssociation(ps *goolib.PkgSpec, installSource string) (string, string) {
 		`SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\`,
 		`SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\`,
 	}
+	// The normalized names depend only on ps, so compute them once rather
+	// than for every registry key.
+	// TODO: Look into precompiling regex
+	var publisher, programName string
+	for _, v := range publisherNameReg {
+		re := regexp.MustCompile("(?i)" + regex[v])
+		publisher = re.ReplaceAllString(ps.Authors, "")
+	}
+	for _, v := range programNameReg {
+		re := regexp.MustCompile("(?i)" + regex[v])
+		programName = re.ReplaceAllString(ps.Name, "")
+	}
 	for _, productroot := range productroots {
 		k, err := registry.OpenKey(registry.LOCAL_MACHINE, productroot, registry.ENUMERATE_SUB_KEYS)
 		if err != nil {
@@ -183,16 +195,6 @@ func AppAssociation(ps *goolib.PkgSpec, installSource string) (string, string) {
 			}
 			if displayName == ps.ExternalProgramName && ps.ExternalProgramName != "" {
 				return displayName, productReg
-			}
-			// TODO: Look into precompiling regex
-			var publisher, programName string
-			for _, v := range publisherNameReg {
-				re := regexp.MustCompile("(?i)" + regex[v])
-				publisher = re.ReplaceAllString(ps.Authors, "")
-			}
-			for _, v := range programNameReg {
-				re := regexp.MustCompile("(?i)" + regex[v])
-				programName = re.ReplaceAllString(ps.Name, "")
 			}
 			// Ignore empty and googet labeled pacakges
 			if displayName == "" || strings.Contains(displayName, "GooGet -") {

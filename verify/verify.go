@@ -89,10 +89,12 @@ func Files(ps client.PackageState) (bool, error) {
 		}
 		fstat, err := os.Stat(file)
 		if err != nil {
+			f.Close()
 			return false, err
 		}
 		// Only calculate/ check the checksum for file, not folder.
 		if fstat.IsDir() {
+			f.Close()
 			continue
 		}
 		chksm := goolib.Checksum(f)

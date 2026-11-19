@@ -21,10 +21,16 @@ import (
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/system"
 )
 
 // TestAAAScratchTiming measures SQLite operation costs on the CI runner.
 func TestAAAScratchTiming(t *testing.T) {
+	for range 3 {
+		start := time.Now()
+		system.AppAssociation(&goolib.PkgSpec{Name: "probe", Arch: "noarch", Version: "1"}, "")
+		t.Logf("AppAssociation=%v", time.Since(start))
+	}
 	for round := range 3 {
 		dir, err := os.MkdirTemp("", "timing")
 		if err != nil {

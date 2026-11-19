@@ -149,12 +149,11 @@ func GenGooWithGoopack(t *testing.T, goopackBin, outDir, dstDir string, ps gooli
 		"provides":        ps.Provides,
 		"pkgDependencies": ps.PkgDependencies,
 		"files": map[string]string{
-			filepath.Join("payload", ps.Name): filepath.Join(dstDir, ps.Name),
+			ps.Name: filepath.Join(dstDir, ps.Name),
 		},
 		"sources": []goolib.PkgSources{
 			{
 				Include: []string{ps.Name},
-				Target:  "payload",
 				Root:    srcDir,
 			},
 		},
