@@ -18,6 +18,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -165,7 +166,9 @@ func TestRandomCreatedParentsTreesUpgradeRollbackAndRemove(t *testing.T) {
 			// after 2..3 missing levels, or PATH_MAX overflow) and verify full
 			// rollback back to preTree.
 			var badDst string
-			if rng.IntN(2) == 0 {
+			// Windows long paths have no PATH_MAX, so only an over-long
+			// component fails there.
+			if rng.IntN(2) == 0 || runtime.GOOS == "windows" {
 				badDst = filepath.Join(dstRoot, "fail_a_"+strconv.FormatUint(seed, 10), "fail_b", strings.Repeat("x", 300), "bad.dat")
 			} else {
 				parts := []string{dstRoot, "ovf_a_" + strconv.FormatUint(seed, 10), "ovf_b"}

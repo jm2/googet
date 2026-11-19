@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,7 +151,7 @@ func TestRecoveryFailureKeepsArchiveAndReportsIt(t *testing.T) {
 		}
 		return nil
 	})
-	for _, want := range []string{"missing-script.exe", "couldn't reinstall P.noarch.1, which installing R.noarch.1 removed (archive \"" + pArchive + "\")", "had removed: D.noarch.1"} {
+	for _, want := range []string{"missing-script.exe", fmt.Sprintf("couldn't reinstall P.noarch.1, which installing R.noarch.1 removed (archive %q)", pArchive), "had removed: D.noarch.1"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("install R = %v, want an error containing %q", err, want)
 		}

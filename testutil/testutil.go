@@ -110,6 +110,17 @@ func GenGoo(t *testing.T, dir, dst string, ps goolib.PkgSpec) goolib.RepoSpec {
 	}
 }
 
+// ScaledIterations returns n, or a tenth of n (at least 1) on Windows, for
+// randomized tests whose iterations each write a SQLite database. A SQLite
+// write transaction takes about a hundred times longer on Windows CI runners
+// than on Linux ones, and the tested logic doesn't depend on the platform.
+func ScaledIterations(n int) int {
+	if runtime.GOOS != "windows" {
+		return n
+	}
+	return max(n/10, 1)
+}
+
 // BuildGoopack compiles the local goopack binary into a temporary directory
 // for end-to-end archive creation.
 func BuildGoopack(t *testing.T) string {
@@ -154,7 +165,10 @@ func GenGooWithGoopack(t *testing.T, goopackBin, outDir, dstDir string, ps gooli
 		"sources": []goolib.PkgSources{
 			{
 				Include: []string{ps.Name},
-				Root:    srcDir,
+				// goopack resolves Root against its working directory; a
+				// relative root keeps archive paths free of the drive letter
+				// on Windows.
+				Root: "src",
 			},
 		},
 	}
@@ -168,6 +182,7 @@ func GenGooWithGoopack(t *testing.T, goopackBin, outDir, dstDir string, ps gooli
 	}
 
 	cmd := exec.Command(goopackBin, "-output_dir", outDir, specPath)
+	cmd.Dir = workDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("goopack(%s) failed: %v\n%s", ps, err, out)
 	}

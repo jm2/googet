@@ -18,7 +18,6 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -517,12 +516,9 @@ func TestDependentSatisfiedOnlyByLaterStepStillFailsPerStep(t *testing.T) {
 // between modes, and that the non-victim dependents removed by OrphanRemove
 // equal the exact Dependents reported by OrphanFail.
 func TestOrphanFailMatchesOrphanRemoveProperty(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("scratch: skipped on Windows while measuring")
-	}
 	rng := rand.New(rand.NewPCG(316, 2026))
 	var orphanHits, hardErrs, cleanSuccess int
-	for iter := range 300 {
+	for iter := range testutil.ScaledIterations(300) {
 		seed := rng.Uint64()
 		c := genCorpusCase(seed)
 		f := newRelFixture(t, c.Installed, c.Available)

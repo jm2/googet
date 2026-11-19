@@ -18,7 +18,6 @@ import (
 	"maps"
 	"math/rand/v2"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -81,15 +80,12 @@ func TestAllRowConflictsAndDependenciesFromRepo(t *testing.T) {
 // TestResolveMatchesSQLiteReference checks relation.Resolve against a direct
 // SQLite query reference over multi-arch installed states.
 func TestResolveMatchesSQLiteReference(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("scratch: skipped on Windows while measuring")
-	}
 	rng := rand.New(rand.NewPCG(14, 314))
 	names := []string{"foo", "bar", "a_b"}
 	archs := []string{"noarch", "x86_64", "arm64"}
 	vers := []string{"1", "2.0.0", "3", "notaver", ""}
 
-	for i := range 200 {
+	for i := range testutil.ScaledIterations(200) {
 		db := openTestDB(t)
 		var st client.GooGetState
 		seen := map[string]bool{}

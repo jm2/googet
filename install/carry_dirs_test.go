@@ -16,6 +16,7 @@ package install
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -77,6 +78,12 @@ func TestCarryDirs(t *testing.T) {
 		existingParent:      "",
 		dedupUpper:          "",
 		existingSecondLower: "",
+	}
+	if runtime.GOOS == "windows" {
+		// The file system ignores case, so MissingFirst names the existing
+		// missingfirst directory and, sorting first, is the spelling carried.
+		delete(want, existingSecondLower)
+		want[missingFirstUpper] = ""
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("carryDirs() mismatch (-want +got):\n%s", diff)

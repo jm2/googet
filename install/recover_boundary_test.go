@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -111,6 +112,9 @@ func scriptedPkg(t *testing.T, gooDir, payloadPath string, ps goolib.PkgSpec, in
 // reverse removal order with file-conflict overwriting enabled even when
 // StrictConflicts is set.
 func TestRecoveryExactReverseScriptOrderAndStrictConflicts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("The packages' install scripts are POSIX shell scripts.")
+	}
 	t.Cleanup(settings.Snapshot())
 	rootDir := t.TempDir()
 	settings.Initialize(rootDir, false)
@@ -566,8 +570,8 @@ func TestAllRecoveryReinstallsFailingReportsFailuresCleanly(t *testing.T) {
 		}
 		for _, want := range []string{
 			"missing-script.exe",
-			`couldn't reinstall P.noarch.1, which installing R.noarch.1 removed (archive "` + before["P"].LocalPath + `")`,
-			`couldn't reinstall D.noarch.1, which installing R.noarch.1 removed (archive "` + before["D"].LocalPath + `")`,
+			fmt.Sprintf("couldn't reinstall P.noarch.1, which installing R.noarch.1 removed (archive %q)", before["P"].LocalPath),
+			fmt.Sprintf("couldn't reinstall D.noarch.1, which installing R.noarch.1 removed (archive %q)", before["D"].LocalPath),
 		} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("err = %q, want substring %q", err.Error(), want)

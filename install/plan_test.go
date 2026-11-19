@@ -19,7 +19,6 @@ import (
 	"go/token"
 	"math/rand/v2"
 	"os"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -28,6 +27,7 @@ import (
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
+	"github.com/google/googet/v2/testutil"
 )
 
 var planSeeds = flag.Int("plan_seeds", 150, "number of random install scenarios TestBuildPlanMatchesFromRepo checks")
@@ -296,15 +296,12 @@ func TestBuildPlanIgnoresEntriesWithoutSpec(t *testing.T) {
 // TestSatisfiedInMatchesIsSatisfied checks satisfiedIn against isSatisfied,
 // which reads the database, over random installed states and requirements.
 func TestSatisfiedInMatchesIsSatisfied(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("scratch: skipped on Windows while measuring")
-	}
 	rng := rand.New(rand.NewPCG(5, 6))
 	names := []string{"P", "Q", "virt"}
 	archs := []string{"noarch", "x86_64"}
 	vers := []string{"1", "2.0.0", "3", "notaver", ""}
 	provs := []string{"virt", "virt=2", "virt=notaver", "P=3", "Q"}
-	for i := range 300 {
+	for i := range testutil.ScaledIterations(300) {
 		db := openTestDB(t)
 		var st client.GooGetState
 		for range rng.IntN(5) {

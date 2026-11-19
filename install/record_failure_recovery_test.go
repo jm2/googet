@@ -16,6 +16,7 @@ package install
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -85,7 +86,7 @@ func TestPersistentRecordFailureNamesKeptArchives(t *testing.T) {
 				t.Errorf("console output %q and logs %q, want both to contain a line starting %q", out, logs, linePrefix)
 			}
 			for _, name := range []string{"P", "Q"} {
-				wantErr := "couldn't reinstall " + name + ".noarch.1, which installing R.noarch.1 removed (archive \"" + before[name].LocalPath + "\")"
+				wantErr := fmt.Sprintf("couldn't reinstall %s.noarch.1, which installing R.noarch.1 removed (archive %q)", name, before[name].LocalPath)
 				wantEntry := name + ".noarch.1 (archive " + before[name].LocalPath + ")"
 				if dbOnly {
 					wantErr = "couldn't reinstall " + name + ".noarch.1, which installing R.noarch.1 removed: "

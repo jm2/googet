@@ -25,6 +25,17 @@ import (
 	"github.com/google/googet/v2/internal/snapshot"
 )
 
+// scaledIterations returns n, or a tenth of n (at least 1) on Windows, where a
+// SQLite write transaction takes about a hundred times longer on CI runners
+// than on Linux ones. It mirrors testutil.ScaledIterations, which this package
+// can't import because testutil imports googetdb.
+func scaledIterations(n int) int {
+	if runtime.GOOS != "windows" {
+		return n
+	}
+	return max(n/10, 1)
+}
+
 // openSnapshotTestDB opens a fresh database in a temporary directory.
 func openSnapshotTestDB(t *testing.T) *GooDB {
 	t.Helper()
@@ -39,9 +50,6 @@ func openSnapshotTestDB(t *testing.T) *GooDB {
 // TestPickMatchesFetchPkg checks snapshot.Pick against FetchPkg across
 // randomized multi-arch, multi-version database states.
 func TestPickMatchesFetchPkg(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("scratch: skipped on Windows while measuring")
-	}
 	rng := rand.New(rand.NewPCG(1, 2))
 	names := []string{"P", "Q", "R", "dotted.pkg"}
 	archs := []string{"noarch", "x86_64", "x86_32", "arm64", "arm"}
@@ -50,10 +58,8 @@ func TestPickMatchesFetchPkg(t *testing.T) {
 	qArchs := []string{"", "noarch", "x86_64", "x86_32", "arm64", "arm", "unknown"}
 	qVers := []string{"", "1", "1.0.0", "2.0.0", "1.2.3@4", "99.9.9"}
 
-	const (
-		numStates       = 200
-		queriesPerState = 25
-	)
+	numStates := scaledIterations(200)
+	const queriesPerState = 25
 	for i := range numStates {
 		db := openSnapshotTestDB(t)
 		count := rng.IntN(9)
@@ -100,15 +106,12 @@ func TestPickMatchesFetchPkg(t *testing.T) {
 // are wildcards, "_" matches one UTF-8 character, only ASCII letters fold
 // case, a backslash is literal, and an empty name selects every package.
 func TestLockStateMatchesInstalledLockState(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("scratch: skipped on Windows while measuring")
-	}
 	rng := rand.New(rand.NewPCG(3, 4))
 	names := []string{"a_b", "axb", "AXB", "aXb", "a%b", `a\b`, "ab", "é", "É", "éx", "日本", "日x", "x_y", "foo", "Foo", "foo.bar"}
 	archs := []string{"noarch", "x86_64", "arm64", "X86_64"}
 	queries := []string{"a_b", "A_B", "a%", "%b", "_", "__", "%", "", `a\b`, `a\_b`, "é", "É", "_x", "日_", "_本", "%x%", "foo", "FOO", "foo%", "fo_.bar", "nonexistent", "a%%b", "%_%"}
 
-	const numStates = 300
+	numStates := scaledIterations(300)
 	for i := range numStates {
 		db := openSnapshotTestDB(t)
 		var state client.GooGetState
