@@ -21,7 +21,6 @@ import (
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
-	"github.com/google/googet/v2/internal/relation"
 )
 
 // Plan describes what (*Installer).FromRepo would do to install one package:
@@ -99,17 +98,47 @@ func (p *Plan) Installs() []goolib.PackageInfo {
 	return out
 }
 
-// Removals returns the installed packages the plan removes, in removal
-// order.
-func (p *Plan) Removals() []goolib.PackageInfo {
+// Removal is one installed package a plan removes, together with why.
+type Removal struct {
+	// Package is the installed package removed by the plan.
+	Package goolib.PackageInfo
+	// ReplacedBy is the step package whose Replaces entry removes Package, or
+	// nil when Package is a dependent removed alongside replaced packages.
+	ReplacedBy *goolib.PackageInfo
+}
+
+// RemovalDetails returns the installed packages the plan removes, in removal
+// order, together with the step package whose Replaces entry removes each
+// victim (or a nil ReplacedBy for cascaded dependents).
+func (p *Plan) RemovalDetails() []Removal {
 	if p == nil || p.p == nil {
 		return nil
 	}
-	var out []goolib.PackageInfo
+	var out []Removal
 	for _, s := range p.p.steps {
+		replacer := specInfo(s.spec.PackageSpec)
 		for _, r := range s.removed {
-			out = append(out, specInfo(r.PackageSpec))
+			rem := Removal{Package: specInfo(r.row.PackageSpec)}
+			if r.victim {
+				by := replacer
+				rem.ReplacedBy = &by
+			}
+			out = append(out, rem)
 		}
+	}
+	return out
+}
+
+// Removals returns the installed packages the plan removes, in removal
+// order.
+func (p *Plan) Removals() []goolib.PackageInfo {
+	details := p.RemovalDetails()
+	if len(details) == 0 {
+		return nil
+	}
+	out := make([]goolib.PackageInfo, len(details))
+	for i, r := range details {
+		out[i] = r.Package
 	}
 	return out
 }
@@ -118,15 +147,10 @@ func (p *Plan) Removals() []goolib.PackageInfo {
 // package removing them name, in removal order. Removals also lists the
 // dependents removed with them.
 func (p *Plan) Replaced() []goolib.PackageInfo {
-	if p == nil || p.p == nil {
-		return nil
-	}
 	var out []goolib.PackageInfo
-	for _, s := range p.p.steps {
-		for _, r := range s.removed {
-			if replacedBy(s, r) {
-				out = append(out, specInfo(r.PackageSpec))
-			}
+	for _, r := range p.RemovalDetails() {
+		if r.ReplacedBy != nil {
+			out = append(out, r.Package)
 		}
 	}
 	return out
@@ -154,7 +178,7 @@ func (p *Plan) String() string {
 				fmt.Fprintln(&b, "The following packages will be removed:")
 				removing = true
 			}
-			fmt.Fprintf(&b, "  %s (%s)\n", r.PackageSpec, removalReason(s, r))
+			fmt.Fprintf(&b, "  %s (%s)\n", r.row.PackageSpec, removalReason(s, r))
 		}
 	}
 	writeStepListedOrphans(&b, p.p.steps)
@@ -191,39 +215,62 @@ func specInfo(ps *goolib.PkgSpec) goolib.PackageInfo {
 	return goolib.PackageInfo{Name: ps.Name, Arch: ps.Arch, Ver: ps.Version}
 }
 
+// stepVersion classifies installing ps over old (the same name.arch row, or
+// nil).
+type stepVersion struct {
+	action       goolib.Action
+	from         string
+	uncomparable bool
+}
+
+// classifyVersion returns the installer action and previous version for
+// installing ps over old.
+func classifyVersion(old *client.PackageState, ps *goolib.PkgSpec) stepVersion {
+	if old == nil {
+		return stepVersion{action: goolib.ActionInstall}
+	}
+	from := old.PackageSpec.Version
+	c, err := goolib.Compare(ps.Version, from)
+	switch {
+	case err != nil:
+		act := goolib.ActionUpgrade
+		if ps.Version == from {
+			act = goolib.ActionReinstall
+		}
+		return stepVersion{action: act, from: from, uncomparable: true}
+	case c > 0:
+		return stepVersion{action: goolib.ActionUpgrade, from: from}
+	case c < 0:
+		return stepVersion{action: goolib.ActionDowngrade, from: from}
+	default:
+		return stepVersion{action: goolib.ActionReinstall, from: from}
+	}
+}
+
 // versionChange describes how step changes the installed version of its
 // package, or returns "" for a fresh install.
 func versionChange(s planStep) string {
-	if s.old == nil {
-		return ""
+	sv := classifyVersion(s.old, s.spec.PackageSpec)
+	if sv.uncomparable {
+		return fmt.Sprintf(" (replacing version %s)", sv.from)
 	}
-	from := s.old.PackageSpec.Version
-	c, err := goolib.Compare(s.spec.PackageSpec.Version, from)
-	switch {
-	case err != nil:
-		return fmt.Sprintf(" (replacing version %s)", from)
-	case c > 0:
-		return fmt.Sprintf(" (upgrade from %s)", from)
-	case c < 0:
-		return fmt.Sprintf(" (downgrade from %s)", from)
-	default:
+	switch sv.action {
+	case goolib.ActionUpgrade:
+		return fmt.Sprintf(" (upgrade from %s)", sv.from)
+	case goolib.ActionDowngrade:
+		return fmt.Sprintf(" (downgrade from %s)", sv.from)
+	case goolib.ActionReinstall:
 		return " (reinstall)"
+	default:
+		return ""
 	}
 }
 
 // removalReason says why step removes the installed package r: either one of
-// step's Replaces entries names it at a version that meets the entry's
-// version constraint, or it depends on a package they name.
-func removalReason(s planStep, r client.PackageState) string {
-	if replacedBy(s, r) {
+// step's Replaces entries names it, or it depends on a package they name.
+func removalReason(s planStep, r removal) string {
+	if r.victim {
 		return "replaced by " + s.spec.PackageSpec.String()
 	}
 	return "depends on a package " + s.spec.PackageSpec.String() + " replaces"
-}
-
-// replacedBy reports whether one of the Replaces entries of step's package
-// names the installed package r at a version that meets the entry's version
-// constraint.
-func replacedBy(s planStep, r client.PackageState) bool {
-	return relation.ReplacesInstalled(s.spec.PackageSpec.Replaces, r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version)
 }

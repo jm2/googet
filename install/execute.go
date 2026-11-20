@@ -125,16 +125,16 @@ func (ri *repoInstall) fetch(ctx context.Context, p *plan) ([]fetched, error) {
 	}
 	for i, s := range p.steps {
 		for _, r := range s.removed {
-			if installedEarlier(p.steps[:i], r) {
+			if installedEarlier(p.steps[:i], r.row) {
 				// Its archive is one fetched above.
 				continue
 			}
-			if _, err := remove.LocalArchive(ctx, r, ri.downloader); err != nil {
-				rmArg := r.PackageSpec.Name
-				if r.PackageSpec.Arch != "" {
-					rmArg = pkgKey(r.PackageSpec)
+			if _, err := remove.LocalArchive(ctx, r.row, ri.downloader); err != nil {
+				rmArg := r.row.PackageSpec.Name
+				if r.row.PackageSpec.Arch != "" {
+					rmArg = pkgKey(r.row.PackageSpec)
 				}
-				return nil, fmt.Errorf("cannot install %s: installing it removes %s, which has no usable cached archive to uninstall it with: %v; restore the archive at %s, or remove %s first with \"googet remove -db_only %s\", which doesn't run its uninstall script", s.spec.PackageSpec, r.PackageSpec, err, archivePath(r), pkgKey(r.PackageSpec), rmArg)
+				return nil, fmt.Errorf("cannot install %s: installing it removes %s, which has no usable cached archive to uninstall it with: %v; restore the archive at %s, or remove %s first with \"googet remove -db_only %s\", which doesn't run its uninstall script", s.spec.PackageSpec, r.row.PackageSpec, err, archivePath(r.row), pkgKey(r.row.PackageSpec), rmArg)
 			}
 		}
 	}
@@ -271,8 +271,8 @@ func (ri *repoInstall) checkRemovals(s planStep) error {
 		return err
 	}
 	out, err := planReplacement(s.spec.PackageSpec, state)
-	if err == nil && (ri.opts.OrphanedDependents != OrphanFail || len(out.orphans) == 0) && slices.EqualFunc(out.removed, s.removed, func(a, b client.PackageState) bool {
-		return pkgKey(a.PackageSpec) == pkgKey(b.PackageSpec)
+	if err == nil && (ri.opts.OrphanedDependents != OrphanFail || len(out.orphans) == 0) && slices.EqualFunc(out.removed, s.removed, func(a, b removal) bool {
+		return pkgKey(a.row.PackageSpec) == pkgKey(b.row.PackageSpec) && a.victim == b.victim
 	}) {
 		return nil
 	}
@@ -305,11 +305,11 @@ func (ri *repoInstall) divergence(s planStep, check, detail string) error {
 	return fmt.Errorf("%w: installing %s: %s", errPlanDivergence, s.spec.PackageSpec, detail)
 }
 
-// rowKeys returns name.arch for each row.
-func rowKeys(rows []client.PackageState) []string {
+// rowKeys returns name.arch for each removal row.
+func rowKeys(rows []removal) []string {
 	var out []string
 	for _, r := range rows {
-		out = append(out, pkgKey(r.PackageSpec))
+		out = append(out, pkgKey(r.row.PackageSpec))
 	}
 	return out
 }
