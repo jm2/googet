@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
@@ -31,20 +32,24 @@ func setStrictConflicts(t *testing.T, v bool) {
 	t.Cleanup(func() { settings.StrictConflicts = old })
 }
 
-func TestNewPolicy(t *testing.T) {
-	for _, strict := range []bool{false, true} {
-		for _, force := range []bool{false, true} {
-			setStrictConflicts(t, strict)
-			if got, want := newPolicy(force), (policy{strictConflicts: strict, force: force}); got != want {
-				t.Errorf("StrictConflicts=%t: newPolicy(%t) = %+v, want %+v", strict, force, got, want)
+func TestOptionsFromSettings(t *testing.T) {
+	for _, dbOnly := range []bool{false, true} {
+		for _, strict := range []bool{false, true} {
+			for _, force := range []bool{false, true} {
+				setStrictConflicts(t, strict)
+				got := OptionsFromSettings(dbOnly, force)
+				want := Options{DBOnly: dbOnly, Force: force, StrictConflicts: strict}
+				if got != want {
+					t.Errorf("StrictConflicts=%t: OptionsFromSettings(%t, %t) = %+v, want %+v", strict, dbOnly, force, got, want)
+				}
 			}
 		}
 	}
 }
 
-// TestMakeInstallFunctionUsesPolicy checks that the file-conflict check
-// follows the policy it is given rather than the global settings.
-func TestMakeInstallFunctionUsesPolicy(t *testing.T) {
+// TestMakeInstallFunctionUsesOptions checks that the file-conflict check
+// follows the Options it is given rather than the global settings.
+func TestMakeInstallFunctionUsesOptions(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "src")
 	dst := t.TempDir()
 	if err := os.MkdirAll(src, 0755); err != nil {
@@ -62,17 +67,56 @@ func TestMakeInstallFunctionUsesPolicy(t *testing.T) {
 
 	for _, tc := range []struct {
 		settings bool
-		pol      policy
+		opts     Options
 		wantErr  bool
 	}{
-		{settings: true, pol: policy{}},
-		{settings: false, pol: policy{strictConflicts: true}, wantErr: true},
+		{settings: true, opts: Options{}},
+		{settings: false, opts: Options{StrictConflicts: true}, wantErr: true},
 	} {
 		setStrictConflicts(t, tc.settings)
-		fn := makeInstallFunction(src, dst, map[string]string{}, false, tc.pol, owners, &undo{})
+		fn := makeInstallFunction(src, dst, map[string]string{}, tc.opts, owners, &undo{})
 		if err := fn(file, fi, nil); (err != nil) != tc.wantErr {
-			t.Errorf("StrictConflicts=%t, policy %+v: install function error = %v, want error: %t", tc.settings, tc.pol, err, tc.wantErr)
+			t.Errorf("StrictConflicts=%t, opts %+v: install function error = %v, want error: %t", tc.settings, tc.opts, err, tc.wantErr)
 		}
+	}
+}
+
+// TestInstallerNewIgnoresSettings checks that New and Installer follow Options
+// exclusively and never read settings globals.
+func TestInstallerNewIgnoresSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		settingsStrict bool
+		optsStrict     bool
+		wantErr        bool
+	}{
+		{name: "permissive Options overrides strict settings", settingsStrict: true, optsStrict: false},
+		{name: "strict Options overrides permissive settings", settingsStrict: false, optsStrict: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRelFixture(t, nil, []goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1"}})
+			// Package A owns the destination file that B installs.
+			goo := filepath.Join(f.cache, "A.noarch.1.goo")
+			writeGoo(t, goo, map[string]string{"x": "from A"})
+			ps := &goolib.PkgSpec{
+				Name:    "A",
+				Arch:    "noarch",
+				Version: "1",
+				Files:   map[string]string{"x": filepath.Join(f.dst, "B")},
+			}
+			if _, err := installPkg(goo, ps, Options{}, f.db, func(insFiles map[string]string) error {
+				return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			setStrictConflicts(t, tc.settingsStrict)
+			ins := New(f.cache, f.db, Options{StrictConflicts: tc.optsStrict})
+			err := ins.FromRepo(t.Context(), goolib.PackageInfo{Name: "B"}, "", f.rm, []string{"noarch"}, f.downloader)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Installer.FromRepo error = %v, want error: %t", err, tc.wantErr)
+			}
+		})
 	}
 }
 

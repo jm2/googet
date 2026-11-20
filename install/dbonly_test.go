@@ -40,7 +40,7 @@ func installDBOnly(t *testing.T, f *relFixture, name string, contents, files map
 	goo := filepath.Join(f.cache, name+".noarch.1.goo")
 	writeGoo(t, goo, contents)
 	ps := &goolib.PkgSpec{Name: name, Arch: "noarch", Version: "1", Files: files}
-	installed, err := installPkg(goo, ps, true, policy{}, f.db, func(insFiles map[string]string) error {
+	installed, err := installPkg(goo, ps, Options{DBOnly: true}, f.db, func(insFiles map[string]string) error {
 		return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
 	})
 	if err != nil {
@@ -91,7 +91,7 @@ func TestDBOnlyFilesSeenByConflictCheck(t *testing.T) {
 			goo := filepath.Join(f.cache, "B.noarch.1.goo")
 			writeGoo(t, goo, map[string]string{"shared": "from B"})
 			ps := &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", Files: map[string]string{"shared": shared}}
-			_, err := installPkg(goo, ps, false, policy{strictConflicts: tc.strict, force: tc.force}, f.db, nil)
+			_, err := installPkg(goo, ps, Options{StrictConflicts: tc.strict, Force: tc.force}, f.db, nil)
 			if gotErr := err != nil; gotErr != tc.wantErr {
 				t.Fatalf("installPkg(B) = %v, want error: %t", err, tc.wantErr)
 			}

@@ -239,7 +239,7 @@ func TestInstallPkg(t *testing.T) {
 	}
 
 	ps := goolib.PkgSpec{Files: map[string]string{"./": dst}}
-	got, err := installPkg(f.Name(), &ps, false, policy{}, db, nil)
+	got, err := installPkg(f.Name(), &ps, Options{}, db, nil)
 	if err != nil {
 		t.Fatalf("Error running installPkg: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestInstallPkgRollback(t *testing.T) {
 				ps.Files[src] = filepath.Join(dst, rel)
 			}
 
-			_, err = installPkg(pkg, &ps, false, policy{}, db, nil)
+			_, err = installPkg(pkg, &ps, Options{}, db, nil)
 			want := tc.want
 			if want == nil {
 				want = before
@@ -1057,7 +1057,7 @@ func TestFromRepo_SatisfiedByProvider(t *testing.T) {
 
 	// We pass empty repo map and downloader because we expect it NOT to try downloading deps
 	// since they are satisfied.
-	err = (&installer{db: db}).installDeps(t.Context(), ps, nil)
+	err = (&repoInstall{Installer: New("", db, Options{})}).installDeps(t.Context(), ps, nil)
 	if err != nil {
 		t.Errorf("installDeps failed: %v", err)
 	}
@@ -1099,7 +1099,7 @@ func TestFromRepo_SatisfiedByUninstalledProvider(t *testing.T) {
 	// Verify that dependency resolution succeeds (finding provider_pkg); the download
 	// is expected to fail due to an invalid repository URL.
 	downloader, _ := client.NewDownloader("")
-	err = (&installer{rm: rm, archs: []string{"noarch"}, downloader: downloader, db: db}).installDeps(t.Context(), ps, nil)
+	err = (&repoInstall{Installer: New("", db, Options{}), rm: rm, archs: []string{"noarch"}, downloader: downloader}).installDeps(t.Context(), ps, nil)
 
 	// We expect an error because download will fail (invalid URL/Source).
 	if err == nil {
@@ -1258,7 +1258,7 @@ func TestInstallDeps_SelfDependency(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDownloader: %v", err)
 			}
-			err = (&installer{cache: t.TempDir(), rm: rm, archs: []string{"x86_64", "x86_32", "noarch"}, downloader: downloader, db: db}).installDeps(t.Context(), tc.pkgs[0], nil)
+			err = (&repoInstall{Installer: New(t.TempDir(), db, Options{}), rm: rm, archs: []string{"x86_64", "x86_32", "noarch"}, downloader: downloader}).installDeps(t.Context(), tc.pkgs[0], nil)
 			const selfErr = "resolves to the package itself"
 			if gotSelf := err != nil && strings.Contains(err.Error(), selfErr); gotSelf != tc.wantSelf {
 				t.Errorf("installDeps = %v; want an error containing %q: %v", err, selfErr, tc.wantSelf)
@@ -1427,28 +1427,28 @@ func TestMakeInstallFunction(t *testing.T) {
 	f.Close()
 
 	// Test 1: Conflict without force -> Success by default
-	fnBlock := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, policy{}, cm, &undo{})
+	fnBlock := makeInstallFunction(srcDir, dstDir, make(map[string]string), Options{}, cm, &undo{})
 	errBlock := fnBlock(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errBlock != nil {
 		t.Errorf("expected no conflict error by default, got %v", errBlock)
 	}
 
 	// Test 2: Conflict with force -> Success
-	fnForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, policy{force: true}, cm, &undo{})
+	fnForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), Options{Force: true}, cm, &undo{})
 	errForce := fnForce(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errForce != nil {
 		t.Errorf("expected no error with force, got %v", errForce)
 	}
 
 	// Test 3: Conflict without force in strict mode -> Error
-	fnStrict := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, policy{strictConflicts: true}, cm, &undo{})
+	fnStrict := makeInstallFunction(srcDir, dstDir, make(map[string]string), Options{StrictConflicts: true}, cm, &undo{})
 	errStrict := fnStrict(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errStrict == nil {
 		t.Errorf("expected conflict error in strict mode, got nil")
 	}
 
 	// Test 4: Conflict with force in strict mode -> Success
-	fnStrictForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, policy{strictConflicts: true, force: true}, cm, &undo{})
+	fnStrictForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), Options{StrictConflicts: true, Force: true}, cm, &undo{})
 	errStrictForce := fnStrictForce(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errStrictForce != nil {
 		t.Errorf("expected no error with force in strict mode, got %v", errStrictForce)
