@@ -108,15 +108,13 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 		return err
 	}
 
-	if _, err := installPkg(dst, zs, ins.opts, db, func(insFiles map[string]string) error {
-		return addPkg(db, client.PackageState{
-			LocalPath:      dst,
-			PackageSpec:    zs,
-			InstalledFiles: insFiles,
-		})
-	}); err != nil {
+	rc := newRecorder(db, client.PackageState{LocalPath: dst, PackageSpec: zs}, fromDiskPolicy(ins.opts.DBOnly), func(row client.PackageState) error {
+		return addPkg(db, row)
+	})
+	if _, err := installPkg(dst, zs, ins.opts, db, rc.record); err != nil {
 		return err
 	}
+	rc.finish()
 
 	if reinstall {
 		logger.Infof("Reinstallation of %q, version %q completed", zs.Name, zs.Version)
@@ -327,18 +325,6 @@ func resolveDst(dst string) string {
 		return "/" + dst
 	}
 	return dst
-}
-
-func cleanOld(st client.PackageState, insFiles map[string]string, dbOnly bool) {
-	if !dbOnly {
-		cleanOldFiles(st, insFiles)
-	}
-	if st.LocalPath != "" && oswrap.RemoveAll(st.LocalPath) != nil {
-		logger.Error("Unable to remove old local path")
-	}
-	if st.UnpackDir != "" && oswrap.RemoveAll(st.UnpackDir) != nil {
-		logger.Error("Unable to remove old unpack dir")
-	}
 }
 
 func cleanOldFiles(oldState client.PackageState, insFiles map[string]string) {
