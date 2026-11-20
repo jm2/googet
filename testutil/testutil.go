@@ -123,7 +123,13 @@ func GenGoo(t *testing.T, dir, dst string, ps goolib.PkgSpec) goolib.RepoSpec {
 // ServeGoo returns an HTTP server that serves files from dir.
 func ServeGoo(t *testing.T, dir string) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(GooHandler(t, dir))
+}
+
+// GooHandler returns the handler ServeGoo uses to serve files from dir.
+func GooHandler(t *testing.T, dir string) http.Handler {
+	t.Helper()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		absDir, err := filepath.Abs(dir)
 		if err != nil {
 			t.Fatal(err)
@@ -141,5 +147,5 @@ func ServeGoo(t *testing.T, dir string) *httptest.Server {
 			io.Copy(w, f)
 			f.Close()
 		}
-	}))
+	})
 }

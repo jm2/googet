@@ -58,6 +58,9 @@ type planStep struct {
 	// removed lists the installed packages that spec's Replaces entries
 	// remove before spec is installed, in removal order.
 	removed []client.PackageState
+	// recheck holds the conflict checks that passed only because a package
+	// that removed lists was exempt; they must still pass once it is gone.
+	recheck deferredChecks
 }
 
 // plan is the ordered list of steps that installing one package performs.
@@ -111,8 +114,7 @@ type planner struct {
 	steps []planStep
 }
 
-// repoNode plans the install of pi from a repository, as fromRepo performs
-// it. chain lists the packages, as name.arch, whose dependencies are being
+// repoNode plans the install of pi from a repository. chain lists the packages, as name.arch, whose dependencies are being
 // planned further up.
 func (p *planner) repoNode(pi goolib.PackageInfo, repo string, chain []string) error {
 	p.sink.Infof("Starting install of %s.%s.%s", pi.Name, pi.Arch, pi.Ver)
@@ -136,11 +138,11 @@ func (p *planner) repoNode(pi goolib.PackageInfo, repo string, chain []string) e
 	if at := slices.Index(chain, key); at >= 0 {
 		return fmt.Errorf("cannot install %s: dependency cycle %s", chain[0], strings.Join(append(slices.Clone(chain[at:]), key), " -> "))
 	}
-	removed, err := p.depsAndReplacements(rs.PackageSpec, append(slices.Clone(chain), key))
+	removed, recheck, err := p.depsAndReplacements(rs.PackageSpec, append(slices.Clone(chain), key))
 	if err != nil {
 		return err
 	}
-	p.addStep(planStep{spec: rs, repo: repo, removed: removed}, client.PackageState{
+	p.addStep(planStep{spec: rs, repo: repo, removed: removed, recheck: recheck}, client.PackageState{
 		SourceRepo:  repo,
 		Checksum:    rs.Checksum,
 		PackageSpec: rs.PackageSpec,
@@ -149,24 +151,25 @@ func (p *planner) repoNode(pi goolib.PackageInfo, repo string, chain []string) e
 }
 
 // depsAndReplacements plans ps's conflict checks, dependencies and
-// replacements, as installDeps performs them, and returns the installed
-// packages that ps's Replaces entries remove, in removal order.
-func (p *planner) depsAndReplacements(ps *goolib.PkgSpec, chain []string) ([]client.PackageState, error) {
+// replacements, and returns the installed packages that ps's Replaces entries
+// remove, in removal order, and the conflict checks that must still pass once
+// they are gone.
+func (p *planner) depsAndReplacements(ps *goolib.PkgSpec, chain []string) ([]client.PackageState, deferredChecks, error) {
 	p.sink.Infof("Resolving conflicts and dependencies for %s %s version %s", ps.Arch, ps.Name, ps.Version)
 	ex, err := repoExclusionsIn(ps, p.state)
 	if err != nil {
-		return nil, err
+		return nil, deferredChecks{}, err
 	}
 	deferred, err := checkConflictsIn(ps, ex, p.pol.conflicts, p.state, p.sink)
 	if err != nil {
-		return nil, err
+		return nil, deferredChecks{}, err
 	}
 	for _, dep := range slices.Sorted(maps.Keys(ps.PkgDependencies)) {
 		ver := ps.PkgDependencies[dep]
 		r := relation.ParseDependency(dep, ver)
 		ok, err := satisfiedIn(r, p.state)
 		if err != nil {
-			return nil, err
+			return nil, deferredChecks{}, err
 		}
 		if ok {
 			p.sink.Infof("Dependency met: %s.%s with version greater than %s installed or provided", r.Name, r.Arch, ver)
@@ -175,28 +178,28 @@ func (p *planner) depsAndReplacements(ps *goolib.PkgSpec, chain []string) ([]cli
 		installedArch, isLocked := snapshot.LockState(r.Name, p.state)
 		spec, repo, _, err := client.FindRepoLatest(goolib.PackageInfo{Name: r.Name, Arch: r.Arch, Ver: ver}, p.rm, p.archs, installedArch, isLocked)
 		if err != nil {
-			return nil, err
+			return nil, deferredChecks{}, err
 		}
 		if spec.Name == ps.Name && spec.Arch == ps.Arch {
-			return nil, fmt.Errorf("dependency %s of %s.%s resolves to the package itself", dep, ps.Name, ps.Arch)
+			return nil, deferredChecks{}, fmt.Errorf("dependency %s of %s.%s resolves to the package itself", dep, ps.Name, ps.Arch)
 		}
 		p.sink.Infof("Dependency found: %s.%s %s (provides %s) is available", spec.Name, spec.Arch, spec.Version, r.Name)
 		if err := p.repoNode(goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, repo, chain); err != nil {
-			return nil, err
+			return nil, deferredChecks{}, err
 		}
 	}
 	if err := deferred.recheckBeforeReplacementsIn(ps, p.pol.conflicts, p.state, p.sink); err != nil {
-		return nil, err
+		return nil, deferredChecks{}, err
 	}
 	post, removed, err := replaceRows(ps, p.state)
 	if err != nil {
-		return nil, err
+		return nil, deferredChecks{}, err
 	}
 	if err := deferred.recheckIn(ps, p.pol.conflicts, post, p.sink); err != nil {
-		return nil, err
+		return nil, deferredChecks{}, err
 	}
 	p.state = post
-	return removed, nil
+	return removed, deferred, nil
 }
 
 // diskNode plans the install of the local package ps, as FromDisk performs
