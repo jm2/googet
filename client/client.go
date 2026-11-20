@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -438,6 +439,8 @@ func latest(psm map[string][]*goolib.PkgSpec, rm RepoMap) (*goolib.PkgSpec, stri
 // 1. Repo Priority (High > Low)
 // 2. Version (New > Old)
 // 3. Architecture Preference (as defined by archs slice order)
+// 4. Repo URL (ascending), so that exact ties across repos always resolve to
+// the same repo.
 func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installedArch string, isLocked bool) (*goolib.PkgSpec, string, string, error) {
 	name := pi.Name
 	if pi.Arch != "" {
@@ -458,7 +461,8 @@ func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installed
 	var directCandidates []candidate
 	var providesCandidates []candidate
 
-	for u, r := range rm {
+	for _, u := range slices.Sorted(maps.Keys(rm)) {
+		r := rm[u]
 		for _, p := range r.Packages {
 			ps := p.PackageSpec
 
@@ -485,10 +489,24 @@ func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installed
 	cmpFunc := func(a, b candidate) int {
 		c, err := goolib.ComparePriorityVersion(a.priority, a.spec.Version, b.priority, b.spec.Version)
 		if err != nil {
+			// ComparePriorityVersion only parses versions when priorities are equal.
+			// Preserve a strict weak ordering for slices.SortStableFunc so an
+			// unparseable candidate never breaks transitivity between valid
+			// candidates or outranks them.
 			logger.Errorf("Error comparing priority/version: %v", err)
-			return 0
-		}
-		if c != 0 {
+			_, aErr := goolib.ParseVersion(a.spec.Version)
+			_, bErr := goolib.ParseVersion(b.spec.Version)
+			switch {
+			case aErr == nil && bErr != nil:
+				return -1
+			case aErr != nil && bErr == nil:
+				return 1
+			default:
+				if vc := strings.Compare(b.spec.Version, a.spec.Version); vc != 0 {
+					return vc
+				}
+			}
+		} else if c != 0 {
 			return -c // reverse for descending order
 		}
 		if archPref[a.spec.Arch] < archPref[b.spec.Arch] {
@@ -497,14 +515,14 @@ func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installed
 		if archPref[a.spec.Arch] > archPref[b.spec.Arch] {
 			return 1
 		}
-		return 0
+		return strings.Compare(a.repo, b.repo)
 	}
 
 	bestCandidate := func(list []candidate) (*goolib.PkgSpec, string, string, error) {
 		if len(list) == 0 {
 			return nil, "", "", fmt.Errorf("no package found")
 		}
-		slices.SortFunc(list, cmpFunc)
+		slices.SortStableFunc(list, cmpFunc)
 		for _, cand := range list {
 			if isLocked && cand.spec.Arch != installedArch && cand.spec.LockArch {
 				continue // Ignore this candidate
@@ -549,15 +567,28 @@ func SatisfiesProvider(prov, reqName, reqVer string) bool {
 
 // WhatRepo returns what repo a package is in.
 // Name, Arch, and Ver fields of PackageInfo must be provided.
+// If several repos carry the package, WhatRepo returns the one with the
+// highest priority, and among those the one with the smallest URL, which is
+// the repo FindRepoLatest picks for the same package.
 func WhatRepo(pi goolib.PackageInfo, rm RepoMap) (string, error) {
-	for u, r := range rm {
+	var best string
+	found := false
+	for _, u := range slices.Sorted(maps.Keys(rm)) {
+		r := rm[u]
+		if found && r.Priority <= rm[best].Priority {
+			continue
+		}
 		for _, p := range r.Packages {
 			if p.PackageSpec.Name == pi.Name && p.PackageSpec.Arch == pi.Arch && p.PackageSpec.Version == pi.Ver {
-				return u, nil
+				best, found = u, true
+				break
 			}
 		}
 	}
-	return "", fmt.Errorf("package %s %s version %s not found in any repo", pi.Arch, pi.Name, pi.Ver)
+	if !found {
+		return "", fmt.Errorf("package %s %s version %s not found in any repo", pi.Arch, pi.Name, pi.Ver)
+	}
+	return best, nil
 }
 
 // RemoveOrRename attempts to remove a file or directory. If it fails
