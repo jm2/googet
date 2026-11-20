@@ -112,8 +112,8 @@ func pkgKey(ps *goolib.PkgSpec) string {
 	return ps.Name + "." + ps.Arch
 }
 
-// exclusions identifies installed packages, keyed as name.arch, that a forward
-// conflict check skips because installing the incoming package removes them.
+// exclusions identifies installed packages, keyed as name.arch, that conflict
+// checks skip because installing the incoming package removes them.
 type exclusions struct {
 	// self is the incoming package's own name.arch key.
 	self string
@@ -368,32 +368,220 @@ func resolveConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) ([]
 	return deferred, nil
 }
 
-// deferredChecks holds conflict checks that passed before dependency
-// installation only because a Replaces victim was exempted, so callers can
-// verify after replacements run that no conflicting row remains installed.
+// ConflictMode controls how reverse package conflicts are handled.
+type ConflictMode int
+
+const (
+	// ConflictWarn logs a warning and continues installation when an
+	// installed package conflicts with the incoming package.
+	ConflictWarn ConflictMode = iota
+	// ConflictError fails the installation when an installed package
+	// conflicts with the incoming package.
+	ConflictError
+	// ConflictIgnore logs at info level and continues installation without
+	// user-facing output when an installed package conflicts with the
+	// incoming package.
+	ConflictIgnore
+)
+
+// String returns the canonical lowercase configuration name for m.
+func (m ConflictMode) String() string {
+	switch m {
+	case ConflictWarn:
+		return "warn"
+	case ConflictError:
+		return "error"
+	case ConflictIgnore:
+		return "ignore"
+	default:
+		return fmt.Sprintf("ConflictMode(%d)", int(m))
+	}
+}
+
+// ParseConflictMode parses a case-insensitive conflict mode name ("warn",
+// "error", or "ignore") after trimming surrounding whitespace.
+func ParseConflictMode(s string) (ConflictMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "warn":
+		return ConflictWarn, nil
+	case "error":
+		return ConflictError, nil
+	case "ignore":
+		return ConflictIgnore, nil
+	default:
+		return ConflictWarn, fmt.Errorf("invalid package conflict mode %q: want warn, error, or ignore", s)
+	}
+}
+
+// ErrPackageConflict marks an installation failure caused by an installed
+// package's Conflicts entry under ConflictError mode.
+var ErrPackageConflict = errors.New("package conflict")
+
+// reverseHit is a single reverse-conflict result between an installed package
+// and an incoming package.
+type reverseHit struct {
+	installed   *goolib.PkgSpec
+	entry       string
+	unparseable bool
+}
+
+// matchReverseEntry evaluates a single Conflicts entry c of an installed
+// package against incoming package ps across ps's name and all of ps.Provides.
+// A valid match takes precedence over an unparseable sibling Provides version.
+func matchReverseEntry(c string, ps *goolib.PkgSpec) (matched, unparseable bool) {
+	r := relation.ParseRelation(c)
+	ok, err := r.MinInstalled(ps.Name, ps.Arch, ps.Version)
+	if ok && err == nil {
+		return true, false
+	}
+	hadErr := err != nil
+	for _, prov := range ps.Provides {
+		pOK, pErr := r.SatisfiedBy(relation.ParseProvide(prov))
+		if pErr != nil {
+			hadErr = true
+			continue
+		}
+		if pOK {
+			return true, false
+		}
+	}
+	return false, hadErr
+}
+
+// reverseConflicts evaluates all Conflicts entries of non-excluded specs in
+// installed against incoming package ps, returning at most one hit per
+// (installed package, entry) pair.
+func reverseConflicts(ps *goolib.PkgSpec, installed []*goolib.PkgSpec, ex exclusions) []reverseHit {
+	var hits []reverseHit
+	for _, inst := range installed {
+		if inst == nil || ex.has(pkgKey(inst)) {
+			continue
+		}
+		for _, c := range inst.Conflicts {
+			matched, unparseable := matchReverseEntry(c, ps)
+			if matched {
+				hits = append(hits, reverseHit{installed: inst, entry: c})
+			} else if unparseable {
+				hits = append(hits, reverseHit{installed: inst, entry: c, unparseable: true})
+			}
+		}
+	}
+	return hits
+}
+
+// conflictLine formats the structured telemetry log line for a reverse package
+// conflict event.
+func conflictLine(mode ConflictMode, result string, installed *goolib.PkgSpec, entry string, incoming *goolib.PkgSpec) string {
+	return fmt.Sprintf("package_conflict direction=reverse mode=%s result=%s installed=%s entry=%q incoming=%s",
+		mode, result, installed, entry, incoming)
+}
+
+// applyReverseConflicts logs each hit in hits according to mode, prints user
+// warnings in warn mode, and returns an error on real conflicts in error mode.
+func applyReverseConflicts(ps *goolib.PkgSpec, hits []reverseHit, mode ConflictMode) error {
+	var firstErr error
+	for _, hit := range hits {
+		if hit.unparseable {
+			logger.Warning(conflictLine(mode, "unparseable", hit.installed, hit.entry, ps))
+			continue
+		}
+		switch mode {
+		case ConflictError:
+			logger.Error(conflictLine(mode, "failed", hit.installed, hit.entry, ps))
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%w: cannot install %s: conflict with installed package %s (entry %q; package conflict mode is %s)", ErrPackageConflict, ps, hit.installed, hit.entry, mode)
+			}
+		case ConflictIgnore:
+			logger.Info(conflictLine(mode, "ignored", hit.installed, hit.entry, ps))
+		default:
+			logger.Warning(conflictLine(ConflictWarn, "warned", hit.installed, hit.entry, ps))
+			fmt.Printf("Warning: installed package %s conflicts with %s (entry %q); installing anyway (package_conflicts=warn)\n", hit.installed, ps, hit.entry)
+		}
+	}
+	return firstErr
+}
+
+// resolveReverseConflicts checks installed packages' Conflicts against ps
+// under ex and mode, and returns the name.arch keys of any excluded victim
+// rows that matched ps so they can be re-verified after replacements run.
+func resolveReverseConflicts(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, db *googetdb.GooDB) (map[string]bool, error) {
+	installed, err := installedSpecs(db)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyReverseConflicts(ps, reverseConflicts(ps, installed, ex), mode); err != nil {
+		return nil, err
+	}
+	if len(ex.victims) == 0 {
+		return nil, nil
+	}
+	var victims []*goolib.PkgSpec
+	for _, inst := range installed {
+		if inst != nil {
+			k := pkgKey(inst)
+			if ex.victims[k] && k != ex.self {
+				victims = append(victims, inst)
+			}
+		}
+	}
+	victimHits := reverseConflicts(ps, victims, exclusions{self: ex.self})
+	if len(victimHits) == 0 {
+		return nil, nil
+	}
+	deferred := make(map[string]bool, len(victimHits))
+	for _, h := range victimHits {
+		deferred[pkgKey(h.installed)] = true
+	}
+	return deferred, nil
+}
+
+// deferredChecks holds forward and reverse conflict checks that passed before
+// dependency installation only because a Replaces victim was exempted, so
+// callers can verify after replacements run that no conflicting row survived.
 type deferredChecks struct {
 	// fwd holds parsed ps.Conflicts requirements that passed only via a victim exemption.
 	fwd []relation.Requirement
+	// rev maps name.arch keys of exempted victims whose Conflicts matched ps.
+	rev map[string]bool
 }
 
-// checkConflicts evaluates ps's conflicts under ex and returns any checks that
-// were deferred onto Replaces removal.
-func checkConflicts(ps *goolib.PkgSpec, ex exclusions, db *googetdb.GooDB) (deferredChecks, error) {
+// checkConflicts evaluates both ps's forward Conflicts and installed packages'
+// reverse Conflicts under ex and mode, returning any checks deferred onto
+// Replaces removal.
+func checkConflicts(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, db *googetdb.GooDB) (deferredChecks, error) {
 	fwd, err := resolveConflicts(ps, ex, db)
 	if err != nil {
 		return deferredChecks{}, err
 	}
-	return deferredChecks{fwd: fwd}, nil
+	rev, err := resolveReverseConflicts(ps, ex, mode, db)
+	if err != nil {
+		return deferredChecks{}, err
+	}
+	return deferredChecks{fwd: fwd, rev: rev}, nil
+}
+
+// revSpecs returns the specs in installed whose name.arch key is recorded in d.rev.
+func (d deferredChecks) revSpecs(installed []*goolib.PkgSpec) []*goolib.PkgSpec {
+	var out []*goolib.PkgSpec
+	for _, inst := range installed {
+		if inst != nil && d.rev[pkgKey(inst)] {
+			out = append(out, inst)
+		}
+	}
+	return out
 }
 
 // recheckBeforeReplacements simulates resolveReplacements on the
-// post-dependency database snapshot and re-evaluates deferred forward conflict
-// entries against the simulated post-replacement state with self-only
-// exclusions, failing before resolveReplacements removes any package whenever
-// the post-replacement recheck would fail. If simulation does not complete
-// cleanly, it logs at info level and defers to resolveReplacements and recheck.
-func (d deferredChecks) recheckBeforeReplacements(ps *goolib.PkgSpec, db *googetdb.GooDB) error {
-	if len(d.fwd) == 0 {
+// post-dependency database snapshot and re-evaluates deferred forward entries
+// and (in ConflictError mode) deferred reverse victim rows against the
+// simulated post-replacement state with self-only exclusions, failing before
+// resolveReplacements removes any package whenever the post-replacement recheck
+// would fail. If simulation does not complete cleanly, it logs at info level
+// and defers to resolveReplacements and recheck.
+func (d deferredChecks) recheckBeforeReplacements(ps *goolib.PkgSpec, mode ConflictMode, db *googetdb.GooDB) error {
+	needFwd := len(d.fwd) > 0
+	needRev := mode == ConflictError && len(d.rev) > 0
+	if !needFwd && !needRev {
 		return nil
 	}
 	state, err := db.FetchPkgs("")
@@ -405,28 +593,56 @@ func (d deferredChecks) recheckBeforeReplacements(ps *goolib.PkgSpec, db *googet
 		logger.Infof("Replacement simulation for %s did not complete; deferring conflict checks until after replacements", ps)
 		return nil
 	}
-	pickFromPost := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
-		st, _ := fetchPick(pi, post)
-		return st.PackageSpec, nil
+	postSpecs := specsFromState(post)
+	if needFwd {
+		pickFromPost := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
+			st, _ := fetchPick(pi, post)
+			return st.PackageSpec, nil
+		}
+		if err := recheckForwardEntries(d.fwd, ps, postSpecs, pickFromPost, ""); err != nil {
+			return err
+		}
 	}
-	return recheckForwardEntries(d.fwd, ps, specsFromState(post), pickFromPost, "")
+	if !needRev {
+		return nil
+	}
+	// Unparseable conflict versions never fail installation even in
+	// ConflictError mode; drop them here so all-unparseable rows defer to
+	// recheck and mixed rows do not log unparseable warnings twice.
+	hits := slices.DeleteFunc(reverseConflicts(ps, d.revSpecs(postSpecs), selfExclusion(ps)), func(h reverseHit) bool {
+		return h.unparseable
+	})
+	if len(hits) == 0 {
+		return nil
+	}
+	return applyReverseConflicts(ps, hits, ConflictError)
 }
 
-// recheck re-evaluates deferred conflict entries with self-only exclusions
-// after resolveReplacements completes, ensuring no exempted victim survived.
-func (d deferredChecks) recheck(ps *goolib.PkgSpec, db *googetdb.GooDB) error {
-	if len(d.fwd) == 0 {
+// recheck re-evaluates deferred forward and reverse conflict checks with
+// self-only exclusions after resolveReplacements completes, ensuring no
+// exempted victim survived.
+func (d deferredChecks) recheck(ps *goolib.PkgSpec, mode ConflictMode, db *googetdb.GooDB) error {
+	if len(d.fwd) == 0 && len(d.rev) == 0 {
 		return nil
 	}
 	installed, err := installedSpecs(db)
 	if err != nil {
 		return err
 	}
-	pickFromDB := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
-		st, err := db.FetchPkg(pi)
-		return st.PackageSpec, err
+	if len(d.fwd) > 0 {
+		pickFromDB := func(pi goolib.PackageInfo) (*goolib.PkgSpec, error) {
+			st, err := db.FetchPkg(pi)
+			return st.PackageSpec, err
+		}
+		if err := recheckForwardEntries(d.fwd, ps, installed, pickFromDB, " (still installed after replacing)"); err != nil {
+			return err
+		}
 	}
-	return recheckForwardEntries(d.fwd, ps, installed, pickFromDB, " (still installed after replacing)")
+	surviving := d.revSpecs(installed)
+	if len(surviving) == 0 {
+		return nil
+	}
+	return applyReverseConflicts(ps, reverseConflicts(ps, surviving, selfExclusion(ps)), mode)
 }
 
 // recheckForwardEntries checks each requirement in reqs against installed
@@ -457,21 +673,37 @@ type Options struct {
 	// or running install scripts.
 	DBOnly bool
 	// Force overwrites files owned by another package when StrictConflicts is
-	// set.
+	// set; it applies to file overlaps only and never affects PackageConflicts.
 	Force bool
 	// StrictConflicts makes overlapping files owned by another package an
 	// error unless Force is set.
 	StrictConflicts bool
+	// PackageConflicts controls how reverse package conflicts from installed
+	// packages are handled.
+	PackageConflicts ConflictMode
 }
 
 // OptionsFromSettings builds Options from the global settings package for
 // callers that use googet.conf. It is the only place in package install that
-// reads settings.
+// reads settings. settings.Initialize guarantees settings.PackageConflicts is
+// either "" or a string accepted by ParseConflictMode; if it holds any other
+// non-empty value (for example from direct mutation), OptionsFromSettings logs
+// an error once per call and falls back to ConflictWarn.
 func OptionsFromSettings(dbOnly, force bool) Options {
+	mode := ConflictWarn
+	if settings.PackageConflicts != "" {
+		m, err := ParseConflictMode(settings.PackageConflicts)
+		if err != nil {
+			logger.Errorf("Invalid settings.PackageConflicts value %q: %v; falling back to warn", settings.PackageConflicts, err)
+		} else {
+			mode = m
+		}
+	}
 	return Options{
-		DBOnly:          dbOnly,
-		Force:           force,
-		StrictConflicts: settings.StrictConflicts,
+		DBOnly:           dbOnly,
+		Force:            force,
+		StrictConflicts:  settings.StrictConflicts,
+		PackageConflicts: mode,
 	}
 }
 
@@ -540,7 +772,7 @@ func (ri *repoInstall) installDeps(ctx context.Context, ps *goolib.PkgSpec, chai
 	if err != nil {
 		return err
 	}
-	deferred, err := checkConflicts(ps, ex, db)
+	deferred, err := checkConflicts(ps, ex, ri.opts.PackageConflicts, db)
 	if err != nil {
 		return err
 	}
@@ -572,13 +804,13 @@ func (ri *repoInstall) installDeps(ctx context.Context, ps *goolib.PkgSpec, chai
 			return err
 		}
 	}
-	if err := deferred.recheckBeforeReplacements(ps, db); err != nil {
+	if err := deferred.recheckBeforeReplacements(ps, ri.opts.PackageConflicts, db); err != nil {
 		return err
 	}
 	if err := ri.resolveReplacements(ctx, ps); err != nil {
 		return err
 	}
-	return deferred.recheck(ps, db)
+	return deferred.recheck(ps, ri.opts.PackageConflicts, db)
 }
 
 // FromRepo installs pi and its dependencies from rm.
@@ -697,7 +929,7 @@ func (ins *Installer) FromDisk(pkgPath string, reinstall bool) error {
 	logger.Infof("Starting install of %q, version %q from %q", zs.Name, zs.Version, pkgPath)
 	fmt.Printf("Installing %s %s...\n", zs.Name, zs.Version)
 
-	if _, err := checkConflicts(zs, selfExclusion(zs), db); err != nil {
+	if _, err := checkConflicts(zs, selfExclusion(zs), ins.opts.PackageConflicts, db); err != nil {
 		return err
 	}
 	for p, ver := range zs.PkgDependencies {

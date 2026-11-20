@@ -297,22 +297,26 @@ func TestCharacterizeSelfConflictBlocksUpgrade(t *testing.T) {
 	}
 }
 
-// TestCharacterizeConflictsOneWay pins that only the incoming package's
-// Conflicts are checked, so installing a package that an installed package
-// conflicts with succeeds.
+// TestCharacterizeConflictsOneWay pins that when an installed package
+// declares a conflict with the incoming package, the default warn mode logs a
+// structured reverse-conflict warning and allows the installation to proceed.
 //
-// Known wrong: a fix should detect the conflict when B is installed. If the
-// fix makes it an error, installing B should fail here; if it only warns by
-// default, this test should also assert the warning.
+// Intended: reverse conflicts are detected and logged at warn by default
+// without failing unattended upgrades unless configured as an error.
 func TestCharacterizeConflictsOneWay(t *testing.T) {
+	logs := testutil.CaptureLogs(t)
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1", Conflicts: []string{"B"}}},
 		[]goolib.PkgSpec{{Name: "B", Arch: "noarch", Version: "1"}})
 	if err := f.install(t, "B"); err != nil {
-		t.Fatalf("install B: %v, want success (today conflicts are one-way)", err)
+		t.Fatalf("install B: %v", err)
 	}
 	if diff := cmp.Diff([]string{"A.noarch.1", "B.noarch.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages (-want +got):\n%s", diff)
+	}
+	wantLog := `package_conflict direction=reverse mode=warn result=warned installed=A.noarch.1 entry="B" incoming=B.noarch.1`
+	if !strings.Contains(logs.String(), wantLog) {
+		t.Errorf("logs missing %q; got:\n%s", wantLog, logs.String())
 	}
 }
 
