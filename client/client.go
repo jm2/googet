@@ -36,6 +36,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
+	"github.com/google/googet/v2/internal/repocmp"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/logger"
@@ -448,110 +449,28 @@ func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installed
 		name = fmt.Sprintf("%s.%s", pi.Name, pi.Arch)
 	}
 
-	archPref := make(map[string]int)
-	for i, a := range archs {
-		archPref[a] = i
+	best, ok, problems := repocmp.Latest(repoList(rm), pi.Name, pi.Ver, archs, installedArch, isLocked)
+	for _, err := range problems {
+		logger.Errorf("Error %v", err)
 	}
-
-	type candidate struct {
-		spec     *goolib.PkgSpec
-		repo     string
-		priority priority.Value
+	if ok {
+		return best.Spec, best.Repo, best.Spec.Arch, nil
 	}
-	var directCandidates []candidate
-	var providesCandidates []candidate
-
-	for _, u := range slices.Sorted(maps.Keys(rm)) {
-		r := rm[u]
-		for _, p := range r.Packages {
-			ps := p.PackageSpec
-
-			if _, ok := archPref[ps.Arch]; !ok {
-				continue
-			}
-
-			if ps.Name == pi.Name {
-				if satisfiesVersion(ps.Version, pi.Ver) {
-					directCandidates = append(directCandidates, candidate{ps, u, r.Priority})
-				}
-				continue
-			}
-
-			for _, prov := range ps.Provides {
-				if SatisfiesProvider(prov, pi.Name, pi.Ver) {
-					providesCandidates = append(providesCandidates, candidate{ps, u, r.Priority})
-					break
-				}
-			}
-		}
-	}
-
-	cmpFunc := func(a, b candidate) int {
-		c, err := goolib.ComparePriorityVersion(a.priority, a.spec.Version, b.priority, b.spec.Version)
-		if err != nil {
-			// ComparePriorityVersion only parses versions when priorities are equal.
-			// Preserve a strict weak ordering for slices.SortStableFunc so an
-			// unparseable candidate never breaks transitivity between valid
-			// candidates or outranks them.
-			logger.Errorf("Error comparing priority/version: %v", err)
-			_, aErr := goolib.ParseVersion(a.spec.Version)
-			_, bErr := goolib.ParseVersion(b.spec.Version)
-			switch {
-			case aErr == nil && bErr != nil:
-				return -1
-			case aErr != nil && bErr == nil:
-				return 1
-			default:
-				if vc := strings.Compare(b.spec.Version, a.spec.Version); vc != 0 {
-					return vc
-				}
-			}
-		} else if c != 0 {
-			return -c // reverse for descending order
-		}
-		if archPref[a.spec.Arch] < archPref[b.spec.Arch] {
-			return -1
-		}
-		if archPref[a.spec.Arch] > archPref[b.spec.Arch] {
-			return 1
-		}
-		return strings.Compare(a.repo, b.repo)
-	}
-
-	bestCandidate := func(list []candidate) (*goolib.PkgSpec, string, string, error) {
-		if len(list) == 0 {
-			return nil, "", "", fmt.Errorf("no package found")
-		}
-		slices.SortStableFunc(list, cmpFunc)
-		for _, cand := range list {
-			if isLocked && cand.spec.Arch != installedArch && cand.spec.LockArch {
-				continue // Ignore this candidate
-			}
-			return cand.spec, cand.repo, cand.spec.Arch, nil
-		}
-		return nil, "", "", fmt.Errorf("no package found satisfying lock conditions")
-	}
-
-	for _, cands := range [][]candidate{directCandidates, providesCandidates} {
-		if len(cands) == 0 {
-			continue
-		}
-		spec, repo, arch, err := bestCandidate(cands)
-		if err == nil {
-			return spec, repo, arch, nil
-		}
-	}
-
 	return nil, "", "", fmt.Errorf("no package found satisfying %s in any repo", name)
 }
 
-func satisfiesVersion(pkgVer, reqVer string) bool {
-	ok, err := relation.Requirement{Ver: reqVer}.Satisfies(pkgVer)
-	if err != nil {
-		logger.Errorf("Error comparing versions %s vs %s: %v", pkgVer, reqVer, err)
-		return false
+// repoList returns the repositories in rm, ordered by URL, as repocmp reads
+// them.
+func repoList(rm RepoMap) []repocmp.Repo {
+	var repos []repocmp.Repo
+	for _, u := range slices.Sorted(maps.Keys(rm)) {
+		r := repocmp.Repo{URL: u, Priority: rm[u].Priority}
+		for _, p := range rm[u].Packages {
+			r.Specs = append(r.Specs, p.PackageSpec)
+		}
+		repos = append(repos, r)
 	}
-	return ok
+	return repos
 }
 
 // SatisfiesProvider checks if a provider string satisfies a requirement.
