@@ -33,6 +33,19 @@ import (
 	"github.com/google/logger"
 )
 
+// uninstallHookObserver, when non-nil in tests, receives the InstallerContext
+// computed for each non-db_only uninstall hook invocation in uninstallRow.
+var uninstallHookObserver func(goolib.InstallerContext)
+
+// removeContext returns the InstallerContext for removing an installed package
+// row ps via All.
+func removeContext(ps client.PackageState) goolib.InstallerContext {
+	return goolib.InstallerContext{
+		Action:  goolib.ActionRemove,
+		Package: ps.PackageSpec.String(),
+	}
+}
+
 // uninstallPkg removes the single installed row db.FetchPkg picks for pi
 // (unlike UninstallRow, which removes an exact name.arch.version row).
 func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
@@ -44,7 +57,11 @@ func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downl
 	if ps.PackageSpec == nil {
 		return fmt.Errorf("package %q not found in state database", pi.Name)
 	}
-	return uninstallRow(ctx, pi, ps, dbOnly, false, downloader, db)
+	var ic goolib.InstallerContext
+	if !dbOnly {
+		ic = removeContext(ps)
+	}
+	return uninstallRow(ctx, pi, ps, dbOnly, false, ic, downloader, db)
 }
 
 // Options configures UninstallRow.
@@ -57,6 +74,10 @@ type Options struct {
 	KeepCache bool
 	// Downloader downloads the package's archive again if it isn't cached.
 	Downloader *client.Downloader
+	// Hook is the installer context passed to the package's uninstall
+	// command; the zero value preserves GooGet's inherited environment
+	// unchanged for external callers.
+	Hook goolib.InstallerContext
 }
 
 // UninstallRow uninstalls exactly the installed package row describes: the
@@ -79,7 +100,11 @@ func UninstallRow(ctx context.Context, row client.PackageState, opts Options, db
 	if ps.PackageSpec == nil || ps.PackageSpec.Name != spec.Name || ps.PackageSpec.Arch != spec.Arch || ps.PackageSpec.Version != spec.Version {
 		return fmt.Errorf("package %s is no longer installed", spec)
 	}
-	return uninstallRow(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, ps, opts.DBOnly, opts.KeepCache, opts.Downloader, db)
+	var ic goolib.InstallerContext
+	if !opts.DBOnly {
+		ic = opts.Hook
+	}
+	return uninstallRow(ctx, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version}, ps, opts.DBOnly, opts.KeepCache, ic, opts.Downloader, db)
 }
 
 // uninstallRow uninstalls the installed package ps and deletes its database
@@ -87,7 +112,7 @@ func UninstallRow(ctx context.Context, row client.PackageState, opts Options, db
 // script from its cached archive, downloading the archive again if needed,
 // removes the files the package installed, and, unless keepCache is set,
 // deletes the archive. label names the package in messages.
-func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, dbOnly, keepCache bool, downloader *client.Downloader, db *googetdb.GooDB) error {
+func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, dbOnly, keepCache bool, ic goolib.InstallerContext, downloader *client.Downloader, db *googetdb.GooDB) error {
 	if !dbOnly {
 		state, err := db.FetchPkgs("")
 		if err != nil {
@@ -105,7 +130,10 @@ func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.Packa
 		if err != nil {
 			return err
 		}
-		if err := system.Uninstall(eDir, &ps); err != nil {
+		if uninstallHookObserver != nil {
+			uninstallHookObserver(ic)
+		}
+		if err := system.UninstallWith(eDir, &ps, goolib.InstallerContext{}); err != nil {
 			return err
 		}
 

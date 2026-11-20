@@ -191,7 +191,7 @@ func (f *relFixture) installArchive(t *testing.T, name string, contents, files m
 	writeGoo(t, goo, contents)
 	ps := &goolib.PkgSpec{Name: name, Arch: "noarch", Version: "1", Files: files}
 	rc := newRecorder(f.db, client.PackageState{LocalPath: goo, PackageSpec: ps}, nil, fromDiskPolicy(false), f.db.AddPkgWithTransfers)
-	installed, err := installPkg(goo, ps, Options{}, f.db, rc.record)
+	installed, err := installPkg(goo, ps, Options{}, goolib.InstallerContext{}, f.db, rc.record)
 	if err != nil {
 		t.Fatalf("installPkg(%s): %v", name, err)
 	}

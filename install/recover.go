@@ -106,7 +106,11 @@ func (ri *repoInstall) removeReplaced(ctx context.Context, s planStep) (*replace
 			return rec, err
 		}
 		logger.Infof("%s replaces %s, removing", s.spec.PackageSpec, key)
-		if err := remove.UninstallRow(ctx, e.row, remove.Options{DBOnly: ri.opts.DBOnly, KeepCache: true, Downloader: ri.downloader}, ri.db); err != nil {
+		var hook goolib.InstallerContext
+		if !ri.opts.DBOnly {
+			hook = removalContext(s, removal{row: e.row, victim: e.victim})
+		}
+		if err := remove.UninstallRow(ctx, e.row, remove.Options{DBOnly: ri.opts.DBOnly, KeepCache: true, Downloader: ri.downloader, Hook: hook}, ri.db); err != nil {
 			return rec, err
 		}
 		rec.removed = append(rec.removed, e)
@@ -174,7 +178,7 @@ func (ri *repoInstall) reinstall(ctx context.Context, e recordEntry, opts Option
 			}
 		}
 		rc := newRecorder(ri.db, row, &e.row, recoverPolicy(opts.DBOnly), ri.db.AddPkgWithTransfers)
-		if _, err := installPkg(e.archive, row.PackageSpec, opts, ri.db, rc.record); err != nil {
+		if _, err := installPkg(e.archive, row.PackageSpec, opts, recoverContext(e), ri.db, rc.record); err != nil {
 			return err
 		}
 		rc.finish()

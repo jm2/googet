@@ -211,7 +211,7 @@ func TestInstallerNewIgnoresSettings(t *testing.T) {
 			Conflicts: []string{"B"},
 			Files:     map[string]string{"x": filepath.Join(f.dst, "B")},
 		}
-		if _, err := installPkg(goo, ps, Options{}, f.db, func(insFiles map[string]string) error {
+		if _, err := installPkg(goo, ps, Options{}, goolib.InstallerContext{}, f.db, func(insFiles map[string]string) error {
 			return f.db.AddPkg(client.PackageState{LocalPath: goo, PackageSpec: ps, InstalledFiles: insFiles})
 		}); err != nil {
 			t.Fatal(err)

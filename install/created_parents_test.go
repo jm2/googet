@@ -634,7 +634,7 @@ func TestPartialMkdirAllFailureRollsBackCreatedAncestors(t *testing.T) {
 					Version: "1.0.0",
 					Files:   tc.files,
 				}
-				if _, err := installPkg(goo, &ps, Options{}, db, nil); err == nil {
+				if _, err := installPkg(goo, &ps, Options{}, goolib.InstallerContext{}, db, nil); err == nil {
 					t.Fatal("installPkg() = nil, want error at deepest directory level")
 				}
 				if diff := cmp.Diff(map[string]string{}, tree(t, dstRoot)); diff != "" {
@@ -688,7 +688,7 @@ func TestPartialMkdirAllFailureRollsBackCreatedAncestors(t *testing.T) {
 					Version: "1.0.0",
 					Files:   tc.files,
 				}
-				if _, err := installPkg(goo, &ps, Options{}, db, nil); err == nil {
+				if _, err := installPkg(goo, &ps, Options{}, goolib.InstallerContext{}, db, nil); err == nil {
 					t.Fatal("installPkg() = nil, want ENAMETOOLONG error")
 				}
 				entries, readErr := os.ReadDir(dstRoot)
