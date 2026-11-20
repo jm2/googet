@@ -197,6 +197,7 @@ func (d *Downloader) unmarshalRepoPackages(ctx context.Context, p, cacheDir stri
 		if err != nil {
 			return nil, err
 		}
+		defer f.Close()
 		var m []goolib.RepoSpec
 		dec := json.NewDecoder(f)
 		for dec.More() {
