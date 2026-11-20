@@ -212,8 +212,8 @@ func versionChange(s planStep) string {
 }
 
 // removalReason says why step removes the installed package r: either one of
-// step's Replaces entries names it at its minimum version or later, or it
-// depends on a package they name.
+// step's Replaces entries names it at a version that meets the entry's
+// version constraint, or it depends on a package they name.
 func removalReason(s planStep, r client.PackageState) string {
 	if replacedBy(s, r) {
 		return "replaced by " + s.spec.PackageSpec.String()
@@ -222,7 +222,8 @@ func removalReason(s planStep, r client.PackageState) string {
 }
 
 // replacedBy reports whether one of the Replaces entries of step's package
-// names the installed package r at its minimum version or later.
+// names the installed package r at a version that meets the entry's version
+// constraint.
 func replacedBy(s planStep, r client.PackageState) bool {
 	return relation.ReplacesInstalled(s.spec.PackageSpec.Replaces, r.PackageSpec.Name, r.PackageSpec.Arch, r.PackageSpec.Version)
 }

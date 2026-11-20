@@ -340,3 +340,268 @@ func TestReplacesInstalled(t *testing.T) {
 		}
 	}
 }
+
+// TestOperatorZeroAndEquality checks that OpMin is the zero value, all six
+// operator constants are distinct, and Requirement equality distinguishes Op.
+func TestOperatorZeroAndEquality(t *testing.T) {
+	var zero Requirement
+	if zero.Op != OpMin || OpMin != 0 {
+		t.Fatalf("zero Requirement.Op = %v (OpMin=%v), want 0", zero.Op, OpMin)
+	}
+	ops := []Op{OpMin, OpLT, OpLE, OpEQ, OpGE, OpGT}
+	for i := range ops {
+		for j := i + 1; j < len(ops); j++ {
+			if ops[i] == ops[j] {
+				t.Fatalf("ops[%d] == ops[%d] (%v)", i, j, ops[i])
+			}
+		}
+	}
+	rLT := Requirement{Name: "foo", Arch: "noarch", Op: OpLT, Ver: "2.0.0"}
+	rLE := Requirement{Name: "foo", Arch: "noarch", Op: OpLE, Ver: "2.0.0"}
+	rMin := Requirement{Name: "foo", Arch: "noarch", Op: OpMin, Ver: "2.0.0"}
+	rGE := Requirement{Name: "foo", Arch: "noarch", Op: OpGE, Ver: "2.0.0"}
+	if rLT == rLE || rMin == rGE || rLT != (Requirement{Name: "foo", Arch: "noarch", Op: OpLT, Ver: "2.0.0"}) {
+		t.Fatal("Requirement equality does not distinguish Op values")
+	}
+}
+
+// TestRequirementEvaluationSignTable checks MinInstalled, Satisfies and
+// SatisfiedBy across every version operator, including prerelease, build
+// metadata, release suffix, empty version and unparseable version inputs.
+func TestRequirementEvaluationSignTable(t *testing.T) {
+	ops := []struct {
+		name  string
+		op    Op
+		signs map[int]bool
+	}{
+		{name: "min", op: OpMin, signs: map[int]bool{0: true, 1: true}},
+		{name: "lt", op: OpLT, signs: map[int]bool{-1: true}},
+		{name: "le", op: OpLE, signs: map[int]bool{-1: true, 0: true}},
+		{name: "eq", op: OpEQ, signs: map[int]bool{0: true}},
+		{name: "ge", op: OpGE, signs: map[int]bool{0: true, 1: true}},
+		{name: "gt", op: OpGT, signs: map[int]bool{1: true}},
+	}
+	versions := []struct {
+		label       string
+		ver         string
+		wantSign    int
+		unparseable bool
+	}{
+		{label: "below", ver: "1.0.0", wantSign: -1},
+		{label: "equal", ver: "2.0.0", wantSign: 0},
+		{label: "release_suffix", ver: "2.0.0@1", wantSign: 1},
+		{label: "prerelease", ver: "2.0.0-rc1", wantSign: -1},
+		{label: "build_metadata", ver: "2.0.0+build", wantSign: 0},
+		{label: "above", ver: "3.0.0", wantSign: 1},
+		{label: "zero_prerelease", ver: "0.0.0-rc1", wantSign: -1},
+		{label: "empty", ver: "", wantSign: -1},
+		{label: "unparseable", ver: "notaver", unparseable: true},
+	}
+
+	for _, o := range ops {
+		req := Requirement{Name: "foo", Op: o.op, Ver: "2.0.0"}
+		for _, v := range versions {
+			t.Run(o.name+"/"+v.label, func(t *testing.T) {
+				gotMin, minErr := req.MinInstalled("foo", "noarch", v.ver)
+				gotSat, satErr := req.Satisfies(v.ver)
+				gotProv, provErr := req.SatisfiedBy(Provide{Name: "foo", Ver: v.ver})
+
+				if v.unparseable {
+					if minErr == nil || gotMin {
+						t.Errorf("MinInstalled(%q) = (%t, %v), want (false, non-nil)", v.ver, gotMin, minErr)
+					}
+					_, legacyErr := oldMinInstalled(goolib.PackageInfo{Name: "foo", Ver: "2.0.0"}, "foo", "noarch", v.ver)
+					if legacyErr == nil || minErr.Error() != legacyErr.Error() {
+						t.Errorf("MinInstalled(%q) error = %v, want %v", v.ver, minErr, legacyErr)
+					}
+					if satErr == nil || gotSat {
+						t.Errorf("Satisfies(%q) = (%t, %v), want (false, non-nil)", v.ver, gotSat, satErr)
+					}
+					if provErr == nil || gotProv {
+						t.Errorf("SatisfiedBy(%q) = (%t, %v), want (false, non-nil)", v.ver, gotProv, provErr)
+					}
+					return
+				}
+
+				if cmpSign, err := goolib.Compare(v.ver, "2.0.0"); err != nil || cmpSign != v.wantSign {
+					t.Fatalf("goolib.Compare(%q, \"2.0.0\") = (%d, %v), want (%d, nil)", v.ver, cmpSign, err, v.wantSign)
+				}
+				wantMin := o.signs[v.wantSign]
+				if minErr != nil || gotMin != wantMin {
+					t.Errorf("MinInstalled(%q) = (%t, %v), want (%t, nil)", v.ver, gotMin, minErr, wantMin)
+				}
+
+				wantSat := wantMin
+				if v.ver == "" {
+					// An empty provided version satisfies every operator without version comparison.
+					wantSat = true
+				}
+				if satErr != nil || gotSat != wantSat {
+					t.Errorf("Satisfies(%q) = (%t, %v), want (%t, nil)", v.ver, gotSat, satErr, wantSat)
+				}
+				if provErr != nil || gotProv != wantSat {
+					t.Errorf("SatisfiedBy(%q) = (%t, %v), want (%t, nil)", v.ver, gotProv, provErr, wantSat)
+				}
+			})
+		}
+	}
+
+	// Verify OpMin and OpGE produce identical evaluations over the entire version corpus.
+	for _, reqVer := range versionCorpus {
+		for _, ver := range versionCorpus {
+			rMin := Requirement{Name: "foo", Arch: "noarch", Op: OpMin, Ver: reqVer}
+			rGE := Requirement{Name: "foo", Arch: "noarch", Op: OpGE, Ver: reqVer}
+			minOK, minErr := rMin.MinInstalled("foo", "noarch", ver)
+			geOK, geErr := rGE.MinInstalled("foo", "noarch", ver)
+			if minOK != geOK || (minErr == nil) != (geErr == nil) {
+				t.Errorf("MinInstalled(%q vs %q): OpMin=(%t,%v), OpGE=(%t,%v)", reqVer, ver, minOK, minErr, geOK, geErr)
+			}
+			satMin, satMinErr := rMin.Satisfies(ver)
+			satGE, satGEErr := rGE.Satisfies(ver)
+			if satMin != satGE || (satMinErr == nil) != (satGEErr == nil) {
+				t.Errorf("Satisfies(%q vs %q): OpMin=(%t,%v), OpGE=(%t,%v)", reqVer, ver, satMin, satMinErr, satGE, satGEErr)
+			}
+		}
+	}
+
+	// Verify empty requirement version short-circuits Satisfies for every operator, even on unparseable input.
+	for _, o := range ops {
+		r := Requirement{Name: "foo", Op: o.op}
+		if ok, err := r.Satisfies("notaver"); !ok || err != nil {
+			t.Errorf("Requirement{Op: %s}.Satisfies(\"notaver\") = (%t, %v), want (true, nil)", o.name, ok, err)
+		}
+		if ok, err := r.MinInstalled("bar", "noarch", "notaver"); ok || err != nil {
+			t.Errorf("Requirement{Name: \"foo\", Op: %s}.MinInstalled(\"bar\") = (%t, %v), want (false, nil)", o.name, ok, err)
+		}
+	}
+
+	// Verify argument order in MinInstalled preserves the legacy error when both versions fail to parse.
+	_, wantOrderErr := oldMinInstalled(goolib.PackageInfo{Name: "foo", Ver: "badreq"}, "foo", "noarch", "badinst")
+	for _, o := range ops {
+		got, err := (Requirement{Name: "foo", Op: o.op, Ver: "badreq"}).MinInstalled("foo", "noarch", "badinst")
+		if got || err == nil || err.Error() != wantOrderErr.Error() {
+			t.Errorf("Op %s MinInstalled(badreq, badinst) = (%t, %v), want (false, %v)", o.name, got, err, wantOrderErr)
+		}
+	}
+
+	// Verify an out-of-range operator value never matches non-empty versions.
+	badOp := Requirement{Name: "foo", Op: Op(99), Ver: "2.0.0"}
+	if ok, err := badOp.MinInstalled("foo", "noarch", "2.0.0"); ok || err != nil {
+		t.Errorf("Op(99).MinInstalled = (%t, %v), want (false, nil)", ok, err)
+	}
+	if ok, err := badOp.Satisfies("2.0.0"); ok || err != nil {
+		t.Errorf("Op(99).Satisfies = (%t, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestEntryAndStringFormatting checks that OpMin formatting stays
+// byte-identical to PackageInfo.String and FormatPackageRequirement, while
+// non-OpMin operators format compactly in Entry and with spaces in String.
+func TestEntryAndStringFormatting(t *testing.T) {
+	legacyInputs := append(slices.Clone(relationCorpus), "A..3", "A.noarch.3", "foo.bar.x86_64.1.2.3@4")
+	for _, raw := range legacyInputs {
+		pi := goolib.PkgNameSplit(raw)
+		r := Requirement{Name: pi.Name, Arch: pi.Arch, Op: OpMin, Ver: pi.Ver}
+		if got, want := r.Entry(), r.PackageInfo().String(); got != want {
+			t.Errorf("OpMin Entry(%+v) = %q, want %q", r, got, want)
+		}
+		if got, want := r.String(), FormatPackageRequirement(r.PackageInfo()); got != want {
+			t.Errorf("OpMin String(%+v) = %q, want %q", r, got, want)
+		}
+	}
+	if got := (Requirement{Name: "A", Ver: "3"}).Entry(); got != "A" {
+		t.Errorf("Requirement{Name: \"A\", Ver: \"3\"}.Entry() = %q, want \"A\"", got)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		req        Requirement
+		wantEntry  string
+		wantString string
+	}{
+		{
+			name:       "lt_archless",
+			req:        Requirement{Name: "foo", Op: OpLT, Ver: "2.0.0"},
+			wantEntry:  "foo<2.0.0",
+			wantString: "foo < 2.0.0",
+		},
+		{
+			name:       "le_arch",
+			req:        Requirement{Name: "foo", Arch: "x86_64", Op: OpLE, Ver: "2.0.0"},
+			wantEntry:  "foo.x86_64<=2.0.0",
+			wantString: "foo.x86_64 <= 2.0.0",
+		},
+		{
+			name:       "eq_release",
+			req:        Requirement{Name: "foo", Op: OpEQ, Ver: "1.0.0@2"},
+			wantEntry:  "foo=1.0.0@2",
+			wantString: "foo = 1.0.0@2",
+		},
+		{
+			name:       "ge_noarch",
+			req:        Requirement{Name: "foo", Arch: "noarch", Op: OpGE, Ver: "2.0.0-rc1"},
+			wantEntry:  "foo.noarch>=2.0.0-rc1",
+			wantString: "foo.noarch >= 2.0.0-rc1",
+		},
+		{
+			name:       "gt_archless",
+			req:        Requirement{Name: "foo", Op: OpGT, Ver: "3.0.0+build"},
+			wantEntry:  "foo>3.0.0+build",
+			wantString: "foo > 3.0.0+build",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.req.Entry(); got != tc.wantEntry {
+				t.Errorf("%+v.Entry() = %q, want %q", tc.req, got, tc.wantEntry)
+			}
+			if got := tc.req.String(); got != tc.wantString {
+				t.Errorf("%+v.String() = %q, want %q", tc.req, got, tc.wantString)
+			}
+		})
+	}
+
+	// Verify Resolve uses Entry() in its version comparison error message.
+	installed := []*goolib.PkgSpec{{Name: "foo", Arch: "noarch", Version: "notaver"}}
+	_, err := Resolve(Requirement{Name: "foo", Op: OpLT, Ver: "2.0.0"}, installed)
+	if err == nil || !strings.Contains(err.Error(), "against foo<2.0.0:") {
+		t.Errorf("Resolve operator error = %v, want substring \"against foo<2.0.0:\"", err)
+	}
+	_, legacyErr := Resolve(Requirement{Name: "foo", Op: OpMin, Ver: "3"}, installed)
+	if legacyErr == nil || !strings.Contains(legacyErr.Error(), "against foo:") {
+		t.Errorf("Resolve OpMin error = %v, want substring \"against foo:\"", legacyErr)
+	}
+}
+
+// TestProvidedBy checks nil handling, match precedence over unparseable
+// sibling Provides entries, and first-error reporting when nothing matches.
+func TestProvidedBy(t *testing.T) {
+	req := Requirement{Name: "foo", Op: OpLT, Ver: "2.0.0"}
+	if ok, err := ProvidedBy(nil, req); ok || err != nil {
+		t.Fatalf("ProvidedBy(nil) = (%t, %v), want (false, nil)", ok, err)
+	}
+	if ok, err := ProvidedBy(&goolib.PkgSpec{Name: "p"}, req); ok || err != nil {
+		t.Fatalf("ProvidedBy(empty) = (%t, %v), want (false, nil)", ok, err)
+	}
+	matchAfterErr := &goolib.PkgSpec{
+		Name:     "p",
+		Provides: []string{"other=1.0.0", "foo=badver", "foo=1.5.0"},
+	}
+	if ok, err := ProvidedBy(matchAfterErr, req); !ok || err != nil {
+		t.Errorf("ProvidedBy(match after badver) = (%t, %v), want (true, nil)", ok, err)
+	}
+	unversioned := &goolib.PkgSpec{
+		Name:     "p",
+		Provides: []string{"foo"},
+	}
+	if ok, err := ProvidedBy(unversioned, req); !ok || err != nil {
+		t.Errorf("ProvidedBy(unversioned) = (%t, %v), want (true, nil)", ok, err)
+	}
+	twoErrors := &goolib.PkgSpec{
+		Name:     "p",
+		Provides: []string{"foo=badfirst", "foo=3.0.0", "foo=badsecond"},
+	}
+	ok, err := ProvidedBy(twoErrors, req)
+	if ok || err == nil || !strings.Contains(err.Error(), "badfirst") {
+		t.Errorf("ProvidedBy(two errors) = (%t, %v), want (false, error mentioning badfirst)", ok, err)
+	}
+}

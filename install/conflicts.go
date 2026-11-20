@@ -111,12 +111,20 @@ func specsFromState(state client.GooGetState) []*goolib.PkgSpec {
 // providesRequirement reports whether ps declares a Provides entry that
 // satisfies r.
 func providesRequirement(ps *goolib.PkgSpec, r relation.Requirement) bool {
-	for _, prov := range ps.Provides {
-		if client.SatisfiesProvider(prov, r.Name, r.Ver) {
-			return true
+	if r.Op == relation.OpMin {
+		// Legacy entries keep client.SatisfiesProvider so that its Error log
+		// line for an unparseable Provides version is unchanged. Operator
+		// entries must go through relation, which carries Op;
+		// SatisfiesProvider would drop it.
+		for _, prov := range ps.Provides {
+			if client.SatisfiesProvider(prov, r.Name, r.Ver) {
+				return true
+			}
 		}
+		return false
 	}
-	return false
+	ok, _ := relation.ProvidedBy(ps, r)
+	return ok
 }
 
 // checkForwardConflict evaluates a single Conflicts requirement r against all
@@ -168,7 +176,7 @@ func resolveConflictsIn(ps *goolib.PkgSpec, ex exclusions, st client.GooGetState
 			return nil, err
 		}
 		if hit {
-			return nil, fmt.Errorf("cannot install, conflict with installed package or provider: %s", r.PackageInfo())
+			return nil, fmt.Errorf("cannot install, conflict with installed package or provider: %s", r.Entry())
 		}
 		for _, exPkg := range exempted {
 			k := pkgKey(exPkg)
@@ -233,18 +241,11 @@ func matchReverseEntry(c string, ps *goolib.PkgSpec) (matched, unparseable bool)
 	if ok && err == nil {
 		return true, false
 	}
-	hadErr := err != nil
-	for _, prov := range ps.Provides {
-		pOK, pErr := r.SatisfiedBy(relation.ParseProvide(prov))
-		if pErr != nil {
-			hadErr = true
-			continue
-		}
-		if pOK {
-			return true, false
-		}
+	pOK, pErr := relation.ProvidedBy(ps, r)
+	if pOK {
+		return true, false
 	}
-	return false, hadErr
+	return false, err != nil || pErr != nil
 }
 
 // matchReverseReplaces evaluates a single Replaces entry e of an installed
@@ -473,7 +474,7 @@ func recheckForwardEntries(reqs []relation.Requirement, ps *goolib.PkgSpec, inst
 			return err
 		}
 		if hit {
-			return fmt.Errorf("cannot install, conflict with installed package or provider: %s%s", r.PackageInfo(), suffix)
+			return fmt.Errorf("cannot install, conflict with installed package or provider: %s%s", r.Entry(), suffix)
 		}
 	}
 	return nil

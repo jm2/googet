@@ -732,18 +732,13 @@ func repoList(rm client.RepoMap) []repocmp.Repo {
 // providesName reports whether ps has a Provides entry for name, at any
 // version.
 func providesName(ps *goolib.PkgSpec, name string) bool {
-	r := relation.Requirement{Name: name}
-	for _, prov := range ps.Provides {
-		if ok, err := r.SatisfiedBy(relation.ParseProvide(prov)); err == nil && ok {
-			return true
-		}
-	}
-	return false
+	ok, _ := relation.ProvidedBy(ps, relation.Requirement{Name: name})
+	return ok
 }
 
 // replaces reports whether one of ps's Replaces entries names the package
-// target at the entry's minimum version or later. Entries whose versions
-// can't be compared don't count.
+// target at a version that meets the entry's version constraint. Entries
+// whose versions can't be compared don't count.
 func replaces(ps, target *goolib.PkgSpec) bool {
 	return relation.ReplacesInstalled(ps.Replaces, target.Name, target.Arch, target.Version)
 }
