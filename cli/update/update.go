@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 
 	"github.com/google/googet/v2/cli"
+	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
@@ -37,23 +38,25 @@ import (
 func init() { subcommands.Register(&updateCmd{}, "package management") }
 
 type updateCmd struct {
-	dbOnly  bool
-	sources string
-	dryRun  bool
-	force   bool
+	dbOnly      bool
+	sources     string
+	dryRun      bool
+	force       bool
+	policyFlags policy.Flags
 }
 
 func (*updateCmd) Name() string     { return "update" }
 func (*updateCmd) Synopsis() string { return "update all packages to the latest version available" }
 func (*updateCmd) Usage() string {
-	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force]\n", filepath.Base(os.Args[0]))
+	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore]\n", filepath.Base(os.Args[0]))
 }
 
 func (cmd *updateCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&cmd.dbOnly, "db_only", false, "only make changes to DB, don't perform install system actions")
 	f.StringVar(&cmd.sources, "sources", "", "comma separated list of sources, setting this overrides local .repo files")
 	f.BoolVar(&cmd.dryRun, "dry_run", false, "check for updates and print them, but do not prompt to install")
-	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config)")
+	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts)")
+	cmd.policyFlags.Register(f)
 }
 
 func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -110,6 +113,7 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 		}
 	}
 
+	ins := install.New(cache, db, cmd.policyFlags.Options(cmd.dbOnly, cmd.force))
 	exitCode := subcommands.ExitSuccess
 	for _, pi := range ud {
 		r, err := client.WhatRepo(pi, rm)
@@ -118,8 +122,8 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 			exitCode = subcommands.ExitFailure
 			continue
 		}
-		if err := install.FromRepo(ctx, pi, r, cache, rm, settings.Archs, cmd.dbOnly, cmd.force, downloader, db); err != nil {
-			logger.Errorf("Error updating %s %s %s: %v", pi.Arch, pi.Name, pi.Ver, err)
+		if err := ins.FromRepo(ctx, pi, r, rm, settings.Archs, downloader); err != nil {
+			logger.Errorf("Error updating %s %s %s: %v", pi.Arch, pi.Name, pi.Ver, policy.WrapError(err))
 			exitCode = subcommands.ExitFailure
 			continue
 		}

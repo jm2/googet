@@ -60,6 +60,18 @@ and `strictconflicts`; PascalCase keys are ignored).
   Reinstalling an already-installed package (`googet install -reinstall` and
   `googet verify`) does not check package conflicts.
 
+On `googet install` and `googet update`, `-package_conflicts` overrides
+`packageconflicts` in `googet.conf`:
+
+| Policy | CLI flag | `googet.conf` key | Default | Notes |
+| --- | --- | --- | --- | --- |
+| Reverse package conflicts | `-package_conflicts=warn\|error\|ignore` | `packageconflicts: warn\|error\|ignore` | `warn` | Precedence: CLI flag > `googet.conf` > default. `-force` applies only to file overlaps (`strictconflicts`) and never affects `-package_conflicts`. |
+
+Compatibility note: do not pass `-package_conflicts` to `googet` binaries older
+than 3.5.0, because older binaries exit with an unknown-flag usage error
+(including when an older `googet` binary runs a self-upgrade). Setting
+`packageconflicts` in `googet.conf` is ignored by older binaries.
+
 ## Repo file
 
 GooGet has the ability to use a repo file to change some repo specific settings.
