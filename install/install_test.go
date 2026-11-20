@@ -37,6 +37,7 @@ import (
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
@@ -132,7 +133,7 @@ func TestMinInstalled(t *testing.T) {
 		{"baz_pkg", "noarch", false},
 	}
 	for _, tt := range table {
-		ma, err := minInstalled(goolib.PackageInfo{Name: tt.pkg, Arch: tt.arch, Ver: "1.0.0@1"}, db)
+		ma, err := minInstalled(relation.Requirement{Name: tt.pkg, Arch: tt.arch, Ver: "1.0.0@1"}, db)
 		if err != nil {
 			t.Fatalf("error checking minAvailable: %v", err)
 		}
@@ -1000,7 +1001,7 @@ func TestIsSatisfied(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := isSatisfied(tt.pi, db)
+			got, err := isSatisfied(relation.Requirement{Name: tt.pi.Name, Arch: tt.pi.Arch, Ver: tt.pi.Ver}, db)
 			if err != nil {
 				t.Fatalf("isSatisfied error: %v", err)
 			}
