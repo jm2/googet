@@ -64,9 +64,16 @@ type Provide struct {
 	Name, Ver string
 }
 
-// ParseRelation parses a Conflicts or Replaces entry of the form
-// name[.arch[.version]]. A version is a minimum, so the Op is OpMin.
+// ParseRelation parses a Conflicts or Replaces entry. A well-formed operator
+// entry, name[.arch]OPversion with OP one of <, <=, =, >= and >, gets that
+// Op; surrounding whitespace is ignored. Any other entry is parsed as
+// name[.arch[.version]], as goolib.PkgNameSplit splits it, with Op OpMin, so
+// its version is a minimum. That includes an entry with an operator rune
+// that isn't well formed, which relsyntax.Split reports as Malformed.
 func ParseRelation(s string) Requirement {
+	if p := relsyntax.Split(s); p.Form == relsyntax.Operator {
+		return Requirement{Name: p.Name, Arch: p.Arch, Op: p.Op, Ver: p.Ver}
+	}
 	pi := goolib.PkgNameSplit(s)
 	return Requirement{Name: pi.Name, Arch: pi.Arch, Ver: pi.Ver}
 }

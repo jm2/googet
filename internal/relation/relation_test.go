@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relsyntax"
 )
 
 // The old* functions are verbatim copies of the code this package replaced,
@@ -65,7 +66,20 @@ var (
 	relationCorpus = []string{
 		"", " ", ".", "..", "foo", " foo ", "foo.", "foo..", "foo..1", "foo.x86_64", "foo.noarch",
 		"foo.noarch.1.0.0", "foo.noarch.1.0.0@2", " foo.noarch.2 ", "foo.x86_64.1", "a.b.c.d",
-		"foo<2.0.0", "foo.x86_64<2.0.0", "foo >= 1", "foo.noarch >= 1", "foo=1", "foo.noarch=1",
+	}
+	// operatorRelations are well-formed operator entries. ParseRelation
+	// gives them their operator, so they have no PkgNameSplit or
+	// oldMinInstalled equivalent.
+	operatorRelations = []struct {
+		rel  string
+		want Requirement
+	}{
+		{rel: "foo<2.0.0", want: Requirement{Name: "foo", Op: OpLT, Ver: "2.0.0"}},
+		{rel: "foo.x86_64<2.0.0", want: Requirement{Name: "foo", Arch: "x86_64", Op: OpLT, Ver: "2.0.0"}},
+		{rel: "foo >= 1", want: Requirement{Name: "foo", Op: OpGE, Ver: "1"}},
+		{rel: "foo.noarch >= 1", want: Requirement{Name: "foo", Arch: "noarch", Op: OpGE, Ver: "1"}},
+		{rel: "foo=1", want: Requirement{Name: "foo", Op: OpEQ, Ver: "1"}},
+		{rel: "foo.noarch=1", want: Requirement{Name: "foo", Arch: "noarch", Op: OpEQ, Ver: "1"}},
 	}
 	provideCorpus = []string{
 		"", "=", "foo", "foo=", "=1", "foo=1", "foo=1.0.0@1", "foo=1=2", " foo=1", "foo =1",
@@ -79,16 +93,34 @@ var (
 	archCorpus = []string{"", "noarch", "x86_64"}
 )
 
+// allRelations returns relationCorpus followed by the operatorRelations
+// entries.
+func allRelations() []string {
+	out := slices.Clone(relationCorpus)
+	for _, tc := range operatorRelations {
+		out = append(out, tc.rel)
+	}
+	return out
+}
+
+// TestParseRelationMatchesPkgNameSplit checks that ParseRelation splits an
+// entry without a well-formed operator as PkgNameSplit does, and parses each
+// well-formed operator entry with its operator.
 func TestParseRelationMatchesPkgNameSplit(t *testing.T) {
 	for _, s := range relationCorpus {
 		if got, want := ParseRelation(s).PackageInfo(), goolib.PkgNameSplit(s); got != want {
 			t.Errorf("ParseRelation(%q) = %+v, want %+v", s, got, want)
 		}
 	}
+	for _, tc := range operatorRelations {
+		if got := ParseRelation(tc.rel); got != tc.want {
+			t.Errorf("ParseRelation(%q) = %+v, want %+v", tc.rel, got, tc.want)
+		}
+	}
 }
 
 func TestParseDependency(t *testing.T) {
-	for _, key := range relationCorpus {
+	for _, key := range allRelations() {
 		for _, ver := range versionCorpus {
 			pi := goolib.PkgNameSplit(key)
 			want := Requirement{Name: pi.Name, Arch: pi.Arch, Ver: ver}
@@ -108,10 +140,64 @@ func TestParseProvideMatchesCut(t *testing.T) {
 	}
 }
 
+// fuzzRelationSeeds returns Legacy, spaced and unspaced Operator, and
+// Malformed entries for relation fuzz targets.
+func fuzzRelationSeeds() []string {
+	return slices.Concat(allRelations(), malformedOperatorCorpus)
+}
+
+// oracleOperatorMatch evaluates op against the comparison sign of (ver, reqVer)
+// independently of Requirement methods.
+func oracleOperatorMatch(op Op, sign int) bool {
+	switch op {
+	case OpLT:
+		return sign < 0
+	case OpLE:
+		return sign <= 0
+	case OpEQ:
+		return sign == 0
+	case OpGE:
+		return sign >= 0
+	case OpGT:
+		return sign > 0
+	default:
+		return false
+	}
+}
+
 func checkMinInstalled(t *testing.T, rel, name, arch, ver string) {
 	t.Helper()
 	r := ParseRelation(rel)
 	got, gotErr := r.MinInstalled(name, arch, ver)
+	if p := relsyntax.Split(rel); p.Form == relsyntax.Operator {
+		wantID := name == p.Name && (p.Arch == "" || arch == p.Arch)
+		if !wantID {
+			if got || gotErr != nil {
+				t.Errorf("ParseRelation(%q).MinInstalled(%q, %q, %q) = (%t, %v), want (false, nil)", rel, name, arch, ver, got, gotErr)
+			}
+			return
+		}
+		sign, cmpErr := goolib.Compare(ver, p.Ver)
+		if (gotErr == nil) != (cmpErr == nil) {
+			t.Errorf("ParseRelation(%q).MinInstalled(%q, %q, %q) err = %v, Compare err = %v", rel, name, arch, ver, gotErr, cmpErr)
+			return
+		}
+		if cmpErr != nil {
+			if got {
+				t.Errorf("ParseRelation(%q).MinInstalled(%q, %q, %q) = true with error %v", rel, name, arch, ver, gotErr)
+			}
+			return
+		}
+		if want := oracleOperatorMatch(p.Op, sign); got != want {
+			t.Errorf("ParseRelation(%q).MinInstalled(%q, %q, %q) = %t, want %t", rel, name, arch, ver, got, want)
+		}
+		satOK, satErr := r.Satisfies(ver)
+		wantSat := ver == "" || oracleOperatorMatch(p.Op, sign)
+		if satErr != nil || satOK != wantSat {
+			t.Errorf("ParseRelation(%q).Satisfies(%q) = (%t, %v), want (%t, nil)", rel, ver, satOK, satErr, wantSat)
+		}
+		return
+	}
 	want, wantErr := oldMinInstalled(r.PackageInfo(), name, arch, ver)
 	if got != want || (gotErr == nil) != (wantErr == nil) {
 		t.Errorf("ParseRelation(%q).MinInstalled(%q, %q, %q) = %t, %v; old code returned %t, %v", rel, name, arch, ver, got, gotErr, want, wantErr)
@@ -168,7 +254,7 @@ func TestSatisfiedByMatchesOld(t *testing.T) {
 }
 
 func TestSameIdentityMatchesOld(t *testing.T) {
-	for _, dep := range relationCorpus {
+	for _, dep := range allRelations() {
 		for _, name := range nameCorpus {
 			for _, arch := range archCorpus {
 				got := ParseDependency(dep, "").SameIdentity(name, arch)
@@ -181,12 +267,25 @@ func TestSameIdentityMatchesOld(t *testing.T) {
 }
 
 func FuzzParseRelation(f *testing.F) {
-	for _, s := range relationCorpus {
+	for _, s := range fuzzRelationSeeds() {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
-		if got, want := ParseRelation(s).PackageInfo(), goolib.PkgNameSplit(s); got != want {
-			t.Errorf("ParseRelation(%q) = %+v, want %+v", s, got, want)
+		r := ParseRelation(s)
+		if p := relsyntax.Split(s); p.Form == relsyntax.Operator {
+			want := Requirement{Name: p.Name, Arch: p.Arch, Op: p.Op, Ver: p.Ver}
+			if r != want {
+				t.Errorf("ParseRelation(%q) = %+v, want %+v", s, r, want)
+			}
+			if rt := ParseRelation(r.Entry()); rt != r {
+				t.Errorf("ParseRelation(%q.Entry()=%q) = %+v, want %+v", s, r.Entry(), rt, r)
+			}
+			return
+		}
+		pi := goolib.PkgNameSplit(s)
+		want := Requirement{Name: pi.Name, Arch: pi.Arch, Op: OpMin, Ver: pi.Ver}
+		if r != want {
+			t.Errorf("ParseRelation(%q) = %+v, want %+v", s, r, want)
 		}
 	})
 }
@@ -204,7 +303,7 @@ func FuzzParseProvide(f *testing.F) {
 }
 
 func FuzzMinInstalled(f *testing.F) {
-	for _, rel := range relationCorpus {
+	for _, rel := range fuzzRelationSeeds() {
 		for _, ver := range versionCorpus {
 			f.Add(rel, "foo", "noarch", ver)
 		}
@@ -603,5 +702,95 @@ func TestProvidedBy(t *testing.T) {
 	ok, err := ProvidedBy(twoErrors, req)
 	if ok || err == nil || !strings.Contains(err.Error(), "badfirst") {
 		t.Errorf("ProvidedBy(two errors) = (%t, %v), want (false, error mentioning badfirst)", ok, err)
+	}
+}
+
+// malformedOperatorCorpus holds inputs containing operator runes that fail the
+// operator grammar and must fall back to goolib.PkgNameSplit.
+var malformedOperatorCorpus = []string{
+	"=", "<", ">", "<=", ">=",
+	"foo<", "foo<=", "foo=", "foo>=", "foo>",
+	"<2", "<=2", "=2", ">=2", ">2",
+	"foo==2", "foo=<2", "foo=>2", "foo<>2", "foo><2", "foo< =2", "foo> =2",
+	"foo<2<3", "foo=1=2", "a.b.c<2", "foo.<2", ".noarch<2",
+	"foo bar<2", "foo .noarch<2", "foo. noarch<2", "foo<2 3",
+	"foo\u00a0bar<2", "foo<2\u00853", "   <2", "foo<   ",
+}
+
+// TestEntryOperatorRoundTrip checks that Entry round-trips through
+// ParseRelation for every operator requirement.
+func TestEntryOperatorRoundTrip(t *testing.T) {
+	for _, op := range []Op{OpLT, OpLE, OpEQ, OpGE, OpGT} {
+		for _, arch := range []string{"", "noarch", "x86_64"} {
+			for _, ver := range []string{"2.0.0", "2.0.0-rc1", "2.0.0+build", "2.5.1@3"} {
+				want := Requirement{Name: "foo", Arch: arch, Op: op, Ver: ver}
+				if got := ParseRelation(want.Entry()); got != want {
+					t.Errorf("ParseRelation(%q) = %+v, want %+v", want.Entry(), got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestLegacyAndMalformedDifferential checks that every operator-free and
+// malformed input parses identically to PkgNameSplit with OpMin and evaluates
+// MinInstalled identically to oldMinInstalled.
+func TestLegacyAndMalformedDifferential(t *testing.T) {
+	inputs := slices.Concat(relationCorpus, malformedOperatorCorpus)
+	for _, s := range inputs {
+		form := relsyntax.Split(s).Form
+		if form == relsyntax.Operator {
+			t.Fatalf("Split(%q).Form = Operator, want Legacy or Malformed", s)
+		}
+		pi := goolib.PkgNameSplit(s)
+		want := Requirement{Name: pi.Name, Arch: pi.Arch, Op: OpMin, Ver: pi.Ver}
+		if got := ParseRelation(s); got != want {
+			t.Errorf("ParseRelation(%q) = %+v, want %+v", s, got, want)
+		}
+		for _, name := range nameCorpus {
+			for _, arch := range archCorpus {
+				for _, ver := range versionCorpus {
+					checkMinInstalled(t, s, name, arch, ver)
+				}
+			}
+		}
+	}
+}
+
+// TestFuzzRelationSeedCoverage checks that fuzzRelationSeeds exercises Legacy,
+// unspaced Operator, spaced Operator and Malformed inputs.
+func TestFuzzRelationSeedCoverage(t *testing.T) {
+	var sawLegacy, sawUnspaced, sawSpaced, sawMalformed bool
+	for _, s := range fuzzRelationSeeds() {
+		p := relsyntax.Split(s)
+		switch p.Form {
+		case relsyntax.Legacy:
+			sawLegacy = true
+		case relsyntax.Operator:
+			if p.Spaced {
+				sawSpaced = true
+			} else {
+				sawUnspaced = true
+			}
+		case relsyntax.Malformed:
+			sawMalformed = true
+		}
+	}
+	if !sawLegacy || !sawUnspaced || !sawSpaced || !sawMalformed {
+		t.Fatalf("relation fuzz seed coverage incomplete: legacy=%t unspaced=%t spaced=%t malformed=%t",
+			sawLegacy, sawUnspaced, sawSpaced, sawMalformed)
+	}
+}
+
+// TestOperatorConstantsMatchRelsyntax checks that the re-exported operator
+// constants in relation match internal/relsyntax.
+func TestOperatorConstantsMatchRelsyntax(t *testing.T) {
+	if OpMin != relsyntax.OpNone ||
+		OpLT != relsyntax.OpLT ||
+		OpLE != relsyntax.OpLE ||
+		OpEQ != relsyntax.OpEQ ||
+		OpGE != relsyntax.OpGE ||
+		OpGT != relsyntax.OpGT {
+		t.Fatal("relation Op constants do not match relsyntax Op constants")
 	}
 }
