@@ -15,12 +15,16 @@ limitations under the License.
 package googetdb
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/googet/v2/client"
@@ -35,6 +39,12 @@ import (
 const (
 	stateQuery = `INSERT or REPLACE INTO InstalledPackages (pkg_name, pkg_ver, pkg_arch, pkg_json) VALUES (
 		?, ?, ?, ?)`
+
+	// installedFilesKey is the JSON object key for
+	// client.PackageState.InstalledFiles. The field carries no json struct tag,
+	// so encoding/json uses the Go field name directly; TestInstalledFilesKey
+	// pins this coupling.
+	installedFilesKey = "InstalledFiles"
 )
 
 // nowFunc returns the current time; can be overridden in tests.
@@ -109,9 +119,38 @@ func (g *GooDB) WriteStateToDB(gooState client.GooGetState) error {
 	return nil
 }
 
-// AddPkg adds a single package to the googet database
-func (g *GooDB) AddPkg(pkgState client.PackageState) error {
+// FileTransfer names InstalledFiles entries of the installed row Name.Arch,
+// using the exact path strings that row stores, whose ownership transfers to
+// the package being added.
+type FileTransfer struct {
+	Name  string
+	Arch  string
+	Files []string
+}
+
+// AddPkgWithTransfers adds pkgState to the GooGet database like AddPkg and, in
+// the same SQLite transaction, removes each transfer's Files from the named
+// owner row's InstalledFiles map.
+//
+// The call is all-or-nothing: nothing is written unless the single transaction
+// commits, and all owner updates run before the new row is inserted. It returns
+// an error before starting a transaction if any transfer targets pkgState's own
+// name and architecture. Multiple transfers targeting the same (Name, Arch) row
+// are merged. Owner rows that do not exist, rows whose InstalledFiles field is
+// absent or null, and paths an owner row does not list are skipped without
+// error. Every other JSON field on an edited owner row (including fields
+// unknown to this binary) as well as its SQLite id and pkg_ver columns are
+// preserved. Files must use the owner row's exact map keys.
+func (g *GooDB) AddPkgWithTransfers(pkgState client.PackageState, transfers []FileTransfer) error {
 	spec := pkgState.PackageSpec
+	if spec == nil {
+		return errors.New("cannot add package with nil PackageSpec")
+	}
+
+	merged, err := mergeTransfers(spec.Name, spec.Arch, transfers)
+	if err != nil {
+		return err
+	}
 
 	pkgState.InstalledApp.Name, pkgState.InstalledApp.Reg = system.AppAssociation(spec, pkgState.LocalPath)
 	if pkgState.InstallDate == 0 {
@@ -122,20 +161,131 @@ func (g *GooDB) AddPkg(pkgState client.PackageState) error {
 	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+
+	for _, tr := range merged {
+		if err := editInstalledFiles(tx, tr.Name, tr.Arch, tr.Files); err != nil {
+			return err
+		}
+	}
+
 	jsonState, err := json.Marshal(pkgState)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(context.Background(), stateQuery, spec.Name, spec.Version, spec.Arch, jsonState)
-	if err != nil {
-		tx.Rollback()
+	if _, err := tx.ExecContext(context.Background(), stateQuery, spec.Name, spec.Version, spec.Arch, jsonState); err != nil {
 		return err
 	}
-	err = tx.Commit()
+	return tx.Commit()
+}
+
+// AddPkg adds a single package to the GooGet database.
+func (g *GooDB) AddPkg(pkgState client.PackageState) error {
+	return g.AddPkgWithTransfers(pkgState, nil)
+}
+
+func mergeTransfers(selfName, selfArch string, transfers []FileTransfer) ([]FileTransfer, error) {
+	if len(transfers) == 0 {
+		return nil, nil
+	}
+	type rowKey struct {
+		name string
+		arch string
+	}
+	byRow := make(map[rowKey]map[string]struct{})
+	for _, tr := range transfers {
+		if tr.Name == selfName && tr.Arch == selfArch {
+			return nil, fmt.Errorf("cannot transfer files from %s.%s to itself", selfName, selfArch)
+		}
+		if len(tr.Files) == 0 {
+			continue
+		}
+		k := rowKey{name: tr.Name, arch: tr.Arch}
+		set := byRow[k]
+		if set == nil {
+			set = make(map[string]struct{}, len(tr.Files))
+			byRow[k] = set
+		}
+		for _, f := range tr.Files {
+			set[f] = struct{}{}
+		}
+	}
+	if len(byRow) == 0 {
+		return nil, nil
+	}
+	keys := make([]rowKey, 0, len(byRow))
+	for k := range byRow {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b rowKey) int {
+		return cmp.Or(strings.Compare(a.name, b.name), strings.Compare(a.arch, b.arch))
+	})
+	out := make([]FileTransfer, 0, len(keys))
+	for _, k := range keys {
+		files := make([]string, 0, len(byRow[k]))
+		for f := range byRow[k] {
+			files = append(files, f)
+		}
+		slices.Sort(files)
+		out = append(out, FileTransfer{Name: k.name, Arch: k.arch, Files: files})
+	}
+	return out, nil
+}
+
+func editInstalledFiles(tx *sql.Tx, name, arch string, files []string) error {
+	ctx := context.Background()
+	var raw []byte
+	err := tx.QueryRowContext(ctx, `SELECT pkg_json FROM InstalledPackages WHERE pkg_name = ? AND pkg_arch = ?`, name, arch).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	return nil
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return err
+	}
+	if obj == nil {
+		return fmt.Errorf("row %s.%s pkg_json is not a JSON object", name, arch)
+	}
+
+	rawFiles, ok := obj[installedFilesKey]
+	if !ok || bytes.Equal(bytes.TrimSpace(rawFiles), []byte("null")) {
+		return nil
+	}
+
+	var installed map[string]string
+	if err := json.Unmarshal(rawFiles, &installed); err != nil {
+		return err
+	}
+	if installed == nil {
+		return nil
+	}
+
+	changed := false
+	for _, f := range files {
+		if _, exists := installed[f]; exists {
+			delete(installed, f)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+
+	updatedFiles, err := json.Marshal(installed)
+	if err != nil {
+		return err
+	}
+	obj[installedFilesKey] = updatedFiles
+	updatedRow, err := json.Marshal(obj)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE InstalledPackages SET pkg_json = ? WHERE pkg_name = ? AND pkg_arch = ?`, updatedRow, name, arch)
+	return err
 }
 
 // RemovePkg removes a single package from the googet database
