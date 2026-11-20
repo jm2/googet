@@ -190,13 +190,35 @@ func resolveConflictsIn(ps *goolib.PkgSpec, ex exclusions, st client.GooGetState
 	return deferred, nil
 }
 
-// ErrPackageConflict marks an installation failure caused by an installed
-// package's Conflicts entry under ConflictError mode.
+// ErrPackageConflict marks an installation failure under ConflictError mode
+// caused by an installed package's Conflicts entry matching the incoming
+// package, or by an installed package's Replaces entry naming it.
 var ErrPackageConflict = errors.New("package conflict")
 
-// reverseHit is a single reverse-conflict result between an installed package
-// and an incoming package.
+// reverseKind identifies which relation field of an installed package a
+// reverse hit comes from.
+type reverseKind int
+
+const (
+	// revConflict is a hit from an installed package's Conflicts entry.
+	revConflict reverseKind = iota
+	// revReplaces is a hit from an installed package's Replaces entry.
+	revReplaces
+)
+
+// direction returns the direction field of the structured log line for k.
+func (k reverseKind) direction() string {
+	if k == revReplaces {
+		return "reverse_replaces"
+	}
+	return "reverse"
+}
+
+// reverseHit is a single reverse relation result between an installed package
+// and an incoming package: either an installed package's Conflicts entry
+// matches the incoming package, or its Replaces entry names it.
 type reverseHit struct {
+	kind        reverseKind
 	installed   *goolib.PkgSpec
 	entry       string
 	unparseable bool
@@ -225,9 +247,24 @@ func matchReverseEntry(c string, ps *goolib.PkgSpec) (matched, unparseable bool)
 	return false, hadErr
 }
 
-// reverseConflicts evaluates all Conflicts entries of non-excluded specs in
-// installed against incoming package ps, returning at most one hit per
-// (installed package, entry) pair.
+// matchReverseReplaces evaluates a single Replaces entry e of an installed
+// package against incoming package ps's own name, arch and version only, as
+// Replaces selects its victims, never against ps.Provides. An entry that names
+// ps's identity but whose version can't be compared is reported as
+// unparseable.
+func matchReverseReplaces(e string, ps *goolib.PkgSpec) (matched, unparseable bool) {
+	r := relation.ParseRelation(e)
+	ok, err := r.MinInstalled(ps.Name, ps.Arch, ps.Version)
+	if err != nil {
+		return false, r.SameIdentity(ps.Name, ps.Arch)
+	}
+	return ok, false
+}
+
+// reverseConflicts evaluates all Conflicts and Replaces entries of
+// non-excluded specs in installed against incoming package ps, returning at
+// most one hit per (installed package, relation kind, entry) triple. For each
+// installed package its Conflicts hits come before its Replaces hits.
 func reverseConflicts(ps *goolib.PkgSpec, installed []*goolib.PkgSpec, ex exclusions) []reverseHit {
 	var hits []reverseHit
 	for _, inst := range installed {
@@ -236,10 +273,14 @@ func reverseConflicts(ps *goolib.PkgSpec, installed []*goolib.PkgSpec, ex exclus
 		}
 		for _, c := range inst.Conflicts {
 			matched, unparseable := matchReverseEntry(c, ps)
-			if matched {
-				hits = append(hits, reverseHit{installed: inst, entry: c})
-			} else if unparseable {
-				hits = append(hits, reverseHit{installed: inst, entry: c, unparseable: true})
+			if matched || unparseable {
+				hits = append(hits, reverseHit{kind: revConflict, installed: inst, entry: c, unparseable: !matched})
+			}
+		}
+		for _, e := range inst.Replaces {
+			matched, unparseable := matchReverseReplaces(e, ps)
+			if matched || unparseable {
+				hits = append(hits, reverseHit{kind: revReplaces, installed: inst, entry: e, unparseable: !matched})
 			}
 		}
 	}
@@ -247,10 +288,10 @@ func reverseConflicts(ps *goolib.PkgSpec, installed []*goolib.PkgSpec, ex exclus
 }
 
 // conflictLine formats the structured telemetry log line for a reverse package
-// conflict event.
-func conflictLine(mode ConflictMode, result string, installed *goolib.PkgSpec, entry string, incoming *goolib.PkgSpec) string {
-	return fmt.Sprintf("package_conflict direction=reverse mode=%s result=%s installed=%s entry=%q incoming=%s",
-		mode, result, installed, entry, incoming)
+// conflict event of kind k.
+func conflictLine(k reverseKind, mode ConflictMode, result string, installed *goolib.PkgSpec, entry string, incoming *goolib.PkgSpec) string {
+	return fmt.Sprintf("package_conflict direction=%s mode=%s result=%s installed=%s entry=%q incoming=%s",
+		k.direction(), mode, result, installed, entry, incoming)
 }
 
 // applyReverseConflicts logs each hit in hits to sink according to mode,
@@ -260,29 +301,42 @@ func applyReverseConflicts(ps *goolib.PkgSpec, hits []reverseHit, mode ConflictM
 	var firstErr error
 	for _, hit := range hits {
 		if hit.unparseable {
-			sink.Warning(conflictLine(mode, "unparseable", hit.installed, hit.entry, ps))
+			sink.Warning(conflictLine(hit.kind, mode, "unparseable", hit.installed, hit.entry, ps))
 			continue
 		}
 		switch mode {
 		case ConflictError:
-			sink.Error(conflictLine(mode, "failed", hit.installed, hit.entry, ps))
+			sink.Error(conflictLine(hit.kind, mode, "failed", hit.installed, hit.entry, ps))
 			if firstErr == nil {
-				firstErr = fmt.Errorf("%w: cannot install %s: conflict with installed package %s (entry %q; package conflict mode is %s)", ErrPackageConflict, ps, hit.installed, hit.entry, mode)
+				firstErr = reverseError(hit, ps, mode)
 			}
 		case ConflictIgnore:
-			sink.Infof("%s", conflictLine(mode, "ignored", hit.installed, hit.entry, ps))
+			sink.Infof("%s", conflictLine(hit.kind, mode, "ignored", hit.installed, hit.entry, ps))
 		default:
-			sink.Warning(conflictLine(ConflictWarn, "warned", hit.installed, hit.entry, ps))
-			sink.Printf("Warning: installed package %s conflicts with %s (entry %q); installing anyway (package_conflicts=warn)\n", hit.installed, ps, hit.entry)
+			sink.Warning(conflictLine(hit.kind, ConflictWarn, "warned", hit.installed, hit.entry, ps))
+			if hit.kind == revReplaces {
+				sink.Printf("Warning: installed package %s replaces %s (entry %q); installing anyway (package_conflicts=warn)\n", hit.installed, ps, hit.entry)
+			} else {
+				sink.Printf("Warning: installed package %s conflicts with %s (entry %q); installing anyway (package_conflicts=warn)\n", hit.installed, ps, hit.entry)
+			}
 		}
 	}
 	return firstErr
 }
 
-// resolveReverseConflictsIn checks the installed specs' Conflicts against ps
-// under ex and mode, sending its log lines and warnings to sink, and returns
-// the name.arch keys of any excluded victim rows that matched ps so they can
-// be re-verified once the replacements are removed.
+// reverseError returns the ErrPackageConflict error that hit causes when ps is
+// installed under mode.
+func reverseError(hit reverseHit, ps *goolib.PkgSpec, mode ConflictMode) error {
+	if hit.kind == revReplaces {
+		return fmt.Errorf("%w: cannot install %s: installed package %s replaces it (entry %q; package conflict mode is %s)", ErrPackageConflict, ps, hit.installed, hit.entry, mode)
+	}
+	return fmt.Errorf("%w: cannot install %s: conflict with installed package %s (entry %q; package conflict mode is %s)", ErrPackageConflict, ps, hit.installed, hit.entry, mode)
+}
+
+// resolveReverseConflictsIn checks the installed specs' Conflicts and Replaces
+// against ps under ex and mode, sending its log lines and warnings to sink,
+// and returns the name.arch keys of any excluded victim rows that matched ps
+// so they can be re-verified once the replacements are removed.
 func resolveReverseConflictsIn(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, installed []*goolib.PkgSpec, sink eventSink) (map[string]bool, error) {
 	if err := applyReverseConflicts(ps, reverseConflicts(ps, installed, ex), mode, sink); err != nil {
 		return nil, err
@@ -316,14 +370,15 @@ func resolveReverseConflictsIn(ps *goolib.PkgSpec, ex exclusions, mode ConflictM
 type deferredChecks struct {
 	// fwd holds parsed ps.Conflicts requirements that passed only via a victim exemption.
 	fwd []relation.Requirement
-	// rev maps name.arch keys of exempted victims whose Conflicts matched ps.
+	// rev maps name.arch keys of exempted victims whose Conflicts matched ps
+	// or whose Replaces named it.
 	rev map[string]bool
 }
 
 // checkConflictsIn evaluates both ps's forward Conflicts and the installed
-// packages' reverse Conflicts over the installed state st under ex and mode,
-// sending log lines and warnings to sink, and returns any checks deferred
-// until the replacements are removed.
+// packages' reverse Conflicts and Replaces over the installed state st under
+// ex and mode, sending log lines and warnings to sink, and returns any checks
+// deferred until the replacements are removed.
 func checkConflictsIn(ps *goolib.PkgSpec, ex exclusions, mode ConflictMode, st client.GooGetState, sink eventSink) (deferredChecks, error) {
 	fwd, err := resolveConflictsIn(ps, ex, st, sink)
 	if err != nil {

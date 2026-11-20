@@ -198,6 +198,7 @@ func isPlanningLog(text string) bool {
 		"Dependency met: ",
 		"Dependency found: ",
 		"package_conflict direction=reverse ",
+		"package_conflict direction=reverse_replaces ",
 		"Replacement simulation for ",
 	} {
 		if strings.HasPrefix(text, prefix) {

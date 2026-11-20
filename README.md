@@ -52,12 +52,18 @@ Configuration keys in `googet.conf` are lowercase (for example, `packageconflict
   respond, or for more data during a download, before it treats the transfer as
   stalled. Raise it if your proxy scans large files before responding.
 - `packageconflicts` controls what happens when an already-installed package
-  declares `Conflicts` matching a package being installed:
+  declares `Conflicts` matching a package being installed, or declares
+  `Replaces` naming it (so installing it would put back a package that the
+  installed one replaced):
   - `warn` (default): log a warning and continue installing.
   - `error`: fail the installation (normally before that package's dependencies
     are installed).
   - `ignore`: continue installing without printing a warning (still recorded at
     info level in the log).
+  Every case is logged as a structured `package_conflict` line tagged with the
+  mode: `direction=reverse` for `Conflicts` and `direction=reverse_replaces`
+  for `Replaces`. A `Replaces` entry matches only the package's own name, arch
+  and version, never its `Provides` entries.
   Reinstalling an already-installed package (`googet install -reinstall` and
   `googet verify`) does not check package conflicts.
 - `orphaneddependents` controls what happens when a package's `Replaces`
@@ -77,7 +83,7 @@ On `googet install` and `googet update`, CLI policy flags override
 
 | Policy | CLI flag | `googet.conf` key | Default | Notes |
 | --- | --- | --- | --- | --- |
-| Reverse package conflicts | `-package_conflicts=warn\|error\|ignore` | `packageconflicts: warn\|error\|ignore` | `warn` | Precedence: CLI flag > `googet.conf` > default. `-force` applies only to file overlaps (`strictconflicts`) and never affects `-package_conflicts`. |
+| Reverse package conflicts and `Replaces` | `-package_conflicts=warn\|error\|ignore` | `packageconflicts: warn\|error\|ignore` | `warn` | Precedence: CLI flag > `googet.conf` > default. `-force` applies only to file overlaps (`strictconflicts`) and never affects `-package_conflicts`. |
 | Orphaned dependents on replace | `-orphaned_dependents=fail\|remove` | `orphaneddependents: fail\|remove` | `fail` | Precedence: CLI flag > `googet.conf` > default. `-force` never affects `-orphaned_dependents`. During `googet update`, `fail` skips the orphaning update instead of failing the run. |
 
 Compatibility note: do not pass `-package_conflicts` to `googet` binaries older

@@ -246,7 +246,14 @@ func TestGoldenInstalls(t *testing.T) {
 		"seed 88",
 		"seed 91",
 	}
-	var flipped, multiArchFlipped, orphanPolicyFlipped []string
+	wantReverseReplacesFlips := []string{
+		"seed 102",
+		"seed 103",
+		"seed 21",
+		"seed 5",
+		"seed 96",
+	}
+	var flipped, multiArchFlipped, orphanPolicyFlipped, reverseReplacesFlipped []string
 	for _, gc := range cases {
 		c := gc.Scenario.corpusCase()
 		want := gc.Trace
@@ -273,6 +280,10 @@ func TestGoldenInstalls(t *testing.T) {
 			orphanPolicyFlipped = append(orphanPolicyFlipped, id)
 			want = adjusted
 		}
+		if adjusted, ok := applyReverseReplacesFlip(gc.Scenario, want); ok {
+			reverseReplacesFlipped = append(reverseReplacesFlipped, fmt.Sprintf("seed %d", gc.Scenario.Seed))
+			want = adjusted
+		}
 		got := runLive(t, c, newRelFixture(t, c.Installed, c.Available))
 		if diff := cmp.Diff(want, got); diff != "" {
 			t.Errorf("scenario %q seed %d: FromRepo differs from the recording (-recorded +now):\n%s", gc.Scenario.Name, gc.Scenario.Seed, diff)
@@ -290,6 +301,57 @@ func TestGoldenInstalls(t *testing.T) {
 	if diff := cmp.Diff(wantOrphanPolicyFlips, orphanPolicyFlipped); diff != "" {
 		t.Errorf("orphan-policy scenarios flipped (-want +got):\n%s", diff)
 	}
+	slices.Sort(reverseReplacesFlipped)
+	if diff := cmp.Diff(wantReverseReplacesFlips, reverseReplacesFlipped); diff != "" {
+		t.Errorf("reverse Replaces scenarios flipped (-want +got):\n%s", diff)
+	}
+}
+
+// applyReverseReplacesFlip returns the updated trace expected now that
+// installing a package that an installed package's Replaces entry names logs
+// a structured package_conflict line with direction=reverse_replaces in every
+// conflict mode, and prints a warning in warn mode.
+func applyReverseReplacesFlip(s goldenScenario, t trace) (trace, bool) {
+	if s.Name != "" {
+		return t, false
+	}
+	type insertion struct{ after, line string }
+	var ins []insertion
+	switch s.Seed {
+	case 5:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for noarch C version 2",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=A.noarch.2 entry="C..2" incoming=C.noarch.2`}}
+	case 21:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for noarch C version 2",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=P.noarch.2 entry="C" incoming=C.noarch.2`}}
+	case 96:
+		ins = []insertion{
+			{"INFO: Resolving conflicts and dependencies for noarch D version 3",
+				`WARN: package_conflict direction=reverse_replaces mode=warn result=warned installed=B.noarch.2 entry="D" incoming=D.noarch.3`},
+			{"STDOUT: Installing D.noarch.3 and dependencies...",
+				`STDOUT: Warning: installed package B.noarch.2 replaces D.noarch.3 (entry "D"); installing anyway (package_conflicts=warn)`},
+		}
+	case 102:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for x86_64 P version 2",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=C.x86_64.2 entry="P" incoming=P.x86_64.2`}}
+	case 103:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for noarch D version 3",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=Q.x86_64.2 entry="D" incoming=D.noarch.3`}}
+	default:
+		return t, false
+	}
+	events := slices.Clone(t.Events)
+	for _, in := range ins {
+		// A missing anchor appends the line at the end, so the comparison
+		// with what FromRepo does now fails and shows where it went.
+		at := len(events)
+		if i := slices.Index(events, in.after); i >= 0 {
+			at = i + 1
+		}
+		events = slices.Insert(events, at, in.line)
+	}
+	t.Events = events
+	return t, true
 }
 
 // applyOrphanPolicyFlip returns the updated trace expected now that
