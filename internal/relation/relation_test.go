@@ -285,3 +285,27 @@ func TestSplitKey(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatHelpers(t *testing.T) {
+	for _, tc := range []struct {
+		req  Requirement
+		want string
+	}{
+		{req: Requirement{Name: "P"}, want: "P"},
+		{req: Requirement{Name: "P", Arch: "x86_64"}, want: "P.x86_64"},
+		{req: Requirement{Name: "P", Ver: "2.0"}, want: "P >= 2.0"},
+		{req: Requirement{Name: "foo.bar", Arch: "noarch", Ver: "1"}, want: "foo.bar.noarch >= 1"},
+	} {
+		if got := tc.req.String(); got != tc.want {
+			t.Errorf("%+v.String() = %q, want %q", tc.req, got, tc.want)
+		}
+	}
+	specs := []*goolib.PkgSpec{
+		{Name: "A", Arch: "noarch", Version: "1"},
+		nil,
+		{Name: "B", Arch: "x86_64", Version: "2"},
+	}
+	if got, want := JoinSpecs(specs, ","), "A.noarch.1,B.x86_64.2"; got != want {
+		t.Errorf("JoinSpecs(',') = %q, want %q", got, want)
+	}
+}
