@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relsyntax"
 )
 
 // validRelationToken reports whether goolib accepts s as a relation token
@@ -28,8 +29,8 @@ func validRelationToken(s string) bool {
 }
 
 // checkRelationParity asserts that PkgSpec.RelationProblems agrees with
-// ParseRelation and Requirement.SameIdentity on a single Conflicts or Replaces
-// entry.
+// relsyntax.Split, ParseRelation, and Requirement.SameIdentity on a single
+// Conflicts or Replaces entry.
 func checkRelationParity(t *testing.T, entry string) {
 	t.Helper()
 	validArchs := goolib.ValidArchs()
@@ -39,23 +40,43 @@ func checkRelationParity(t *testing.T, entry string) {
 	cProbs := psConflicts.RelationProblems()
 	rProbs := psReplaces.RelationProblems()
 
+	p := relsyntax.Split(entry)
 	r := ParseRelation(entry)
 	trimmed := strings.TrimSpace(entry)
 	_, verErr := goolib.ParseVersion(r.Ver)
-	wantConflictsClean := r.Name != "" &&
-		validRelationToken(r.Name) &&
-		validRelationToken(r.Arch) &&
-		validRelationToken(r.Ver) &&
-		(r.Arch == "" || slices.Contains(validArchs, r.Arch)) &&
-		(r.Ver == "" || verErr == nil) &&
-		r.PackageInfo().String() == trimmed
-	wantReplacesClean := wantConflictsClean && !r.SameIdentity(psReplaces.Name, psReplaces.Arch)
+
+	var wantConflictsClean, wantReplacesClean bool
+	switch p.Form {
+	case relsyntax.Legacy:
+		wantConflictsClean = r.Op == OpMin &&
+			r.Name != "" &&
+			validRelationToken(r.Name) &&
+			validRelationToken(r.Arch) &&
+			validRelationToken(r.Ver) &&
+			(r.Arch == "" || slices.Contains(validArchs, r.Arch)) &&
+			(r.Ver == "" || verErr == nil) &&
+			r.Entry() == trimmed
+		wantReplacesClean = wantConflictsClean && !r.SameIdentity(psReplaces.Name, psReplaces.Arch)
+	case relsyntax.Operator:
+		baseClean := r.Op == p.Op &&
+			!p.Spaced &&
+			verErr == nil &&
+			r.Entry() == trimmed
+		wantConflictsClean = baseClean && r.Arch == ""
+		wantReplacesClean = baseClean &&
+			(r.Arch == "" || slices.Contains(validArchs, r.Arch)) &&
+			!(r.Op == OpGE && r.Arch != "") &&
+			!r.SameIdentity(psReplaces.Name, psReplaces.Arch)
+	case relsyntax.Malformed:
+		wantConflictsClean = false
+		wantReplacesClean = false
+	}
 
 	if (len(cProbs) == 0) != wantConflictsClean {
-		t.Errorf("Conflicts(%q) -> %+v: RelationProblems clean=%t (probs=%v), want %t", entry, r, len(cProbs) == 0, cProbs, wantConflictsClean)
+		t.Errorf("Conflicts(%q) -> %+v (form=%s): RelationProblems clean=%t (probs=%v), want %t", entry, r, p.Form, len(cProbs) == 0, cProbs, wantConflictsClean)
 	}
 	if (len(rProbs) == 0) != wantReplacesClean {
-		t.Errorf("Replaces(%q) -> %+v: RelationProblems clean=%t (probs=%v), want %t", entry, r, len(rProbs) == 0, rProbs, wantReplacesClean)
+		t.Errorf("Replaces(%q) -> %+v (form=%s): RelationProblems clean=%t (probs=%v), want %t", entry, r, p.Form, len(rProbs) == 0, rProbs, wantReplacesClean)
 	}
 }
 
@@ -119,8 +140,9 @@ func TestRelationProblemsParity(t *testing.T) {
 	extraRelations := []string{
 		"foo.noarch.", "foo..1.0", "foo.x86_64.1.2.3@4", "gwindows-updater.noarch",
 		"\tfoo.arm64.0.0.0-rc1\n", "foo\tbar", "foo.noarch=1.0", "holder", "holder.x86_64",
+		"holder<2.0.0", "holder.noarch<2.0.0", "foo.noarch>=1.0.0", "dotted.pkg<2.0.0", "foo<notaver",
 	}
-	for _, s := range append(slices.Clone(relationCorpus), extraRelations...) {
+	for _, s := range append(fuzzRelationSeeds(), extraRelations...) {
 		checkRelationParity(t, s)
 		checkDependencyParity(t, s)
 	}
@@ -130,7 +152,7 @@ func TestRelationProblemsParity(t *testing.T) {
 }
 
 func FuzzRelationProblemsParity(f *testing.F) {
-	for _, s := range relationCorpus {
+	for _, s := range fuzzRelationSeeds() {
 		f.Add(s)
 	}
 	for _, s := range provideCorpus {

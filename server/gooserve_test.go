@@ -41,7 +41,9 @@ func TestRunSyncLogsRelationProblemsAndClosesReaders(t *testing.T) {
 
 	cleanSpec := goolib.PkgSpec{Name: "clean", Arch: "noarch", Version: "1.0.0"}
 	warnSpec := goolib.PkgSpec{Name: "warnpkg", Arch: "noarch", Version: "1.0.0", Conflicts: []string{"old"}, Replaces: []string{"old"}}
-	fatalSpec := goolib.PkgSpec{Name: "fatalpkg", Arch: "noarch", Version: "1.0.0", Conflicts: []string{"dep>=2.0"}}
+	// Arch-qualified operator Conflicts remain fatal syntax because older
+	// clients fail closed when an installed package provides the base name.
+	fatalSpec := goolib.PkgSpec{Name: "fatalpkg", Arch: "noarch", Version: "1.0.0", Conflicts: []string{"dep.noarch>=2.0"}}
 
 	var gooPaths []string
 	for _, ps := range []goolib.PkgSpec{cleanSpec, warnSpec, fatalSpec} {
