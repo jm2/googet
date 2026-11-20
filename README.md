@@ -39,12 +39,301 @@ proxyserver: http://address_to_proxy:port
 archs: [noarch, x86_64]
 cachelife: 10m
 stalltimeout: 5m
+strictconflicts: false
+packageconflicts: warn
+orphaneddependents: fail
+followreplaces: false
 ```
 
-`stalltimeout` (a Go duration such as `5m` or `30s`, default `2m`; zero or
-negative values keep the default) is how long googet waits for a server to
-respond, or for more data during a download, before it treats the transfer as
-stalled. Raise it if your proxy scans large files before responding.
+Configuration keys in `googet.conf` are lowercase (for example, `packageconflicts`,
+`orphaneddependents`, `followreplaces`, and `strictconflicts`; PascalCase keys
+are ignored).
+
+- `stalltimeout` (a Go duration such as `5m` or `30s`, default `2m`; zero or
+  negative values keep the default) is how long googet waits for a server to
+  respond, or for more data during a download, before it treats the transfer as
+  stalled. Raise it if your proxy scans large files before responding.
+- `packageconflicts` controls what happens when an already-installed package
+  declares `Conflicts` matching a package being installed, or declares
+  `Replaces` naming it (so installing it would put back a package that the
+  installed one replaced):
+  - `warn` (default): log a warning and continue installing.
+  - `error`: fail the installation (normally before that package's dependencies
+    are installed).
+  - `ignore`: continue installing without printing a warning (still recorded at
+    info level in the log).
+  Every case is logged as a structured `package_conflict` line tagged with the
+  mode: `direction=reverse` for `Conflicts` and `direction=reverse_replaces`
+  for `Replaces`. A `Replaces` entry matches only the package's own name, arch
+  and version, never its `Provides` entries.
+  Reinstalling an already-installed package (`googet install -reinstall` and
+  `googet verify`) does not check package conflicts.
+- `orphaneddependents` controls what happens when a package's `Replaces`
+  entries remove an installed package and leave another installed package's
+  name-based dependency unsatisfied:
+  - `fail` (default): fail `googet install` before changing anything and list
+    the affected dependents; during `googet update`, log a warning, skip that
+    update, and continue updating other packages.
+  - `remove`: uninstall the affected dependents before removing the replaced
+    package.
+  Dependents satisfied by the replacing package's `Provides` or by another
+  remaining provider stay installed. Dependents that relied only on a
+  `Provides` entry of the replaced package are listed and never removed.
+- `followreplaces` (default `false`) controls whether `googet update` replaces
+  an installed package with another package that declares both `Replaces` and
+  `Provides` for it, as when a package is renamed. When it is `false`,
+  `googet update` upgrades installed packages in place, and moves to a package
+  that `Provides` an installed package's name only once no repository offers
+  the installed package any more. See
+  [How update follows Replaces](#how-update-follows-replaces).
+
+On `googet install` and `googet update`, CLI policy flags override
+`googet.conf` (`-follow_replaces` exists only on `googet update`):
+
+| Policy | CLI flag | `googet.conf` key | Default | Notes |
+| --- | --- | --- | --- | --- |
+| Reverse package conflicts and `Replaces` | `-package_conflicts=warn\|error\|ignore` | `packageconflicts: warn\|error\|ignore` | `warn` | Precedence: CLI flag > `googet.conf` > default. `-force` applies only to file overlaps (`strictconflicts`) and never affects `-package_conflicts`. |
+| Orphaned dependents on replace | `-orphaned_dependents=fail\|remove` | `orphaneddependents: fail\|remove` | `fail` | Precedence: CLI flag > `googet.conf` > default. `-force` never affects `-orphaned_dependents`. During `googet update`, `fail` skips the orphaning update instead of failing the run. |
+| Update follows `Replaces` | `-follow_replaces`, `-follow_replaces=true\|false` | `followreplaces: true\|false` | `false` | `googet update` only. Precedence: CLI flag > `googet.conf` > default, so `-follow_replaces=false` overrides `followreplaces: true`. `-force` never affects `-follow_replaces`. |
+
+Compatibility note: do not pass `-package_conflicts` to `googet` binaries older
+than 3.5.0, `-orphaned_dependents` to `googet` binaries older than 3.6.0, or
+`-follow_replaces` to `googet` binaries older than 3.7.0, because older
+binaries exit with an unknown-flag usage error (including when an older
+`googet` binary runs a self-upgrade). Setting `packageconflicts`,
+`orphaneddependents` or `followreplaces` in `googet.conf` is ignored by older
+binaries.
+
+## How an install proceeds
+
+`googet install` and `googet update` install a package in three phases:
+
+1. **Plan.** GooGet works out every package it will install, in order, and
+   every installed package removed by a `Replaces` entry or cascaded dependent
+   removal, and checks conflicts and dependencies. If anything fails here,
+   nothing changes. The resolution messages for all packages are printed in
+   this phase.
+2. **Fetch.** GooGet downloads and verifies the archive of every package it
+   will install. Unless `-db_only` is set, it also makes sure the cached
+   archive of every package it will remove is present, because uninstalling
+   a package runs scripts from its archive; a missing archive is downloaded
+   again from where it was installed from. If any archive can't be fetched,
+   nothing changes. If a replaced package's archive is gone from its
+   repository, the error names it: restore the archive, or remove that
+   package first with `googet remove -db_only <name>`, which doesn't run its
+   uninstall script.
+3. **Apply.** GooGet installs the packages in order, removing each package's
+   replaced packages just before installing it.
+
+The confirmation prompt and `googet install -dry_run` show the plan: the
+packages that will be installed, in order, the installed packages that will be
+removed and why, any `Provides`-only dependents left with an unsatisfied
+dependency (not removed), and any conflict warnings. `-dry_run` exits with an
+error if the install would fail while it is planned, for example on a conflict
+or orphaned dependent. `googet update -dry_run` prints the same updates,
+replacements and skipped replacements as a live run and exits without
+installing anything; it checks each replacement's install plan, but doesn't
+plan in-place upgrades in full, so it doesn't show whether one would fail.
+
+### How update follows Replaces
+
+`googet update` upgrades each installed package in place, but first it looks
+for packages that replace installed ones:
+
+- When no repository offers an installed package P for its arch any more,
+  `googet update` moves to the best package that `Provides` P, as it always
+  has. If that package also declares `Replaces` for P, the move has to pass
+  the rules below, whatever `followreplaces` says; if it doesn't, P stays
+  installed. As before, the package must have a higher priority or version
+  than P.
+- With `followreplaces: true` or `-follow_replaces`, `googet update` also
+  replaces P while it is still published, with a package that declares both
+  `Replaces` and `Provides` for P, if the rules below pass. The replacing
+  package may have a lower version than P, as when a renamed package restarts
+  its version numbering. A package that declares `Replaces` for P without
+  `Provides`, such as one of several packages P was split into, is never
+  followed.
+
+A package R replaces P only if all of these hold:
+
+1. R's best version replaces P at P's installed version and provides P's name.
+   Every package name counts once, at its best version for P's arch or
+   `noarch`, honouring `LockArch`.
+2. R is the only such package name at the best repository priority among
+   them, P's own best version doesn't come from a higher priority, and, if no
+   repository offers P, R's priority is at least the default (500). If a newer
+   version of P is offered at the default priority or higher (for P's arch or
+   `noarch`), R's `Replaces` entries must still cover P at that newer version;
+   an upper-bounded entry such as `P<2.0.0` stops replacing P once P `2.0.0`
+   is published.
+3. Neither P's best version for any arch, nor an installed package, nor a
+   chain of such replacing packages starting at R, replaces R in turn.
+4. Installing R plans cleanly over the packages installed at that point. With
+   `orphaneddependents: fail`, a replacement that would leave a dependent
+   unsatisfied is skipped, and so is one that fails to plan for any other
+   reason or would remove a package that an earlier replacement installs.
+
+Replacements run before in-place upgrades, and a package that a replacement
+removes or installs isn't upgraded separately, nor installed again to stand in
+for another package through `Provides`. Replacements are scheduled greedily in
+the order of the installed packages, by name and arch: when two replacements
+exclude each other, for example because one would remove what the other
+installs or install again what the other removes, the first one is scheduled
+and the second is skipped. If R is already installed at
+its best version next to P, `googet update` leaves P alone when it follows
+`Replaces` (unless a newer version of P outside R's `Replaces` range is
+offered), and otherwise reports R as already installed. A skipped
+replacement is printed and logged as an `update_replace_skipped` line with one
+of the reasons `missing_provides`, `pinned_priority`, `ambiguous_replacers`,
+`successor_out_of_range`, `replaces_cycle`, `orphaned_dependents` or
+`plan_rejected`; a skip that `followreplaces` asked for leaves P on its normal
+upgrade path.
+
+### Replacing packages is best-effort
+
+When a package's `Replaces` entries remove installed packages, GooGet first
+prints and logs a `replace_record` line naming them and their cached archives,
+and keeps those archives while the package is installed. If the install fails
+before the package is recorded in the database (an uninstall fails, its
+install script fails, its files can't be copied, or the database can't be
+written, even after a second attempt), GooGet removes the files the package
+placed and installs the removed packages again from the kept archives, in the
+reverse of the order it removed them, and reports both the failure and what
+it reinstalled. Recovery isn't a transaction: uninstall and install scripts,
+and installer side effects such as MSI changes, aren't undone, so a package
+whose install script ran before its database write failed keeps those
+changes, and recovery runs the replaced packages' install scripts again. A
+removed package that can't be installed again stays removed: GooGet prints and
+logs a `replace_record ... result=not_restored` line naming it and, when one
+was kept, its archive. If the database keeps failing, recovery can't record the
+replaced packages either, so the replacing package and the replaced packages
+all end up removed, and any archives they had are kept.
+
+The record lives only in memory. If GooGet is killed or interrupted (for
+example with Ctrl-C, or by a shutdown) while it replaces packages, the
+removed packages stay removed. Install them again from the archives the
+`replace_record` line names, before `googet clean` deletes those archives. A
+kill while a package's files are being placed can also leave them in place,
+unrecorded, with the files they overwrote kept as `name.googet-bak*` next to
+them.
+
+Archives fetched for an install that then fails stay in the cache directory,
+so a later attempt doesn't download them again. While an install runs, the
+cache holds the archives of every package it installs, plus those of the
+installed packages it removes, which are deleted once the package that
+replaces them is recorded, plus the previous versions of upgraded packages
+until each upgrade completes. `googet clean` deletes cached archives
+that don't belong to an installed package.
+
+## Installer environment variables
+
+When GooGet runs a package's install or uninstall command, it sets:
+
+| Variable | Value |
+|---|---|
+| `GOOGET_ACTION` | Always set. Install commands: `install`, `upgrade`, `downgrade`, `reinstall`, `recover`. Uninstall commands: `remove`, `replace`, `remove-dependent`. |
+| `GOOGET_PACKAGE` | `name.arch.version` of the package whose command runs. Names may contain dots, so strip your package's known `name.arch.` prefix to get the version. |
+| `GOOGET_PREVIOUS_VERSION` | Always set. For `upgrade`, `downgrade` and `reinstall`: the version of the same `name.arch` installed when the command starts. Empty for every other action, including an install whose package replaces its own earlier version: that version was already removed with `replace`, so the install is fresh. Treat empty and unset alike. |
+| `GOOGET_REPLACED_BY` | Set only with `replace`: `name.arch.version` of the replacing package. |
+
+- `replace`: another package takes over this one, so an uninstall command can skip destructive cleanup such as configuration or user data.
+- `remove-dependent`: a package removed because a package it depends on was replaced and nothing else satisfies it. Treat it like `remove`.
+- `recover`: reinstalls a package that a failed replacement removed.
+- If `GOOGET_ACTION` is unset or has a value you don't recognize, treat it as `install` in an install command and as `remove` in an uninstall command. That's what earlier GooGet versions always meant.
+- The `GOOGET_` prefix is reserved. GooGet removes every inherited variable whose name starts with `GOOGET_` (in any case) from the install and uninstall commands it runs.
+- Verify commands, goopack build commands, and programs that call the `system` package directly get no variables from GooGet. They inherit GooGet's environment unchanged, including any `GOOGET_` variables already set in it.
+- With `-db_only`, no command runs.
+- The variables reach only the command GooGet starts and the processes it starts in turn. They don't reach Windows Installer custom actions (immediate or deferred), `wusa` or Appx deployment, services, or scheduled tasks.
+
+## File ownership
+
+`strictconflicts` defaults to `false` in `googet.conf`: when a package installs
+a file at a path already owned by another installed package, GooGet logs a
+file-conflict warning and overwrites the file unless `strictconflicts: true` is
+set without `-force`.
+
+- **Ownership transfer on differing content.** When a non-`-db_only` install
+  overwrites a file listed by another installed row (including another
+  architecture of the same package name) with a different SHA-256 checksum,
+  GooGet removes that path from the previous owner's `InstalledFiles` in the
+  same database transaction that records the new package, and logs a
+  `file_owner_transfer` line once the commit succeeds. When both packages ship
+  identical file content (equal checksums), both rows keep listing the path so
+  removing either package leaves the shared file on disk. Empty-checksum
+  entries never transfer, and replacement recovery never transfers ownership
+  away from surviving packages.
+- **Preserving co-owned paths.** `googet remove` and upgrade file cleanup never
+  delete a file or directory that any other installed row still lists, logging
+  a structured `file_kept` line instead. Non-`-db_only` removals read the
+  installed package rows before running the uninstall script (`googet remove
+  -db_only` skips that read).
+- **Created parent directories.** Non-`-db_only` installs create missing parent
+  directories above a package's destination with mode `0755` (while applying
+  the archive's own mode to directories shipped inside the package). Any parent
+  directory GooGet creates that still exists as a directory once the install
+  script finishes is recorded in `InstalledFiles`, carried forward across
+  upgrades, `FromDisk` installs, replacement recovery, and reinstalls (along
+  with dropped payload directories kept non-empty by user or other packages'
+  files), and removed deepest-first on uninstall once empty and no longer
+  listed by any other installed row. If package A creates a parent directory
+  and package B later installs files under that already existing parent, only
+  A's row records the parent; removing A first leaves the non-empty parent for
+  B, and removing B afterwards leaves that unrecorded parent on disk.
+- **Windows path equivalence.** On Windows, file-conflict checks, ownership
+  lookups, and upgrade cleanup clean paths, fold `/` to `\`, and upper-case
+  each rune (`unicode.ToUpper`). GooGet does not resolve DOS 8.3 short names,
+  NTFS junctions or symbolic links, drive-relative paths (`\foo` or `C:foo`
+  versus `C:\foo`), trailing dots or spaces, or case-insensitive APFS volumes
+  on macOS.
+
+## Package relations
+
+Package specs declare relationships through `PkgDependencies`, `Provides`,
+`Conflicts` and `Replaces`:
+
+- `Conflicts` and `Replaces` entries accept either the dot-delimited form
+  `name[.arch[.version]]` (where `version`, if present, is a minimum `>=` bound)
+  or an operator form `name[.arch]OPversion` with `OP` one of `<`, `<=`, `=`,
+  `>=` or `>` (for example `foo<2.0.0` or `foo.noarch<2.0.0` in `Replaces`).
+  `PkgDependencies` keys still use `name[.arch]` with the minimum version in the
+  map value, and `Provides` entries use `name[=version]`.
+- Do not put whitespace around the operator (`foo < 2.0.0` is rejected by
+  `goopack`), and ensure every operator version parses as a valid GooGet
+  version; malformed operator strings and unparseable operator versions fail the
+  build.
+- In `Conflicts`, an operator entry must omit the architecture and must not use
+  a dotted package name (`foo.noarch<2.0.0` and `dotted.pkg<2.0.0` are rejected;
+  write `name OP version` instead). GooGet binaries older than 3.5.0 treat the
+  segment before the first dot as the package name and block installation
+  whenever any installed package `Provides` that name, whereas arch-less
+  non-dotted operator entries are ignored by older clients.
+- In `Replaces`, operator entries may include an architecture (for example
+  `foo.x86_64<2.0.0`), because older clients ignore operator `Replaces` entries.
+  When expressing a minimum version `>=` with an architecture in `Replaces`,
+  write the legacy `name.arch.version` form instead of `name.arch>=version` so
+  that clients older than 3.5.0 honour it too (`goopack` warns on
+  `name.arch>=version`).
+- Naming the same package in a legacy `Conflicts` entry and in `Replaces` warns
+  because GooGet binaries older than 3.5.0 check `Conflicts` before `Replaces`
+  and refuse the install. Operator-only `Conflicts` entries paired with
+  `Replaces` (such as `Conflicts: ["foo<2.0.0"]` and `Replaces: ["foo<2.0.0"]`)
+  are ignored on older clients and do not trigger that warning.
+- Version comparisons evaluate semantic version precedence first and then the
+  `@release` suffix:
+  - `=` compares the `@release` suffix strictly (`1.0.0` does not equal
+    `1.0.0@1`), while ignoring semver `+build` metadata (`1.0.0` equals
+    `1.0.0+build5`).
+  - Semver prereleases sort before the release (`2.0.0-rc1 < 2.0.0`), so
+    `foo<2.0.0` matches `2.0.0-rc1` and `foo>=2.0.0` does not. To match only
+    versions strictly older than the `2.0.0` prerelease line, write
+    `foo<2.0.0-0`.
+- An unversioned `Provides` entry (`Provides: ["foo"]`) satisfies every version
+  constraint on `foo`, including `<`, `<=`, `=`, `>=` and `>`, so any bounded
+  `Conflicts` on `foo` still matches an unversioned provider. Declare a
+  versioned `Provides` entry (`Provides: ["foo=2.0.0"]`) whenever operator
+  `Conflicts` or `Replaces` entries name `foo` (`goopack` warns when a package
+  combines an operator `Conflicts` on `foo` with an unversioned `Provides` of
+  `foo`).
 
 ## Repo file
 

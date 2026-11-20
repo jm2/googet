@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -34,6 +35,8 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
+	"github.com/google/googet/v2/internal/repocmp"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/logger"
@@ -197,6 +200,7 @@ func (d *Downloader) unmarshalRepoPackages(ctx context.Context, p, cacheDir stri
 		if err != nil {
 			return nil, err
 		}
+		defer f.Close()
 		var m []goolib.RepoSpec
 		dec := json.NewDecoder(f)
 		for dec.More() {
@@ -436,6 +440,8 @@ func latest(psm map[string][]*goolib.PkgSpec, rm RepoMap) (*goolib.PkgSpec, stri
 // 1. Repo Priority (High > Low)
 // 2. Version (New > Old)
 // 3. Architecture Preference (as defined by archs slice order)
+// 4. Repo URL (ascending), so that exact ties across repos always resolve to
+// the same repo.
 func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installedArch string, isLocked bool) (*goolib.PkgSpec, string, string, error) {
 	name := pi.Name
 	if pi.Arch != "" {
@@ -443,118 +449,65 @@ func FindRepoLatest(pi goolib.PackageInfo, rm RepoMap, archs []string, installed
 		name = fmt.Sprintf("%s.%s", pi.Name, pi.Arch)
 	}
 
-	archPref := make(map[string]int)
-	for i, a := range archs {
-		archPref[a] = i
+	best, ok, problems := repocmp.Latest(repoList(rm), pi.Name, pi.Ver, archs, installedArch, isLocked)
+	for _, err := range problems {
+		logger.Errorf("Error %v", err)
 	}
-
-	type candidate struct {
-		spec     *goolib.PkgSpec
-		repo     string
-		priority priority.Value
+	if ok {
+		return best.Spec, best.Repo, best.Spec.Arch, nil
 	}
-	var directCandidates []candidate
-	var providesCandidates []candidate
-
-	for u, r := range rm {
-		for _, p := range r.Packages {
-			ps := p.PackageSpec
-
-			if _, ok := archPref[ps.Arch]; !ok {
-				continue
-			}
-
-			if ps.Name == pi.Name {
-				if satisfiesVersion(ps.Version, pi.Ver) {
-					directCandidates = append(directCandidates, candidate{ps, u, r.Priority})
-				}
-				continue
-			}
-
-			for _, prov := range ps.Provides {
-				if SatisfiesProvider(prov, pi.Name, pi.Ver) {
-					providesCandidates = append(providesCandidates, candidate{ps, u, r.Priority})
-					break
-				}
-			}
-		}
-	}
-
-	cmpFunc := func(a, b candidate) int {
-		c, err := goolib.ComparePriorityVersion(a.priority, a.spec.Version, b.priority, b.spec.Version)
-		if err != nil {
-			logger.Errorf("Error comparing priority/version: %v", err)
-			return 0
-		}
-		if c != 0 {
-			return -c // reverse for descending order
-		}
-		if archPref[a.spec.Arch] < archPref[b.spec.Arch] {
-			return -1
-		}
-		if archPref[a.spec.Arch] > archPref[b.spec.Arch] {
-			return 1
-		}
-		return 0
-	}
-
-	bestCandidate := func(list []candidate) (*goolib.PkgSpec, string, string, error) {
-		if len(list) == 0 {
-			return nil, "", "", fmt.Errorf("no package found")
-		}
-		slices.SortFunc(list, cmpFunc)
-		for _, cand := range list {
-			if isLocked && cand.spec.Arch != installedArch && cand.spec.LockArch {
-				continue // Ignore this candidate
-			}
-			return cand.spec, cand.repo, cand.spec.Arch, nil
-		}
-		return nil, "", "", fmt.Errorf("no package found satisfying lock conditions")
-	}
-
-	for _, cands := range [][]candidate{directCandidates, providesCandidates} {
-		if len(cands) == 0 {
-			continue
-		}
-		spec, repo, arch, err := bestCandidate(cands)
-		if err == nil {
-			return spec, repo, arch, nil
-		}
-	}
-
 	return nil, "", "", fmt.Errorf("no package found satisfying %s in any repo", name)
 }
 
-func satisfiesVersion(pkgVer, reqVer string) bool {
-	if reqVer == "" || pkgVer == "" {
-		return true
+// repoList returns the repositories in rm, ordered by URL, as repocmp reads
+// them.
+func repoList(rm RepoMap) []repocmp.Repo {
+	var repos []repocmp.Repo
+	for _, u := range slices.Sorted(maps.Keys(rm)) {
+		r := repocmp.Repo{URL: u, Priority: rm[u].Priority}
+		for _, p := range rm[u].Packages {
+			r.Specs = append(r.Specs, p.PackageSpec)
+		}
+		repos = append(repos, r)
 	}
-	c, err := goolib.Compare(pkgVer, reqVer)
-	if err != nil {
-		logger.Errorf("Error comparing versions %s vs %s: %v", pkgVer, reqVer, err)
-		return false
-	}
-	return c >= 0
+	return repos
 }
 
 // SatisfiesProvider checks if a provider string satisfies a requirement.
 func SatisfiesProvider(prov, reqName, reqVer string) bool {
-	pName, pVer, _ := strings.Cut(prov, "=")
-
-	return pName == reqName && satisfiesVersion(pVer, reqVer)
+	p := relation.ParseProvide(prov)
+	ok, err := relation.Requirement{Name: reqName, Ver: reqVer}.SatisfiedBy(p)
+	if err != nil {
+		logger.Errorf("Error comparing versions %s vs %s: %v", p.Ver, reqVer, err)
+		return false
+	}
+	return ok
 }
 
 // WhatRepo returns what repo a package is in.
 // Name, Arch, and Ver fields of PackageInfo must be provided.
+// If several repos carry the package, WhatRepo returns the one with the
+// highest priority, and among those the one with the smallest URL, which is
+// the repo FindRepoLatest picks for the same package.
 func WhatRepo(pi goolib.PackageInfo, rm RepoMap) (string, error) {
-	for u, r := range rm {
+	var best string
+	found := false
+	for _, u := range slices.Sorted(maps.Keys(rm)) {
+		r := rm[u]
+		if found && r.Priority <= rm[best].Priority {
+			continue
+		}
 		for _, p := range r.Packages {
 			if p.PackageSpec.Name == pi.Name && p.PackageSpec.Arch == pi.Arch && p.PackageSpec.Version == pi.Ver {
-				return u, nil
+				best, found = u, true
+				break
 			}
 		}
 	}
-	return "", fmt.Errorf("package %s %s version %s not found in any repo", pi.Arch, pi.Name, pi.Ver)
+	if !found {
+		return "", fmt.Errorf("package %s %s version %s not found in any repo", pi.Arch, pi.Name, pi.Ver)
+	}
+	return best, nil
 }
 
 // RemoveOrRename attempts to remove a file or directory. If it fails

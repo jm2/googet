@@ -17,17 +17,19 @@ package update
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/googet/v2/cli"
+	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
-	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/install"
-	"github.com/google/googet/v2/priority"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/repo"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/logger"
@@ -37,23 +39,26 @@ import (
 func init() { subcommands.Register(&updateCmd{}, "package management") }
 
 type updateCmd struct {
-	dbOnly  bool
-	sources string
-	dryRun  bool
-	force   bool
+	dbOnly      bool
+	sources     string
+	dryRun      bool
+	force       bool
+	policyFlags policy.Flags
 }
 
 func (*updateCmd) Name() string     { return "update" }
 func (*updateCmd) Synopsis() string { return "update all packages to the latest version available" }
 func (*updateCmd) Usage() string {
-	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force]\n", filepath.Base(os.Args[0]))
+	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore] [-orphaned_dependents fail|remove] [-follow_replaces]\n", filepath.Base(os.Args[0]))
 }
 
 func (cmd *updateCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&cmd.dbOnly, "db_only", false, "only make changes to DB, don't perform install system actions")
 	f.StringVar(&cmd.sources, "sources", "", "comma separated list of sources, setting this overrides local .repo files")
 	f.BoolVar(&cmd.dryRun, "dry_run", false, "check for updates and print them, but do not prompt to install")
-	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config)")
+	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts or -orphaned_dependents)")
+	cmd.policyFlags.Register(f)
+	cmd.policyFlags.RegisterFollowReplaces(f)
 }
 
 func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
@@ -92,8 +97,17 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 	}
 
 	rm := downloader.AvailableVersions(ctx, repos, cache, settings.CacheLife)
-	ud := updates(state, rm)
-	if ud == nil {
+	// Plan and print everything, replacements and their skip reasons
+	// included, before -dry_run stops, so that a dry run shows exactly what a
+	// live run would do.
+	plan := planUpdates(state, rm, updateConfig{
+		archs:          settings.Archs,
+		opts:           cmd.policyFlags.Options(cmd.dbOnly, cmd.force),
+		followReplaces: cmd.policyFlags.FollowReplaces(),
+	})
+	renderUpdates(os.Stdout, plan)
+	actions := plan.actions()
+	if len(actions) == 0 {
 		fmt.Println("No updates available for any installed packages.")
 		return subcommands.ExitSuccess
 	}
@@ -110,16 +124,18 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 		}
 	}
 
+	ins := install.New(cache, db, cmd.policyFlags.Options(cmd.dbOnly, cmd.force))
 	exitCode := subcommands.ExitSuccess
-	for _, pi := range ud {
-		r, err := client.WhatRepo(pi, rm)
-		if err != nil {
-			logger.Errorf("Error finding repo: %v.", err)
-			exitCode = subcommands.ExitFailure
-			continue
-		}
-		if err := install.FromRepo(ctx, pi, r, cache, rm, settings.Archs, cmd.dbOnly, cmd.force, downloader, db); err != nil {
-			logger.Errorf("Error updating %s %s %s: %v", pi.Arch, pi.Name, pi.Ver, err)
+	for _, a := range actions {
+		// Install from the repository the plan printed, so that what update
+		// shows and what it installs never disagree.
+		pi := a.info()
+		if err := ins.FromRepo(ctx, pi, a.repo, rm, settings.Archs, downloader); err != nil {
+			if policy.OrphanOnly(err) {
+				logSkippedOrphans(err)
+				continue
+			}
+			logger.Errorf("Error updating %s %s %s: %v", pi.Arch, pi.Name, pi.Ver, policy.WrapError(err))
 			exitCode = subcommands.ExitFailure
 			continue
 		}
@@ -128,54 +144,20 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 	return exitCode
 }
 
-func updates(state client.GooGetState, rm client.RepoMap) []goolib.PackageInfo {
-	fmt.Println("Searching for available updates...")
-	var ud []goolib.PackageInfo
-	for _, p := range state {
-		if p.PackageSpec == nil {
-			continue
-		}
-		pi := goolib.PackageInfo{Name: p.PackageSpec.Name, Arch: p.PackageSpec.Arch}
-		spec, r, _, err := client.FindRepoLatest(pi, rm, settings.Archs, p.PackageSpec.Arch, p.PackageSpec.LockArch)
-		if err != nil {
-			// This error is because this installed package is not available in a repo.
-			logger.Info(err)
-			continue
-		}
-		if p.PackageSpec.Name != spec.Name {
-			// Check if package identified via "Provides" is already installed (at any version).
-			if _, err := state.GetPackageState(goolib.PackageInfo{Name: spec.Name}); err == nil {
-				logger.Infof("%s.%s - %s already installed", spec.Name, spec.Arch, spec.Version)
-				continue
-			}
-		}
-		c, err := goolib.ComparePriorityVersion(rm[r].Priority, spec.Version, priority.Default, p.PackageSpec.Version)
-		if err != nil {
-			logger.Error(err)
-			continue
-		}
-		if c < 1 {
-			logger.Infof("%s.%s - highest priority version already installed", p.PackageSpec.Name, p.PackageSpec.Arch)
-			continue
-		}
-		// The versions might actually be the same even though the priorities are different,
-		// so do another check to skip reinstall of the same version.
-		c, err = goolib.Compare(spec.Version, p.PackageSpec.Version)
-		if err != nil {
-			logger.Error(err)
-			continue
-		}
-		if c == 0 {
-			logger.Infof("%s.%s - same version installed", p.PackageSpec.Name, p.PackageSpec.Arch)
-			continue
-		}
-		op := "Upgrade"
-		if c == -1 {
-			op = "Downgrade"
-		}
-		fmt.Printf("  %s.%s, %s --> %s.%s, %s from %s\n", p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version, spec.Name, spec.Arch, spec.Version, r)
-		logger.Infof("%s for package %s.%s, %s installed and %s.%s, %s available from %s.", op, p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version, spec.Name, spec.Arch, spec.Version, r)
-		ud = append(ud, goolib.PackageInfo{Name: spec.Name, Arch: spec.Arch, Ver: spec.Version})
+// logSkippedOrphans emits one structured warning log line per orphaned
+// dependent when update skips an orphaning replacement under OrphanFail mode.
+func logSkippedOrphans(err error) {
+	var oe *install.OrphanedDependentsError
+	if !errors.As(err, &oe) || len(oe.Dependents) == 0 {
+		logger.Warningf("dependency_unsatisfied op=replace mode=fail result=skipped err=%v", err)
+		return
 	}
-	return ud
+	for _, d := range oe.Dependents {
+		removed := make([]string, 0, len(d.Removed))
+		for _, r := range d.Removed {
+			removed = append(removed, r.String())
+		}
+		logger.Warningf("dependency_unsatisfied op=replace mode=fail result=skipped dependent=%s requirement=%q removed=%s replacer=%s",
+			d.Package, relation.FormatPackageRequirement(d.Requirement), strings.Join(removed, ","), d.ReplacedBy)
+	}
 }

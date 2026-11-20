@@ -29,14 +29,21 @@ import (
 	"github.com/google/logger"
 )
 
-// Install performs a system specfic install given a package extraction directory and a PkgSpec struct.
+// Install performs a system specific install given a package extraction directory and a PkgSpec struct.
 func Install(dir string, ps *goolib.PkgSpec) error {
+	return InstallWith(dir, ps, goolib.InstallerContext{})
+}
+
+// InstallWith performs a system specific install like Install, passing ic's
+// environment variables to the install command when ic.Action is non-zero.
+func InstallWith(dir string, ps *goolib.PkgSpec, ic goolib.InstallerContext) error {
 	in := ps.Install
 	if in.Path == "" {
 		return nil
 	}
 
 	logger.Infof("Running install command: %q", in.Path)
+	logInstallerContext("install", ic)
 	out, err := oswrap.Create(filepath.Join(dir, "googet_install.log"))
 	if err != nil {
 		return err
@@ -46,21 +53,33 @@ func Install(dir string, ps *goolib.PkgSpec) error {
 			logger.Error(err)
 		}
 	}()
-	if err := goolib.Exec(filepath.Join(dir, in.Path), in.Args, in.ExitCodes, out); err != nil {
+	cmd, err := goolib.Command(filepath.Join(dir, in.Path), in.Args)
+	if err != nil {
+		return fmt.Errorf("error running install: %v", err)
+	}
+	if err := goolib.Run(withContext(cmd, ic), in.ExitCodes, out); err != nil {
 		return fmt.Errorf("error running install: %v", err)
 	}
 	return nil
 }
 
-// Uninstall performs a system specfic uninstall given a package extraction directory and a PkgSpec struct.
+// Uninstall performs a system specific uninstall given a package extraction directory and a PackageState struct.
 func Uninstall(dir string, ps *client.PackageState) error {
+	return UninstallWith(dir, ps, goolib.InstallerContext{})
+}
+
+// UninstallWith performs a system specific uninstall like Uninstall, passing
+// ic's environment variables to the uninstall command when ic.Action is
+// non-zero.
+func UninstallWith(dir string, ps *client.PackageState, ic goolib.InstallerContext) error {
 	un := ps.PackageSpec.Uninstall
 	if un.Path == "" {
 		return nil
 	}
 
 	logger.Infof("Running uninstall command: %q", un.Path)
-	// logging is only useful for failed uninstalls
+	logInstallerContext("uninstall", ic)
+	// Logging is only useful for failed uninstalls.
 	out, err := oswrap.Create(filepath.Join(dir, "googet_remove.log"))
 	if err != nil {
 		return err
@@ -70,7 +89,11 @@ func Uninstall(dir string, ps *client.PackageState) error {
 			logger.Error(err)
 		}
 	}()
-	return goolib.Exec(filepath.Join(dir, un.Path), un.Args, un.ExitCodes, out)
+	cmd, err := goolib.Command(filepath.Join(dir, un.Path), un.Args)
+	if err != nil {
+		return err
+	}
+	return goolib.Run(withContext(cmd, ic), un.ExitCodes, out)
 }
 
 // InstallableArchs returns a slice of archs supported by this machine.

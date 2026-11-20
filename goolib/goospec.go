@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -31,8 +32,10 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/blang/semver"
+	"github.com/google/googet/v2/internal/relsyntax"
 	"github.com/google/googet/v2/priority"
 	"github.com/olekukonko/tablewriter/pkg/twwarp"
 )
@@ -73,6 +76,12 @@ const (
 )
 
 var validArch = []string{"noarch", "x86_64", "x86_32", "arm", "arm64"}
+
+// ValidArchs returns a copy of the architecture names recognized by GooGet
+// package specifications.
+func ValidArchs() []string {
+	return slices.Clone(validArch)
+}
 
 // PkgSpec is an individual package specification.
 type PkgSpec struct {
@@ -526,4 +535,242 @@ func (ps PkgSpec) PrettyPrint(w io.Writer, fromRepo string) {
 			writeLines(pi.name, strings.Split(strings.TrimSpace(pi.value), "\n"))
 		}
 	}
+}
+
+// ErrRelationSyntax marks a RelationProblems error for fatal name or relation
+// syntax that build and upload tools must reject.
+var ErrRelationSyntax = errors.New("relation syntax")
+
+// hasForbiddenRelationChar reports whether s contains a version operator rune
+// ('<', '>' or '=', as relsyntax.IsOpRune defines them) or any Unicode
+// whitespace character.
+func hasForbiddenRelationChar(s string) bool {
+	for _, r := range s {
+		if relsyntax.IsOpRune(r) || unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDotRelationEmpty checks whether trimmed (the TrimSpace form of raw in
+// field) is empty or contains an empty dot-delimited name, architecture, or
+// version segment.
+func checkDotRelationEmpty(field, raw, trimmed string) error {
+	if trimmed == "" {
+		return fmt.Errorf("%s %q is empty", field, raw)
+	}
+	parts := strings.SplitN(trimmed, ".", 3)
+	if parts[0] == "" {
+		return fmt.Errorf("%s %q has an empty package name", field, raw)
+	}
+	if len(parts) == 2 && parts[1] == "" {
+		return fmt.Errorf("%s %q has an empty architecture segment", field, raw)
+	}
+	if len(parts) == 3 && (parts[1] == "" || parts[2] == "") {
+		return fmt.Errorf("%s %q has an empty dot-delimited segment", field, raw)
+	}
+	return nil
+}
+
+// checkRelationEntry validates the common dot-delimited structure of raw for
+// field, returning the split PackageInfo, any syntax or architecture problems,
+// and whether field-specific checks should continue.
+func checkRelationEntry(field, raw string) (pi PackageInfo, probs []error, ok bool) {
+	trimmed := strings.TrimSpace(raw)
+	if hasForbiddenRelationChar(trimmed) {
+		return pi, []error{fmt.Errorf("%w: %s %q must not contain '<', '>', '=' or whitespace", ErrRelationSyntax, field, raw)}, false
+	}
+	if err := checkDotRelationEmpty(field, raw, trimmed); err != nil {
+		return pi, []error{err}, false
+	}
+	pi = PkgNameSplit(raw)
+	if pi.Arch != "" && !slices.Contains(validArch, pi.Arch) {
+		probs = append(probs, fmt.Errorf("%s %q has unknown architecture %q (often a dotted package name); matches only a package with that literal architecture", field, raw, pi.Arch))
+	}
+	return pi, probs, true
+}
+
+// checkRelationVersion checks that pi.Ver, when present on raw in field, parses
+// as a valid GooGet version.
+func checkRelationVersion(field, raw string, pi PackageInfo) error {
+	if pi.Ver == "" {
+		return nil
+	}
+	if _, err := ParseVersion(pi.Ver); err != nil {
+		return fmt.Errorf("%s %q has invalid version %q (%v): install fails whenever %s is installed", field, raw, pi.Ver, err, pi.Name)
+	}
+	return nil
+}
+
+// malformedRelationError returns the fatal syntax error for a Conflicts or
+// Replaces entry that contains an operator rune without matching the operator
+// grammar.
+func malformedRelationError(field, raw string) error {
+	return fmt.Errorf("%w: %s %q is not a valid relation: use name[.arch], or name[.arch]OPversion with OP one of <, <=, =, >=, >", ErrRelationSyntax, field, raw)
+}
+
+// spacedOperatorError returns the fatal syntax error for a Conflicts or
+// Replaces operator entry that contains whitespace around its operator.
+func spacedOperatorError(field, raw string, op relsyntax.Op) error {
+	return fmt.Errorf("%w: %s %q must not contain whitespace around operator %q", ErrRelationSyntax, field, raw, op)
+}
+
+// invalidOperatorVersionError returns the fatal syntax error for a Conflicts
+// or Replaces operator entry whose version cannot be parsed.
+func invalidOperatorVersionError(field, raw, ver string, err error) error {
+	return fmt.Errorf("%w: %s %q has invalid version %q (%v)", ErrRelationSyntax, field, raw, ver, err)
+}
+
+// checkOperatorConflict validates a well-formed operator entry in Conflicts.
+func checkOperatorConflict(raw string, p relsyntax.Parts, unversionedProvides map[string]bool) []error {
+	if p.Spaced {
+		return []error{spacedOperatorError("Conflicts entry", raw, p.Op)}
+	}
+	if p.Arch != "" {
+		return []error{fmt.Errorf("%w: Conflicts entry %q specifies architecture or dotted segment %q with operator %q, which blocks installation on googet before 3.5.0 whenever any installed package provides %q; write %s%s%s", ErrRelationSyntax, raw, p.Arch, p.Op, p.Name, p.Name, p.Op, p.Ver)}
+	}
+	if _, err := ParseVersion(p.Ver); err != nil {
+		return []error{invalidOperatorVersionError("Conflicts entry", raw, p.Ver, err)}
+	}
+	if unversionedProvides[p.Name] {
+		return []error{fmt.Errorf("Conflicts entry %q bounds %q while Provides lists unversioned %q, which satisfies every version constraint; use Provides %q", raw, p.Name, p.Name, p.Name+"=<version>")}
+	}
+	return nil
+}
+
+// checkOperatorReplace validates a well-formed operator entry in Replaces,
+// returning any entry-level problems and whether spec-level cross-checks
+// should continue.
+func checkOperatorReplace(raw string, p relsyntax.Parts) (probs []error, ok bool) {
+	if p.Spaced {
+		return []error{spacedOperatorError("Replaces entry", raw, p.Op)}, false
+	}
+	if _, err := ParseVersion(p.Ver); err != nil {
+		return []error{invalidOperatorVersionError("Replaces entry", raw, p.Ver, err)}, false
+	}
+	if p.Arch != "" && !slices.Contains(validArch, p.Arch) {
+		probs = append(probs, fmt.Errorf("Replaces entry %q has unknown architecture %q (often a dotted package name); matches only a package with that literal architecture", raw, p.Arch))
+	}
+	return probs, true
+}
+
+// unversionedProvideNames returns the set of valid package names that ps lists
+// in Provides without a version.
+func unversionedProvideNames(ps *PkgSpec) map[string]bool {
+	var out map[string]bool
+	for _, raw := range ps.Provides {
+		name, _, hasEq := strings.Cut(raw, "=")
+		if !hasEq && name != "" && !hasForbiddenRelationChar(name) {
+			if out == nil {
+				out = make(map[string]bool)
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// RelationProblems reports problems in ps's name and relation fields that
+// verify does not check. Errors that wrap ErrRelationSyntax should fail a
+// build or upload; the rest are warnings. Order: Name, Conflicts, Replaces,
+// Provides, then PkgDependencies keys sorted.
+func (ps *PkgSpec) RelationProblems() []error {
+	if ps == nil {
+		return nil
+	}
+	var probs []error
+
+	if hasForbiddenRelationChar(ps.Name) {
+		probs = append(probs, fmt.Errorf("%w: package name %q must not contain '<', '>', '=' or whitespace", ErrRelationSyntax, ps.Name))
+	}
+
+	unversionedProvides := unversionedProvideNames(ps)
+	legacyConflictNames := make(map[string]bool)
+	for _, raw := range ps.Conflicts {
+		switch p := relsyntax.Split(raw); p.Form {
+		case relsyntax.Legacy:
+			pi, entryProbs, ok := checkRelationEntry("Conflicts entry", raw)
+			probs = append(probs, entryProbs...)
+			if !ok {
+				continue
+			}
+			legacyConflictNames[pi.Name] = true
+			if err := checkRelationVersion("Conflicts entry", raw, pi); err != nil {
+				probs = append(probs, err)
+			}
+		case relsyntax.Malformed:
+			probs = append(probs, malformedRelationError("Conflicts entry", raw))
+		case relsyntax.Operator:
+			probs = append(probs, checkOperatorConflict(raw, p, unversionedProvides)...)
+		}
+	}
+
+	warnedBoth := make(map[string]bool)
+	for _, raw := range ps.Replaces {
+		var name, arch string
+		p := relsyntax.Split(raw)
+		switch p.Form {
+		case relsyntax.Legacy:
+			pi, entryProbs, ok := checkRelationEntry("Replaces entry", raw)
+			probs = append(probs, entryProbs...)
+			if !ok {
+				continue
+			}
+			if err := checkRelationVersion("Replaces entry", raw, pi); err != nil {
+				probs = append(probs, err)
+			}
+			name, arch = pi.Name, pi.Arch
+		case relsyntax.Malformed:
+			probs = append(probs, malformedRelationError("Replaces entry", raw))
+			continue
+		case relsyntax.Operator:
+			entryProbs, ok := checkOperatorReplace(raw, p)
+			probs = append(probs, entryProbs...)
+			if !ok {
+				continue
+			}
+			name, arch = p.Name, p.Arch
+		}
+		if legacyConflictNames[name] && !warnedBoth[name] {
+			warnedBoth[name] = true
+			probs = append(probs, fmt.Errorf("Replaces and Conflicts both name %q: googet before 3.5.0 refuses to install this package while %s is installed", name, name))
+		}
+		if ps.Name != "" && name == ps.Name && (arch == "" || arch == ps.Arch) {
+			probs = append(probs, fmt.Errorf("Replaces entry %q names this package itself: upgrading removes the installed version and its dependents first", raw))
+		}
+		if p.Form == relsyntax.Operator && p.Op == relsyntax.OpGE && p.Arch != "" {
+			probs = append(probs, fmt.Errorf("Replaces entry %q uses \">=\" with architecture %q, which googet before 3.5.0 ignores; write %s.%s.%s so older clients honour it", raw, p.Arch, p.Name, p.Arch, p.Ver))
+		}
+	}
+
+	for _, raw := range ps.Provides {
+		name, ver, hasEq := strings.Cut(raw, "=")
+		if hasForbiddenRelationChar(name) || (hasEq && hasForbiddenRelationChar(ver)) {
+			probs = append(probs, fmt.Errorf("%w: Provides entry %q must not contain '<', '>', extra '=', or whitespace", ErrRelationSyntax, raw))
+			continue
+		}
+		if name == "" || (hasEq && ver == "") {
+			probs = append(probs, fmt.Errorf("Provides entry %q has an empty name or version", raw))
+			continue
+		}
+		if hasEq {
+			if _, err := ParseVersion(ver); err != nil {
+				probs = append(probs, fmt.Errorf("Provides entry %q has invalid version %q (%v): never satisfies a versioned requirement", raw, ver, err))
+			}
+		}
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(ps.PkgDependencies)) {
+		pi, entryProbs, ok := checkRelationEntry("PkgDependencies key", key)
+		probs = append(probs, entryProbs...)
+		if !ok {
+			continue
+		}
+		if pi.Ver != "" {
+			probs = append(probs, fmt.Errorf("PkgDependencies key %q embeds version %q, which is ignored in favour of map value %q", key, pi.Ver, ps.PkgDependencies[key]))
+		}
+	}
+
+	return probs
 }

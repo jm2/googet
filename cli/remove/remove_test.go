@@ -16,11 +16,9 @@ import (
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
-	"github.com/google/logger"
 )
 
 func TestRemoveOne(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	for _, tc := range []struct {
 		desc      string
 		pkgName   string
@@ -66,6 +64,51 @@ func TestRemoveOne(t *testing.T) {
 				{PackageSpec: &goolib.PkgSpec{Name: "D", Arch: "noarch", Version: "4", PkgDependencies: map[string]string{"C": "1"}}},
 			},
 			wantState: []string{},
+		},
+		{
+			desc:    "dotted-name-bare",
+			pkgName: "foo.bar",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "x86_64", Version: "1"}},
+			},
+			wantState: []string{"foo.noarch.1"},
+		},
+		{
+			desc:    "dotted-name-arch",
+			pkgName: "foo.bar.x86_64",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "x86_64", Version: "1"}},
+			},
+			wantState: []string{"foo.bar.noarch.1", "foo.noarch.1"},
+		},
+		{
+			desc:    "dotted-name-missing-preserves-prefix-pkg",
+			pkgName: "foo.bar",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+			},
+			wantState: []string{"foo.noarch.1"},
+		},
+		{
+			desc:    "dotted-name-arch-missing-preserves-sibling-and-prefix",
+			pkgName: "foo.bar.arm64",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "noarch", Version: "1"}},
+			},
+			wantState: []string{"foo.bar.noarch.1", "foo.noarch.1"},
+		},
+		{
+			desc:    "legacy-name-arch-ver",
+			pkgName: "A.noarch.1",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "2"}},
+			},
+			wantState: []string{"B.noarch.2"},
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
@@ -128,7 +171,6 @@ func captureStdout(f func()) string {
 }
 
 func TestRemoveOneDryRun(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	ctx := context.Background()
 
 	for _, tc := range []struct {

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 
 	"github.com/google/googet/v2/cli"
+	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
@@ -38,18 +39,19 @@ import (
 func init() { subcommands.Register(&installCmd{}, "package management") }
 
 type installCmd struct {
-	reinstall  bool
-	redownload bool
-	dbOnly     bool
-	sources    string
-	dryRun     bool
-	force      bool
+	reinstall   bool
+	redownload  bool
+	dbOnly      bool
+	sources     string
+	dryRun      bool
+	force       bool
+	policyFlags policy.Flags
 }
 
 func (*installCmd) Name() string     { return "install" }
 func (*installCmd) Synopsis() string { return "download and install a package and its dependencies" }
 func (*installCmd) Usage() string {
-	return fmt.Sprintf("%s install [-reinstall] [-sources repo1,repo2...] [-dry_run] [-force] <name>...\n", filepath.Base(os.Args[0]))
+	return fmt.Sprintf("%s install [-reinstall] [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore] [-orphaned_dependents fail|remove] <name>...\n", filepath.Base(os.Args[0]))
 }
 
 func (cmd *installCmd) SetFlags(f *flag.FlagSet) {
@@ -58,7 +60,8 @@ func (cmd *installCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&cmd.dbOnly, "db_only", false, "only make changes to DB, don't perform install system actions")
 	f.StringVar(&cmd.sources, "sources", "", "comma separated list of sources, setting this overrides local .repo files")
 	f.BoolVar(&cmd.dryRun, "dry_run", false, "show what would be installed but do not install")
-	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config)")
+	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts or -orphaned_dependents)")
+	cmd.policyFlags.Register(f)
 }
 
 func (cmd *installCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...any) subcommands.ExitStatus {
@@ -84,10 +87,11 @@ func (cmd *installCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...an
 		return subcommands.ExitFailure
 	}
 
+	cache := settings.CacheDir()
 	i := &installer{
 		db:              db,
-		cache:           settings.CacheDir(),
-		dbOnly:          cmd.dbOnly,
+		cache:           cache,
+		pkgInstaller:    install.New(cache, db, cmd.policyFlags.Options(cmd.dbOnly, cmd.force)),
 		shouldReinstall: cmd.reinstall,
 		redownload:      cmd.redownload,
 		confirm:         settings.Confirm,
@@ -149,7 +153,7 @@ type installer struct {
 	cache           string             // path to cache directory
 	downloader      *client.Downloader // HTTP client
 	repoMap         client.RepoMap     // packages available for install
-	dbOnly          bool               // update database without actually installing
+	pkgInstaller    *install.Installer // Package installer configured with resolved options.
 	shouldReinstall bool               // install even if already installed
 	redownload      bool               // ignore cached downloads when reinstalling
 	confirm         bool               // prompt before changes
@@ -168,8 +172,8 @@ func (i *installer) installFromFile(path string) error {
 		fmt.Printf("Not installing %s...\n", base)
 		return nil
 	}
-	if err := install.FromDisk(path, i.cache, i.dbOnly, i.force, i.shouldReinstall, i.db); err != nil {
-		return fmt.Errorf("installing %s: %v", path, err)
+	if err := i.pkgInstaller.FromDisk(path, i.shouldReinstall); err != nil {
+		return fmt.Errorf("installing %s: %w", path, policy.WrapError(err))
 	}
 	return nil
 }
@@ -205,6 +209,13 @@ func (i *installer) installFromRepo(ctx context.Context, name string, archs []st
 		if spec, _, pi.Arch, err = client.FindRepoLatest(pi, i.repoMap, archs, installedArch, isLocked); err != nil {
 			return fmt.Errorf("can't resolve version for package %q: %v", pi.Name, err)
 		}
+		// The requested name may be provided by another package, so continue
+		// with that package's own name.
+		if spec.Name != pi.Name {
+			logger.Infof("Selecting %s.%s.%s, which provides %s", spec.Name, pi.Arch, spec.Version, pi.Name)
+			fmt.Printf("Note: selecting %s.%s.%s, which provides %s\n", spec.Name, pi.Arch, spec.Version, pi.Name)
+		}
+		pi.Name = spec.Name
 		pi.Ver = spec.Version
 	}
 	if _, err := goolib.ParseVersion(pi.Ver); err != nil {
@@ -222,23 +233,23 @@ func (i *installer) installFromRepo(ctx context.Context, name string, archs []st
 		return nil
 	}
 
-	b, err := i.enumerateDeps(pi, r, archs, i.dryRun)
-	if err != nil {
-		return err
+	if i.dryRun || i.confirm {
+		b, err := i.describePlan(pi, r, archs, i.dryRun)
+		if err != nil {
+			return fmt.Errorf("installing %s.%s.%s: %w", pi.Name, pi.Arch, pi.Ver, policy.WrapError(err))
+		}
+		if i.dryRun {
+			fmt.Println(b.String())
+			fmt.Printf("Dry run: Would install %s.%s.%s and its dependencies if not already installed.\n", pi.Name, pi.Arch, pi.Ver)
+			return nil
+		}
+		if !cli.Confirmation(b.String()) {
+			fmt.Println("canceling install...")
+			return nil
+		}
 	}
-
-	if i.dryRun {
-		fmt.Println(b.String())
-		fmt.Printf("Dry run: Would install %s.%s.%s and its dependencies if not already installed.\n", pi.Name, pi.Arch, pi.Ver)
-		return nil
-	}
-
-	if i.confirm && !cli.Confirmation(b.String()) {
-		fmt.Println("canceling install...")
-		return nil
-	}
-	if err := install.FromRepo(ctx, pi, r, i.cache, i.repoMap, archs, i.dbOnly, i.force, i.downloader, i.db); err != nil {
-		return fmt.Errorf("installing %s.%s.%s: %v", pi.Name, pi.Arch, pi.Ver, err)
+	if err := i.pkgInstaller.FromRepo(ctx, pi, r, i.repoMap, archs, i.downloader); err != nil {
+		return fmt.Errorf("installing %s.%s.%s: %w", pi.Name, pi.Arch, pi.Ver, policy.WrapError(err))
 	}
 
 	return nil
@@ -265,22 +276,17 @@ func (i *installer) reinstall(ctx context.Context, pi goolib.PackageInfo, ps cli
 	return nil
 }
 
-func (i *installer) enumerateDeps(pi goolib.PackageInfo, r string, archs []string, dryRun bool) (*bytes.Buffer, error) {
-	dl, err := install.ListDeps(pi, i.repoMap, r, archs, i.db)
+// describePlan describes what installing pi from repo r does, for the
+// confirmation prompt or a dry run: the packages it installs, the installed
+// packages it removes and any warnings. It returns the error the install
+// would fail with, if any, without changing anything.
+func (i *installer) describePlan(pi goolib.PackageInfo, r string, archs []string, dryRun bool) (*bytes.Buffer, error) {
+	p, err := i.pkgInstaller.Plan(pi, r, i.repoMap, archs)
 	if err != nil {
-		return nil, fmt.Errorf("error listing dependencies for %s.%s.%s: %v", pi.Name, pi.Arch, pi.Ver, err)
+		return nil, err
 	}
 	var b bytes.Buffer
-	fmt.Fprintln(&b, "The following packages will be installed:")
-	for _, di := range dl {
-		ni, err := install.NeedsInstallation(di, i.db)
-		if err != nil {
-			return nil, err
-		}
-		if ni {
-			fmt.Fprintf(&b, "  %s.%s.%s\n", di.Name, di.Arch, di.Ver)
-		}
-	}
+	b.WriteString(p.String())
 	if !dryRun {
 		fmt.Fprintf(&b, "Do you wish to install %s.%s.%s and all dependencies?", pi.Name, pi.Arch, pi.Ver)
 	}

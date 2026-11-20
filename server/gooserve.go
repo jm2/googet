@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -79,6 +80,18 @@ func getReader(ctx context.Context, client *storage.Client, rootLoc, packageLoc,
 	}
 }
 
+// logRelationProblems logs any relation problems in spec with pkgPath and spec
+// context while allowing the package to remain indexed.
+func logRelationProblems(pkgPath string, spec *goolib.PkgSpec) {
+	for _, prob := range spec.RelationProblems() {
+		if errors.Is(prob, goolib.ErrRelationSyntax) {
+			logger.Errorf("%s (%s): %v", pkgPath, spec, prob)
+		} else {
+			logger.Warningf("%s (%s): %v", pkgPath, spec, prob)
+		}
+	}
+}
+
 func runSync(ctx context.Context, rootLoc, packageLoc string) error {
 	logger.Info("Beginning sync run")
 
@@ -138,6 +151,7 @@ func runSync(ctx context.Context, rootLoc, packageLoc string) error {
 				return
 			}
 			spec, err := goolib.ExtractPkgSpec(r)
+			r.Close()
 			if err != nil {
 				logger.Error(err)
 				return
@@ -151,7 +165,9 @@ func runSync(ctx context.Context, rootLoc, packageLoc string) error {
 				return
 			}
 			chksum := goolib.Checksum(r)
+			r.Close()
 
+			logRelationProblems(pkgPath, spec)
 			repoContents.add(pkgPath, chksum, spec)
 		}(pkgPath)
 	}

@@ -20,12 +20,16 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/remove"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/logger"
@@ -83,8 +87,7 @@ func (cmd *removeCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 }
 
 func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader *client.Downloader, db *googetdb.GooDB) error {
-	pi := goolib.PkgNameSplit(pkgName)
-	ps, err := db.FetchPkg(pi)
+	ps, err := lookupInstalledPkg(pkgName, db)
 	if err != nil {
 		return err
 	}
@@ -92,10 +95,14 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 		logger.Errorf("Package %q not installed, cannot remove.", pkgName)
 		return nil
 	}
-	pi = goolib.PackageInfo{Name: ps.PackageSpec.Name, Arch: ps.PackageSpec.Arch}
+	pi := goolib.PackageInfo{Name: ps.PackageSpec.Name, Arch: ps.PackageSpec.Arch}
 	deps, dl, err := remove.EnumerateDeps(pi, db)
 	if err != nil {
 		return err
+	}
+	orphans, err := providesOrphans(deps, db)
+	if err != nil {
+		logger.Warningf("Checking unsatisfied dependencies for %q: %v", pkgName, err)
 	}
 
 	if cmd.dryRun {
@@ -103,6 +110,7 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 		for _, d := range dl {
 			fmt.Println("  " + d)
 		}
+		writeUnsatisfied(os.Stdout, orphans)
 		fmt.Printf("Dry run: Would remove %s and all dependencies.\n", pi.Name)
 		return nil
 	}
@@ -113,12 +121,88 @@ func (cmd *removeCmd) removeOne(ctx context.Context, pkgName string, downloader 
 		for _, d := range dl {
 			fmt.Fprintln(&b, "  "+d)
 		}
+		writeUnsatisfied(&b, orphans)
 		fmt.Fprintf(&b, "Do you wish to remove %s and all dependencies?", pi.Name)
 		if !cli.Confirmation(b.String()) {
 			fmt.Println("canceling removal...")
 			return nil
 		}
+	} else {
+		writeUnsatisfied(os.Stdout, orphans)
+	}
+	for _, o := range orphans {
+		logger.Warningf("dependency_unsatisfied op=remove result=listed dependent=%s requirement=%q removed=%s",
+			o.Dependent, o.Requirement.String(), relation.JoinSpecs(o.Removed, ","))
 	}
 	fmt.Printf("Removing %s and all dependencies...\n", pi.Name)
 	return remove.All(ctx, pi, deps, cmd.dbOnly, downloader, db)
+}
+
+// lookupInstalledPkg resolves pkgName as an exact package name, a dotted-safe
+// name.arch key when the suffix is a known architecture, or a legacy
+// name.arch.version tuple. Because db.FetchPkg falls back to the last installed
+// row sharing pi.Name when Arch or Ver does not match, non-bare probes verify
+// the returned spec before accepting it.
+func lookupInstalledPkg(pkgName string, db *googetdb.GooDB) (client.PackageState, error) {
+	trimmed := strings.TrimSpace(pkgName)
+	if ps, err := db.FetchPkg(goolib.PackageInfo{Name: trimmed}); err != nil || ps.PackageSpec != nil {
+		return ps, err
+	}
+	if sk := relation.SplitKey(trimmed); sk.Arch != "" && slices.Contains(goolib.ValidArchs(), sk.Arch) {
+		ps, err := db.FetchPkg(sk)
+		if err != nil || (ps.PackageSpec != nil && ps.PackageSpec.Arch == sk.Arch) {
+			return ps, err
+		}
+		return client.PackageState{}, nil
+	}
+	pi := goolib.PkgNameSplit(trimmed)
+	ps, err := db.FetchPkg(pi)
+	if err != nil || (ps.PackageSpec != nil && ps.Match(pi)) {
+		return ps, err
+	}
+	return client.PackageState{}, nil
+}
+
+// providesOrphans returns the Provides-only dependents left with an
+// unsatisfied dependency once the packages in deps are removed from db.
+func providesOrphans(deps remove.DepMap, db *googetdb.GooDB) ([]relation.Orphan, error) {
+	state, err := db.FetchPkgs("")
+	if err != nil {
+		return nil, err
+	}
+	var removing, remaining []*goolib.PkgSpec
+	for _, st := range state {
+		if st.PackageSpec == nil {
+			continue
+		}
+		key := st.PackageSpec.Name + "." + st.PackageSpec.Arch
+		if _, ok := deps[key]; ok {
+			removing = append(removing, st.PackageSpec)
+		} else {
+			remaining = append(remaining, st.PackageSpec)
+		}
+	}
+	orphans, err := relation.Unsatisfied(removing, remaining)
+	if err != nil {
+		return nil, err
+	}
+	var out []relation.Orphan
+	for _, o := range orphans {
+		if !o.ByName {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+
+// writeUnsatisfied formats orphans for the removal prompt, dry run, or
+// unattended console output. It writes nothing when orphans is empty.
+func writeUnsatisfied(w io.Writer, orphans []relation.Orphan) {
+	if len(orphans) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "The following packages will have an unsatisfied dependency (not removed):")
+	for _, o := range orphans {
+		fmt.Fprintf(w, "  %s (requires %s, provided by %s)\n", o.Dependent, o.Requirement.String(), relation.JoinSpecs(o.Removed, ", "))
+	}
 }

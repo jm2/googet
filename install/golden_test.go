@@ -1,0 +1,433 @@
+/*
+Copyright 2026 Google Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package install
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/googet/v2/goolib"
+)
+
+var updateGolden = flag.Bool("update_golden", false, "rewrite "+goldenFile+" from what FromRepo does now")
+
+// goldenFile holds install scenarios and what FromRepo did with each one when
+// the file was recorded. It was recorded from FromRepo's original recursive
+// implementation, so it stays an independent record of that behaviour after
+// FromRepo is rebuilt on the install planner. Rewrite it with -update_golden
+// only to record a deliberate behaviour change.
+const goldenFile = "testdata/golden_installs.json"
+
+// goldenSeeds is the number of generated scenarios in goldenFile, which
+// also holds the scenarios goldenExtras returns.
+const goldenSeeds = 120
+
+// goldenSpec is a package spec as goldenFile stores it.
+type goldenSpec struct {
+	Name, Arch, Version string
+	LockArch            bool              `json:",omitempty"`
+	PkgDependencies     map[string]string `json:",omitempty"`
+	Replaces            []string          `json:",omitempty"`
+	Conflicts           []string          `json:",omitempty"`
+	Provides            []string          `json:",omitempty"`
+}
+
+// goldenScenario is a corpusCase as goldenFile stores it.
+type goldenScenario struct {
+	Name      string `json:",omitempty"`
+	Seed      uint64 `json:",omitempty"`
+	Installed []goldenSpec
+	Available []goldenSpec
+	Target    string
+	Mode      ConflictMode
+	DBOnly    bool
+}
+
+// goldenCase is one recorded scenario and what FromRepo did with it.
+type goldenCase struct {
+	Scenario goldenScenario
+	Trace    trace
+}
+
+func toGoldenSpecs(specs []goolib.PkgSpec) []goldenSpec {
+	var out []goldenSpec
+	for _, ps := range specs {
+		out = append(out, goldenSpec{ps.Name, ps.Arch, ps.Version, ps.LockArch, ps.PkgDependencies, ps.Replaces, ps.Conflicts, ps.Provides})
+	}
+	return out
+}
+
+func fromGoldenSpecs(specs []goldenSpec) []goolib.PkgSpec {
+	var out []goolib.PkgSpec
+	for _, gs := range specs {
+		out = append(out, goolib.PkgSpec{Name: gs.Name, Arch: gs.Arch, Version: gs.Version, LockArch: gs.LockArch, PkgDependencies: gs.PkgDependencies, Replaces: gs.Replaces, Conflicts: gs.Conflicts, Provides: gs.Provides})
+	}
+	return out
+}
+
+func (s goldenScenario) corpusCase() corpusCase {
+	return corpusCase{Seed: s.Seed, Installed: fromGoldenSpecs(s.Installed), Available: fromGoldenSpecs(s.Available), Target: s.Target, Mode: s.Mode, DBOnly: s.DBOnly}
+}
+
+func toGoldenScenario(name string, c corpusCase) goldenScenario {
+	return goldenScenario{Name: name, Seed: c.Seed, Installed: toGoldenSpecs(c.Installed), Available: toGoldenSpecs(c.Available), Target: c.Target, Mode: c.Mode, DBOnly: c.DBOnly}
+}
+
+// goldenExtras returns hand-written scenarios that the generated ones rarely
+// cover: failures after some packages were installed, replacements with
+// dependents, and selection quirks.
+func goldenExtras() map[string]corpusCase {
+	return map[string]corpusCase{
+		"dependency installed before a later dependency fails to resolve": {
+			Target: "A",
+			Available: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"B": "1", "Z": "1"}},
+				{Name: "B", Arch: "noarch", Version: "1"},
+			},
+		},
+		"dependency installed before the next one's reverse conflict fails": {
+			Target:    "A",
+			Mode:      ConflictError,
+			Installed: []goolib.PkgSpec{{Name: "X", Arch: "noarch", Version: "1", Conflicts: []string{"C"}}},
+			Available: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"B": "1", "C": "1"}},
+				{Name: "B", Arch: "noarch", Version: "1"},
+				{Name: "C", Arch: "noarch", Version: "1"},
+			},
+		},
+		"dependency installs a row that a Replaces entry doesn't remove": {
+			Target:    "R",
+			Installed: []goolib.PkgSpec{{Name: "P", Arch: "noarch", Version: "1"}},
+			Available: []goolib.PkgSpec{
+				{Name: "P", Arch: "x86_64", Version: "1"},
+				{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"P"}, Replaces: []string{"P.noarch"}, PkgDependencies: map[string]string{"P.x86_64": "1"}},
+			},
+		},
+		"replacement removes dependents first": {
+			Target: "R",
+			Installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+				{Name: "E", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"D": "1"}},
+			},
+			Available: []goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}, Provides: []string{"P=1"}}},
+		},
+		"replacement in a dependency's step": {
+			Target:    "A",
+			Installed: []goolib.PkgSpec{{Name: "P", Arch: "noarch", Version: "1"}},
+			Available: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"R": "1"}},
+				{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}},
+			},
+		},
+		"replaced package selected again after its dependents": {
+			Target: "R",
+			DBOnly: true,
+			Installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "P", Arch: "x86_64", Version: "3", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			Available: []goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P..2"}}},
+		},
+		"replacement in a dependency cycle": {
+			Target: "R",
+			Installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"D": "1"}},
+				{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			Available: []goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}},
+		},
+		"lock state sees an earlier step": {
+			Target: "T",
+			Available: []goolib.PkgSpec{
+				{Name: "T", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"aAb": "1", "a_b": "1"}},
+				{Name: "aAb", Arch: "x86_64", Version: "1", LockArch: true},
+				{Name: "a_b", Arch: "noarch", Version: "1", LockArch: true},
+				{Name: "a_b", Arch: "x86_64", Version: "1", LockArch: true},
+			},
+		},
+		"reverse conflict warning and upgrade": {
+			Target: "A",
+			Installed: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1"},
+				{Name: "X", Arch: "noarch", Version: "1", Conflicts: []string{"A"}},
+			},
+			Available: []goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "2"}},
+		},
+	}
+}
+
+// goldenScenarios returns every scenario goldenFile records, in file order.
+func goldenScenarios() []goldenScenario {
+	var out []goldenScenario
+	for seed := uint64(1); seed <= goldenSeeds; seed++ {
+		out = append(out, toGoldenScenario("", genCorpusCase(seed)))
+	}
+	extras := goldenExtras()
+	for _, name := range slices.Sorted(maps.Keys(extras)) {
+		out = append(out, toGoldenScenario(name, extras[name]))
+	}
+	return out
+}
+
+// TestGoldenInstalls checks that FromRepo still does, for every recorded
+// scenario, what it did when the scenario was recorded: the same error, the
+// same installed packages afterwards, the same install and removal order, and
+// the same resolution log lines and console messages.
+func TestGoldenInstalls(t *testing.T) {
+	if *updateGolden {
+		var lines []string
+		for _, s := range goldenScenarios() {
+			c := s.corpusCase()
+			b, err := json.Marshal(goldenCase{Scenario: s, Trace: runLive(t, c, newRelFixture(t, c.Installed, c.Available))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines = append(lines, string(b))
+		}
+		if err := os.MkdirAll(filepath.Dir(goldenFile), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(goldenFile, []byte("[\n"+strings.Join(lines, ",\n")+"\n]\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("wrote %d scenarios to %s", len(lines), goldenFile)
+		return
+	}
+	b, err := os.ReadFile(goldenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []goldenCase
+	if err := json.Unmarshal(b, &cases); err != nil {
+		t.Fatal(err)
+	}
+	if want := len(goldenScenarios()); len(cases) != want {
+		t.Fatalf("%s has %d scenarios, want %d", goldenFile, len(cases), want)
+	}
+	// FromRepo now plans an install completely before changing anything, so
+	// an install that fails while it is planned no longer leaves the
+	// dependencies it installed before the failure, or the packages it
+	// removed. These recorded scenarios did.
+	wantFlipped := []string{
+		"dependency installed before a later dependency fails to resolve",
+		"dependency installed before the next one's reverse conflict fails",
+		"dependency installs a row that a Replaces entry doesn't remove",
+	}
+	wantMultiArchVictimFlips := []string{
+		"replaced package selected again after its dependents",
+		"seed 113",
+		"seed 45",
+		"seed 62",
+	}
+	wantOrphanPolicyFlips := []string{
+		"replacement in a dependency cycle",
+		"replacement removes dependents first",
+		"seed 113",
+		"seed 88",
+		"seed 91",
+	}
+	wantReverseReplacesFlips := []string{
+		"seed 102",
+		"seed 103",
+		"seed 21",
+		"seed 5",
+		"seed 96",
+	}
+	var flipped, multiArchFlipped, orphanPolicyFlipped, reverseReplacesFlipped []string
+	for _, gc := range cases {
+		c := gc.Scenario.corpusCase()
+		want := gc.Trace
+		if want.Err != "" {
+			before := initialNames(c)
+			if len(want.Installs) > 0 || len(want.Removed) > 0 || !slices.Equal(want.Final, before) {
+				flipped = append(flipped, gc.Scenario.Name)
+			}
+			want.Installs, want.Removed, want.Final = nil, nil, before
+		}
+		if adjusted, ok := applyMultiArchVictimFlip(gc.Scenario, want); ok {
+			id := gc.Scenario.Name
+			if id == "" {
+				id = fmt.Sprintf("seed %d", gc.Scenario.Seed)
+			}
+			multiArchFlipped = append(multiArchFlipped, id)
+			want = adjusted
+		}
+		if adjusted, ok := applyOrphanPolicyFlip(gc.Scenario, c, want); ok {
+			id := gc.Scenario.Name
+			if id == "" {
+				id = fmt.Sprintf("seed %d", gc.Scenario.Seed)
+			}
+			orphanPolicyFlipped = append(orphanPolicyFlipped, id)
+			want = adjusted
+		}
+		if adjusted, ok := applyReverseReplacesFlip(gc.Scenario, want); ok {
+			reverseReplacesFlipped = append(reverseReplacesFlipped, fmt.Sprintf("seed %d", gc.Scenario.Seed))
+			want = adjusted
+		}
+		got := runLive(t, c, newRelFixture(t, c.Installed, c.Available))
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("scenario %q seed %d: FromRepo differs from the recording (-recorded +now):\n%s", gc.Scenario.Name, gc.Scenario.Seed, diff)
+		}
+	}
+	slices.Sort(flipped)
+	if diff := cmp.Diff(wantFlipped, flipped); diff != "" {
+		t.Errorf("recorded failures that changed packages before failing (-want +got):\n%s", diff)
+	}
+	slices.Sort(multiArchFlipped)
+	if diff := cmp.Diff(wantMultiArchVictimFlips, multiArchFlipped); diff != "" {
+		t.Errorf("multi-arch victim scenarios flipped (-want +got):\n%s", diff)
+	}
+	slices.Sort(orphanPolicyFlipped)
+	if diff := cmp.Diff(wantOrphanPolicyFlips, orphanPolicyFlipped); diff != "" {
+		t.Errorf("orphan-policy scenarios flipped (-want +got):\n%s", diff)
+	}
+	slices.Sort(reverseReplacesFlipped)
+	if diff := cmp.Diff(wantReverseReplacesFlips, reverseReplacesFlipped); diff != "" {
+		t.Errorf("reverse Replaces scenarios flipped (-want +got):\n%s", diff)
+	}
+}
+
+// applyReverseReplacesFlip returns the updated trace expected now that
+// installing a package that an installed package's Replaces entry names logs
+// a structured package_conflict line with direction=reverse_replaces in every
+// conflict mode, and prints a warning in warn mode.
+func applyReverseReplacesFlip(s goldenScenario, t trace) (trace, bool) {
+	if s.Name != "" {
+		return t, false
+	}
+	type insertion struct{ after, line string }
+	var ins []insertion
+	switch s.Seed {
+	case 5:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for noarch C version 2",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=A.noarch.2 entry="C..2" incoming=C.noarch.2`}}
+	case 21:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for noarch C version 2",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=P.noarch.2 entry="C" incoming=C.noarch.2`}}
+	case 96:
+		ins = []insertion{
+			{"INFO: Resolving conflicts and dependencies for noarch D version 3",
+				`WARN: package_conflict direction=reverse_replaces mode=warn result=warned installed=B.noarch.2 entry="D" incoming=D.noarch.3`},
+			{"STDOUT: Installing D.noarch.3 and dependencies...",
+				`STDOUT: Warning: installed package B.noarch.2 replaces D.noarch.3 (entry "D"); installing anyway (package_conflicts=warn)`},
+		}
+	case 102:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for x86_64 P version 2",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=C.x86_64.2 entry="P" incoming=P.x86_64.2`}}
+	case 103:
+		ins = []insertion{{"INFO: Resolving conflicts and dependencies for noarch D version 3",
+			`INFO: package_conflict direction=reverse_replaces mode=ignore result=ignored installed=Q.x86_64.2 entry="D" incoming=D.noarch.3`}}
+	default:
+		return t, false
+	}
+	events := slices.Clone(t.Events)
+	for _, in := range ins {
+		// A missing anchor appends the line at the end, so the comparison
+		// with what FromRepo does now fails and shows where it went.
+		at := len(events)
+		if i := slices.Index(events, in.after); i >= 0 {
+			at = i + 1
+		}
+		events = slices.Insert(events, at, in.line)
+	}
+	t.Events = events
+	return t, true
+}
+
+// applyOrphanPolicyFlip returns the updated trace expected now that
+// replacements keep dependents that remain satisfied and fail cleanly under
+// default OrphanFail when removing a replaced package would newly break an
+// installed name-based dependent.
+func applyOrphanPolicyFlip(s goldenScenario, c corpusCase, t trace) (trace, bool) {
+	switch {
+	case s.Name == "replacement removes dependents first":
+		// R provides P=1, so D and E remain satisfied and stay installed.
+		t.Final = []string{"D.noarch.1", "E.noarch.1", "R.noarch.1"}
+		t.Removed = []string{`"P"`}
+		return t, true
+	case s.Name == "replacement in a dependency cycle":
+		// Under default OrphanFail, replacing P reports D as an unsatisfied
+		// dependent before changing anything.
+		t.Err = "replacing would leave installed packages with an unsatisfied dependency: D.noarch.1 (requires P >= 1, broken by removing P.noarch.1 for R.noarch.1) (evaluated at each replacement step before later packages in the same run are installed)"
+		return t, true
+	case s.Name == "" && s.Seed == 88:
+		// A.x86_64.2 requires C >= 3, which C.noarch.1 never satisfied, so
+		// removing C.noarch.1 does not newly break A.x86_64.2.
+		t.Final = []string{"A.x86_64.2", "B.noarch.3", "B.x86_64.2", "P.x86_64.2"}
+		t.Removed = []string{`"C"`}
+		return t, true
+	case s.Name == "" && s.Seed == 91:
+		// Remaining Q.noarch.2 provides P=3, keeping B.noarch.1 and D.x86_64.1
+		// satisfied when P.noarch.2 is replaced.
+		t.Final = []string{"A.x86_64.1", "B.noarch.1", "C.x86_64.2", "D.noarch.1", "D.x86_64.1", "Q.noarch.2", "Q.x86_64.1", "x.y.noarch.2"}
+		t.Removed = []string{`"P"`}
+		return t, true
+	case s.Name == "" && s.Seed == 113:
+		// Removing Q.noarch.2 breaks P.x86_64.1 (requires Q >= 2), so default
+		// OrphanFail refuses the replacement before changing anything.
+		t.Err = "replacing would leave installed packages with an unsatisfied dependency: P.x86_64.1 (requires Q >= 2, broken by removing Q.noarch.2 for A.noarch.3) (evaluated at each replacement step before later packages in the same run are installed)"
+		t.Installs = nil
+		t.Removed = nil
+		t.Final = initialNames(c)
+		return t, true
+	default:
+		return t, false
+	}
+}
+
+// applyMultiArchVictimFlip returns the updated trace expected now that Replaces
+// resolves every qualifying architecture row and uninstalls concrete gated rows
+// without re-picking by name after removing dependents.
+func applyMultiArchVictimFlip(s goldenScenario, t trace) (trace, bool) {
+	switch {
+	case s.Name == "replaced package selected again after its dependents":
+		t.Final = []string{"P.noarch.1", "R.noarch.1"}
+		t.Removed = []string{`"P"`}
+		return t, true
+	case s.Name == "" && s.Seed == 45:
+		t.Final = slices.DeleteFunc(slices.Clone(t.Final), func(p string) bool { return p == "P.x86_64.1" })
+		t.Removed = append(slices.Clone(t.Removed), `"P"`)
+		return t, true
+	case s.Name == "" && s.Seed == 62:
+		t.Final = slices.DeleteFunc(slices.Clone(t.Final), func(p string) bool { return p == "D.x86_64.2" })
+		t.Removed = append(slices.Clone(t.Removed), `"D"`)
+		return t, true
+	case s.Name == "" && s.Seed == 113:
+		t.Final = slices.DeleteFunc(slices.Clone(t.Final), func(p string) bool { return p == "Q.x86_64.1" })
+		t.Removed = append(slices.Clone(t.Removed), `"Q"`)
+		return t, true
+	default:
+		return t, false
+	}
+}
+
+// initialNames returns name.arch.version for each package c installs before
+// the run, sorted, as trace.Final lists them.
+func initialNames(c corpusCase) []string {
+	var out []string
+	for _, ps := range c.Installed {
+		out = append(out, ps.String())
+	}
+	slices.Sort(out)
+	return out
+}

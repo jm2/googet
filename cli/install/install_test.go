@@ -15,14 +15,29 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/install"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
-	"github.com/google/logger"
 )
+
+// newTestInstaller constructs an installer configured from current settings
+// using the same policy resolution path as installCmd.Execute.
+func newTestInstaller(db *googetdb.GooDB, cache string, downloader *client.Downloader, shouldReinstall, dryRun bool) *installer {
+	var flags policy.Flags
+	return &installer{
+		db:              db,
+		cache:           cache,
+		downloader:      downloader,
+		pkgInstaller:    install.New(cache, db, flags.Options(false, false)),
+		shouldReinstall: shouldReinstall,
+		dryRun:          dryRun,
+	}
+}
 
 // checkInstalled returns true if the test package identified by ps was
 // installed, based on whether or not the package file was written.
@@ -43,15 +58,16 @@ func checkInstalled(t *testing.T, dir string, ps goolib.PkgSpec) bool {
 }
 
 func TestInstall(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	for _, tc := range []struct {
-		desc            string             // description of test case
-		args            []string           // args to install command
-		state           client.GooGetState // initial DB package state
-		packages        []goolib.PkgSpec   // which packages to provide in repo map
-		shouldReinstall bool               // whether to reinstall
-		wantInstalled   []string           // which packages were actually installed
-		wantState       []string           // abbreviated final DB package state
+		desc               string             // Description of test case.
+		args               []string           // Args to install command.
+		state              client.GooGetState // Initial DB package state.
+		packages           []goolib.PkgSpec   // Packages provided in repo map.
+		shouldReinstall    bool               // Whether to reinstall.
+		orphanedDependents string             // Optional orphaneddependents setting.
+		wantErr            string             // Expected substring in installFromRepo error.
+		wantInstalled      []string           // Packages actually installed.
+		wantState          []string           // Abbreviated final DB package state.
 	}{
 		{
 			desc: "single-install",
@@ -129,8 +145,24 @@ func TestInstall(t *testing.T) {
 			wantState:     []string{"B.noarch.2"},
 		},
 		{
-			desc: "remove-replaced-package-with-deps",
+			desc: "fail-on-orphaned-dependent-by-default",
 			args: []string{"B"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "5"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "5"},
+				{Name: "B", Arch: "noarch", Version: "2", Replaces: []string{"A.noarch.3"}},
+				{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}},
+			},
+			wantErr:   "replacing would leave installed packages with an unsatisfied dependency",
+			wantState: []string{"A.noarch.5", "C.noarch.3"},
+		},
+		{
+			desc:               "remove-replaced-package-with-deps",
+			args:               []string{"B"},
+			orphanedDependents: "remove",
 			state: client.GooGetState{
 				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "5"}},
 				{PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}}},
@@ -143,10 +175,57 @@ func TestInstall(t *testing.T) {
 			wantInstalled: []string{"B.noarch.2"},
 			wantState:     []string{"B.noarch.2"},
 		},
+		{
+			desc: "keep-dependent-satisfied-by-replacer-provides",
+			args: []string{"B"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "5"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "5"},
+				{Name: "B", Arch: "noarch", Version: "2", Replaces: []string{"A.noarch.3"}, Provides: []string{"A=5"}},
+				{Name: "C", Arch: "noarch", Version: "3", PkgDependencies: map[string]string{"A": "5"}},
+			},
+			wantInstalled: []string{"B.noarch.2"},
+			wantState:     []string{"B.noarch.2", "C.noarch.3"},
+		},
+		{
+			desc: "install-dep-satisfied-by-provider",
+			args: []string{"A"},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"virt": "0.0.0"}},
+				{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}},
+			},
+			wantInstalled: []string{"A.noarch.1", "B.noarch.2"},
+			wantState:     []string{"A.noarch.1", "B.noarch.2"},
+		},
+		{
+			desc: "install-by-provided-name",
+			args: []string{"virt"},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}},
+			},
+			wantInstalled: []string{"B.noarch.2"},
+			wantState:     []string{"B.noarch.2"},
+		},
+		{
+			desc: "no-reinstall-by-provided-name-when-provider-installed",
+			args: []string{"virt"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}},
+			},
+			wantState: []string{"B.noarch.2"},
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			// Set up the installer.
+			t.Cleanup(settings.Snapshot())
 			settings.Initialize(t.TempDir(), false)
+			settings.OrphanedDependents = tc.orphanedDependents
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -156,12 +235,7 @@ func TestInstall(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDownloader: %v", err)
 			}
-			i := installer{
-				db:              db,
-				cache:           t.TempDir(),
-				downloader:      downloader,
-				shouldReinstall: tc.shouldReinstall,
-			}
+			i := newTestInstaller(db, t.TempDir(), downloader, tc.shouldReinstall, false)
 			// Set up the test server.
 			gooDir, logDir := t.TempDir(), t.TempDir()
 			srv := testutil.ServeGoo(t, gooDir)
@@ -198,7 +272,14 @@ func TestInstall(t *testing.T) {
 			// Install everything.
 			archs := []string{"noarch"}
 			for _, arg := range tc.args {
-				if err := i.installFromRepo(context.Background(), arg, archs); err != nil {
+				err := i.installFromRepo(context.Background(), arg, archs)
+				if tc.wantErr != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+						t.Fatalf("installFromRepo = %v, want error containing %q", err, tc.wantErr)
+					}
+					continue
+				}
+				if err != nil {
 					t.Fatalf("installFromRepo: %v", err)
 				}
 			}
@@ -239,7 +320,6 @@ func captureStdout(f func()) string {
 }
 
 func TestInstallDryRun(t *testing.T) {
-	logger.Init("GooGet", true, false, io.Discard)
 	ctx := context.Background()
 	settings.Archs = []string{"noarch", "x86_64"}
 
@@ -262,7 +342,7 @@ func TestInstallDryRun(t *testing.T) {
 				"A.noarch.1.0.0",
 				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
 			},
-			notStrs: []string{"Installing "},
+			notStrs: []string{"Installing ", "Note: selecting"},
 		},
 		{
 			desc: "package already installed",
@@ -290,6 +370,62 @@ func TestInstallDryRun(t *testing.T) {
 				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
 			},
 		},
+		{
+			desc: "dependency satisfied by provider",
+			args: []string{"A"},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1.0.0", PkgDependencies: map[string]string{"virt": "0.0.0"}},
+				{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}},
+			},
+			wantStrs: []string{
+				"The following packages will be installed:",
+				"A.noarch.1.0.0",
+				"B.noarch.2.0.0",
+				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
+			},
+		},
+		{
+			desc: "dependency satisfied by versioned provides",
+			args: []string{"A"},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1.0.0", PkgDependencies: map[string]string{"virt": "3.0.0"}},
+				{Name: "B", Arch: "noarch", Version: "1.0.0", Provides: []string{"virt=5.0.0"}},
+			},
+			wantStrs: []string{
+				"The following packages will be installed:",
+				"A.noarch.1.0.0",
+				"B.noarch.1.0.0",
+				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
+			},
+		},
+		{
+			desc: "provided name",
+			args: []string{"virt"},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}},
+			},
+			wantStrs: []string{
+				"Note: selecting B.noarch.2.0.0, which provides virt",
+				"The following packages will be installed:",
+				"B.noarch.2.0.0",
+				"Dry run: Would install B.noarch.2.0.0 and its dependencies if not already installed.",
+			},
+		},
+		{
+			desc: "provided name, provider already installed",
+			args: []string{"virt"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}},
+			},
+			wantStrs: []string{
+				"Note: selecting B.noarch.2.0.0, which provides virt",
+				"B.noarch.2.0.0 or a newer version is already installed",
+			},
+			notStrs: []string{"The following packages will be installed:"},
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			settings.Initialize(t.TempDir(), false)
@@ -305,12 +441,7 @@ func TestInstallDryRun(t *testing.T) {
 			initialState, _ := db.FetchPkgs("")
 
 			downloader, _ := client.NewDownloader("")
-			i := &installer{
-				db:         db,
-				cache:      t.TempDir(),
-				downloader: downloader,
-				dryRun:     true,
-			}
+			i := newTestInstaller(db, t.TempDir(), downloader, false, true)
 
 			gooDir, logDir := t.TempDir(), t.TempDir()
 			srv := testutil.ServeGoo(t, gooDir)

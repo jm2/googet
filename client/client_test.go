@@ -42,7 +42,7 @@ const (
 )
 
 func init() {
-	logger.Init("test", true, false, ioutil.Discard)
+	logger.Init("test", true, false, &testLogs)
 }
 
 func TestAppend(t *testing.T) {
@@ -823,6 +823,143 @@ func TestFindRepoLatest_LockArch(t *testing.T) {
 			}
 			if spec.Arch != tt.wantArch {
 				t.Errorf("got arch %q, want %q", spec.Arch, tt.wantArch)
+			}
+		})
+	}
+}
+
+// TestFindRepoLatestSelectionOrder pins, with explicit expectations, how
+// FindRepoLatest ranks candidates: repository priority first, then version,
+// then arch preference, then repository URL; LockArch can skip a candidate;
+// providers count only when no package of the requested name qualifies; and
+// a parseable version ranks before an unparseable one.
+func TestFindRepoLatestSelectionOrder(t *testing.T) {
+	ps := func(name, arch, ver string, opts ...func(*goolib.PkgSpec)) goolib.RepoSpec {
+		s := &goolib.PkgSpec{Name: name, Arch: arch, Version: ver}
+		for _, o := range opts {
+			o(s)
+		}
+		return goolib.RepoSpec{PackageSpec: s}
+	}
+	lock := func(s *goolib.PkgSpec) { s.LockArch = true }
+	provP := func(s *goolib.PkgSpec) { s.Provides = []string{"P"} }
+	repo := func(prio priority.Value, specs ...goolib.RepoSpec) Repo { return Repo{Priority: prio, Packages: specs} }
+	for _, tc := range []struct {
+		desc          string
+		pi            goolib.PackageInfo
+		archs         []string
+		installedArch string
+		isLocked      bool
+		rm            RepoMap
+		want          string
+		wantRepo      string
+		wantErr       bool
+	}{
+		{
+			desc:     "higher priority beats higher version",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"noarch"},
+			rm:       RepoMap{"https://a": repo(500, ps("P", "noarch", "2.0.0")), "https://b": repo(1000, ps("P", "noarch", "1.0.0"))},
+			want:     "P.noarch.1.0.0",
+			wantRepo: "https://b",
+		},
+		{
+			desc:     "higher version wins at equal priority",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"noarch"},
+			rm:       RepoMap{"https://a": repo(500, ps("P", "noarch", "1.0.0"), ps("P", "noarch", "2.0.0"))},
+			want:     "P.noarch.2.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:     "earlier arch in archs wins at equal priority and version",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"x86_64", "noarch"},
+			rm:       RepoMap{"https://a": repo(500, ps("P", "noarch", "1.0.0"), ps("P", "x86_64", "1.0.0"))},
+			want:     "P.x86_64.1.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:     "smaller repository URL wins an exact tie",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"noarch"},
+			rm:       RepoMap{"https://b": repo(500, ps("P", "noarch", "1.0.0")), "https://a": repo(500, ps("P", "noarch", "1.0.0"))},
+			want:     "P.noarch.1.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:          "locked install skips a candidate that locks another arch",
+			pi:            goolib.PackageInfo{Name: "P"},
+			archs:         []string{"noarch", "x86_64"},
+			installedArch: "x86_64",
+			isLocked:      true,
+			rm:            RepoMap{"https://a": repo(500, ps("P", "noarch", "2.0.0", lock), ps("P", "x86_64", "1.0.0"))},
+			want:          "P.x86_64.1.0.0",
+			wantRepo:      "https://a",
+		},
+		{
+			desc:          "locked install moves to another arch that doesn't lock",
+			pi:            goolib.PackageInfo{Name: "P"},
+			archs:         []string{"noarch", "x86_64"},
+			installedArch: "x86_64",
+			isLocked:      true,
+			rm:            RepoMap{"https://a": repo(500, ps("P", "noarch", "2.0.0"), ps("P", "x86_64", "1.0.0"))},
+			want:          "P.noarch.2.0.0",
+			wantRepo:      "https://a",
+		},
+		{
+			desc:     "a package of the requested name beats a higher-ranked provider",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"noarch"},
+			rm:       RepoMap{"https://a": repo(500, ps("P", "noarch", "1.0.0")), "https://b": repo(1000, ps("Q", "noarch", "3.0.0", provP))},
+			want:     "P.noarch.1.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:     "the best provider is used when no package of the requested name is offered",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"noarch"},
+			rm:       RepoMap{"https://a": repo(500, ps("Q", "noarch", "3.0.0", provP), ps("R", "noarch", "2.0.0", provP))},
+			want:     "Q.noarch.3.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:     "a parseable version ranks before an unparseable one",
+			pi:       goolib.PackageInfo{Name: "P"},
+			archs:    []string{"noarch"},
+			rm:       RepoMap{"https://a": repo(500, ps("P", "noarch", "bad"), ps("P", "noarch", "1.0.0"))},
+			want:     "P.noarch.1.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:     "an arch in the request restricts the candidates to it",
+			pi:       goolib.PackageInfo{Name: "P", Arch: "x86_64"},
+			archs:    []string{"noarch", "x86_64"},
+			rm:       RepoMap{"https://a": repo(500, ps("P", "noarch", "2.0.0"), ps("P", "x86_64", "1.0.0"))},
+			want:     "P.x86_64.1.0.0",
+			wantRepo: "https://a",
+		},
+		{
+			desc:    "an arch outside archs is never chosen",
+			pi:      goolib.PackageInfo{Name: "P"},
+			archs:   []string{"noarch"},
+			rm:      RepoMap{"https://a": repo(500, ps("P", "x86_64", "1.0.0"))},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			spec, repoURL, arch, err := FindRepoLatest(tc.pi, tc.rm, tc.archs, tc.installedArch, tc.isLocked)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("FindRepoLatest = %v from %s, want an error", spec, repoURL)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FindRepoLatest: %v", err)
+			}
+			if spec.String() != tc.want || repoURL != tc.wantRepo || arch != spec.Arch {
+				t.Errorf("FindRepoLatest = (%s, %q, %q), want (%s, %q, %q)", spec, repoURL, arch, tc.want, tc.wantRepo, spec.Arch)
 			}
 		})
 	}
