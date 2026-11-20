@@ -14,6 +14,7 @@ limitations under the License.
 package install
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,17 +104,11 @@ func TestListDepsListsEachPackageOnce(t *testing.T) {
 	}
 }
 
-// TestCharacterizeReplaceCycleWithoutArch pins that replacing a package that
-// is in a dependency cycle fails, removing nothing, when the Replaces entry
-// doesn't name an arch. The replace path enumerates dependents under the
-// arch-less key "P.", while the cycle comes back to P under "P.noarch", so
-// the cycle isn't recognised as passing through the package being replaced.
-//
-// Known wrong: a fix should resolve P to its installed arch first, so that D
-// is removed and then P, as googet remove P does.
-//
-// TODO: flip this when the replace path resolves victims to installed rows
-// (planned with the dependent-aware replace).
+// TestCharacterizeReplaceCycleWithoutArch checks that replacing a package in a
+// mutual dependency cycle with an arch-less Replaces entry resolves P to its
+// concrete installed row: under default OrphanFail it reports D as an orphaned
+// dependent without changing anything, and under OrphanRemove it breaks the
+// root cycle to remove D and then P before installing R.
 func TestCharacterizeReplaceCycleWithoutArch(t *testing.T) {
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{
@@ -122,10 +117,16 @@ func TestCharacterizeReplaceCycleWithoutArch(t *testing.T) {
 		},
 		[]goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}})
 	err := f.install(t, "R")
-	if want := "D.noarch, P.noarch"; err == nil || !strings.Contains(err.Error(), want) {
-		t.Fatalf("install R = %v, want a cycle error naming %q", err, want)
+	if !errors.Is(err, ErrOrphanedDependents) || !strings.Contains(err.Error(), "D.noarch.1 (requires P >= 1") {
+		t.Fatalf("install R (default OrphanFail) = %v, want ErrOrphanedDependents naming D.noarch.1", err)
 	}
 	if diff := cmp.Diff([]string{"D.noarch.1", "P.noarch.1"}, f.installed(t)); diff != "" {
-		t.Errorf("installed packages (-want +got):\n%s", diff)
+		t.Errorf("installed packages after blocked replace (-want +got):\n%s", diff)
+	}
+	if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
+		t.Fatalf("install R (OrphanRemove): %v", err)
+	}
+	if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {
+		t.Errorf("installed packages after OrphanRemove replace (-want +got):\n%s", diff)
 	}
 }

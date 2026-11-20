@@ -14,16 +14,19 @@ limitations under the License.
 package install
 
 import (
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/goolib"
 )
 
-// TestReplaceRemovesDottedDependent checks that replacing a package removes a
-// dependent whose name contains a dot, leaves alone an unrelated package named
-// after the dotted name's first segment, and that the replacement simulation
-// predicts the same result.
+// TestReplaceRemovesDottedDependent checks that replacing a package reports a
+// dotted-name dependent under default OrphanFail, removes it under
+// OrphanRemove while leaving alone an unrelated package named after the dotted
+// name's first segment, and that the replacement simulation predicts the same
+// result.
 func TestReplaceRemovesDottedDependent(t *testing.T) {
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{
@@ -49,8 +52,11 @@ func TestReplaceRemovesDottedDependent(t *testing.T) {
 		t.Errorf("simulated state after replacing P (-want +got):\n%s", diff)
 	}
 
-	if err := f.install(t, "R"); err != nil {
-		t.Fatalf("install R: %v", err)
+	if err := f.install(t, "R"); !errors.Is(err, ErrOrphanedDependents) || !strings.Contains(err.Error(), "foo.bar.noarch.1") || strings.Contains(err.Error(), "foo.noarch.1") {
+		t.Fatalf("install R (default OrphanFail) = %v, want ErrOrphanedDependents naming only foo.bar.noarch.1", err)
+	}
+	if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
+		t.Fatalf("install R (OrphanRemove): %v", err)
 	}
 	if diff := cmp.Diff([]string{"R.noarch.1", "foo.noarch.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages after replace (-want +got):\n%s", diff)

@@ -41,7 +41,7 @@ func TestEachArchiveFetchedOnce(t *testing.T) {
 		})
 	copyFile(t, f.archive(t, "C"), filepath.Join(f.cache, "C.noarch.1.goo"))
 	logs := testutil.CaptureLogs(t)
-	if err := f.install(t, "T"); err != nil {
+	if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "T"); err != nil {
 		t.Fatalf("install T: %v", err)
 	}
 	if diff := cmp.Diff([]string{"C.noarch.1", "D.noarch.1", "E.noarch.1", "T.noarch.1"}, f.installed(t)); diff != "" {

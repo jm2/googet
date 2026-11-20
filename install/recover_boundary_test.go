@@ -192,7 +192,7 @@ func TestRecoveryExactReverseScriptOrderAndStrictConflicts(t *testing.T) {
 		"#!/bin/sh\necho install:R >> \""+orderLog+"\"\nexit 1\n", "")
 	rm := client.RepoMap{srv.URL: client.Repo{Packages: []goolib.RepoSpec{replacer}}}
 
-	err = New(cacheDir, db, Options{StrictConflicts: true}).FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", rm, corpusArchs, downloader)
+	err = New(cacheDir, db, Options{StrictConflicts: true, OrphanedDependents: OrphanRemove}).FromRepo(t.Context(), goolib.PackageInfo{Name: "R"}, "", rm, corpusArchs, downloader)
 	if err == nil || !strings.Contains(err.Error(), "reinstalled the packages that installing R.noarch.1 had removed: P.noarch.1, D.noarch.1, Q.noarch.1, E.noarch.1") {
 		t.Fatalf("FromRepo(R) = %v, want script error with P, D, Q, E reinstalled in reverse removal order", err)
 	}
@@ -225,7 +225,7 @@ func TestRecoveryExactReverseScriptOrderAndStrictConflicts(t *testing.T) {
 		goolib.PkgSpec{Name: "R2", Arch: "noarch", Version: "1", Replaces: []string{"P", "Q"}},
 		"#!/bin/sh\necho install:R2 >> \""+orderLog+"\"\n", "")
 	rm2 := client.RepoMap{srv.URL: client.Repo{Packages: []goolib.RepoSpec{overlapReplacer}}}
-	err = New(cacheDir, db, Options{StrictConflicts: true}).FromRepo(t.Context(), goolib.PackageInfo{Name: "R2"}, "", rm2, corpusArchs, downloader)
+	err = New(cacheDir, db, Options{StrictConflicts: true, OrphanedDependents: OrphanRemove}).FromRepo(t.Context(), goolib.PackageInfo{Name: "R2"}, "", rm2, corpusArchs, downloader)
 	if err == nil || !strings.Contains(err.Error(), "file conflict:") || !strings.Contains(err.Error(), "reinstalled the packages that installing R2.noarch.1 had removed: P.noarch.1, D.noarch.1, Q.noarch.1, E.noarch.1") {
 		t.Fatalf("FromRepo(R2) = %v, want StrictConflicts file-conflict error and full recovery", err)
 	}
@@ -294,7 +294,7 @@ func TestRecoveryBoundaryAcrossAllApplyStages(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := replaceFixture(t, goolib.PkgSpec{})
 			before := f.rows(t)
-			err := f.runWithHook(t, t.Context(), Options{}, "R", func(stage applyStage, step string) error {
+			err := f.runWithHook(t, t.Context(), Options{OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, step string) error {
 				if stage != tc.stage || step != tc.step {
 					return nil
 				}
@@ -484,7 +484,7 @@ func TestPrePhase3StateSchemaCompatibility(t *testing.T) {
 
 	t.Run("after_recovery", func(t *testing.T) {
 		f := replaceFixture(t, goolib.PkgSpec{Install: failingScript})
-		if err := f.install(t, "R"); err == nil {
+		if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err == nil {
 			t.Fatal("install R succeeded, want error")
 		}
 		checkStrictDecode(t, f)
@@ -492,7 +492,7 @@ func TestPrePhase3StateSchemaCompatibility(t *testing.T) {
 
 	t.Run("after_successful_replace_commit", func(t *testing.T) {
 		f := replaceFixture(t, goolib.PkgSpec{})
-		if err := f.install(t, "R"); err != nil {
+		if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
 			t.Fatalf("install R: %v", err)
 		}
 		checkStrictDecode(t, f)
@@ -555,7 +555,7 @@ func TestAllRecoveryReinstallsFailingReportsFailuresCleanly(t *testing.T) {
 		f := replaceFixture(t, goolib.PkgSpec{Install: failingScript})
 		before := f.rows(t)
 		logs := testutil.CaptureLogs(t)
-		err := f.runWithHook(t, t.Context(), Options{}, "R", func(stage applyStage, _ string) error {
+		err := f.runWithHook(t, t.Context(), Options{OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, _ string) error {
 			if stage == stageAfterReplace {
 				for _, name := range []string{"P", "D"} {
 					if writeErr := os.WriteFile(before[name].LocalPath, []byte("corrupt"), 0644); writeErr != nil {
@@ -593,7 +593,7 @@ func TestAllRecoveryReinstallsFailingReportsFailuresCleanly(t *testing.T) {
 	t.Run("db_only_recovery_failure_omits_empty_archive_path", func(t *testing.T) {
 		f := replaceFixture(t, goolib.PkgSpec{})
 		stop := errors.New("stop")
-		err := f.runWithHook(t, t.Context(), Options{DBOnly: true}, "R", func(stage applyStage, _ string) error {
+		err := f.runWithHook(t, t.Context(), Options{DBOnly: true, OrphanedDependents: OrphanRemove}, "R", func(stage applyStage, _ string) error {
 			if stage == stageAfterReplace {
 				if closeErr := f.db.Close(); closeErr != nil {
 					return closeErr

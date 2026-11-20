@@ -239,7 +239,14 @@ func TestGoldenInstalls(t *testing.T) {
 		"seed 45",
 		"seed 62",
 	}
-	var flipped, multiArchFlipped []string
+	wantOrphanPolicyFlips := []string{
+		"replacement in a dependency cycle",
+		"replacement removes dependents first",
+		"seed 113",
+		"seed 88",
+		"seed 91",
+	}
+	var flipped, multiArchFlipped, orphanPolicyFlipped []string
 	for _, gc := range cases {
 		c := gc.Scenario.corpusCase()
 		want := gc.Trace
@@ -258,6 +265,14 @@ func TestGoldenInstalls(t *testing.T) {
 			multiArchFlipped = append(multiArchFlipped, id)
 			want = adjusted
 		}
+		if adjusted, ok := applyOrphanPolicyFlip(gc.Scenario, c, want); ok {
+			id := gc.Scenario.Name
+			if id == "" {
+				id = fmt.Sprintf("seed %d", gc.Scenario.Seed)
+			}
+			orphanPolicyFlipped = append(orphanPolicyFlipped, id)
+			want = adjusted
+		}
 		got := runLive(t, c, newRelFixture(t, c.Installed, c.Available))
 		if diff := cmp.Diff(want, got); diff != "" {
 			t.Errorf("scenario %q seed %d: FromRepo differs from the recording (-recorded +now):\n%s", gc.Scenario.Name, gc.Scenario.Seed, diff)
@@ -270,6 +285,51 @@ func TestGoldenInstalls(t *testing.T) {
 	slices.Sort(multiArchFlipped)
 	if diff := cmp.Diff(wantMultiArchVictimFlips, multiArchFlipped); diff != "" {
 		t.Errorf("multi-arch victim scenarios flipped (-want +got):\n%s", diff)
+	}
+	slices.Sort(orphanPolicyFlipped)
+	if diff := cmp.Diff(wantOrphanPolicyFlips, orphanPolicyFlipped); diff != "" {
+		t.Errorf("orphan-policy scenarios flipped (-want +got):\n%s", diff)
+	}
+}
+
+// applyOrphanPolicyFlip returns the updated trace expected now that
+// replacements keep dependents that remain satisfied and fail cleanly under
+// default OrphanFail when removing a replaced package would newly break an
+// installed name-based dependent.
+func applyOrphanPolicyFlip(s goldenScenario, c corpusCase, t trace) (trace, bool) {
+	switch {
+	case s.Name == "replacement removes dependents first":
+		// R provides P=1, so D and E remain satisfied and stay installed.
+		t.Final = []string{"D.noarch.1", "E.noarch.1", "R.noarch.1"}
+		t.Removed = []string{`"P"`}
+		return t, true
+	case s.Name == "replacement in a dependency cycle":
+		// Under default OrphanFail, replacing P reports D as an unsatisfied
+		// dependent before changing anything.
+		t.Err = "replacing would leave installed packages with an unsatisfied dependency: D.noarch.1 (requires P >= 1, broken by removing P.noarch.1 for R.noarch.1) (evaluated at each replacement step before later packages in the same run are installed)"
+		return t, true
+	case s.Name == "" && s.Seed == 88:
+		// A.x86_64.2 requires C >= 3, which C.noarch.1 never satisfied, so
+		// removing C.noarch.1 does not newly break A.x86_64.2.
+		t.Final = []string{"A.x86_64.2", "B.noarch.3", "B.x86_64.2", "P.x86_64.2"}
+		t.Removed = []string{`"C"`}
+		return t, true
+	case s.Name == "" && s.Seed == 91:
+		// Remaining Q.noarch.2 provides P=3, keeping B.noarch.1 and D.x86_64.1
+		// satisfied when P.noarch.2 is replaced.
+		t.Final = []string{"A.x86_64.1", "B.noarch.1", "C.x86_64.2", "D.noarch.1", "D.x86_64.1", "Q.noarch.2", "Q.x86_64.1", "x.y.noarch.2"}
+		t.Removed = []string{`"P"`}
+		return t, true
+	case s.Name == "" && s.Seed == 113:
+		// Removing Q.noarch.2 breaks P.x86_64.1 (requires Q >= 2), so default
+		// OrphanFail refuses the replacement before changing anything.
+		t.Err = "replacing would leave installed packages with an unsatisfied dependency: P.x86_64.1 (requires Q >= 2, broken by removing Q.noarch.2 for A.noarch.3) (evaluated at each replacement step before later packages in the same run are installed)"
+		t.Installs = nil
+		t.Removed = nil
+		t.Final = initialNames(c)
+		return t, true
+	default:
+		return t, false
 	}
 }
 

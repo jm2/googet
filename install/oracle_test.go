@@ -195,19 +195,19 @@ func minInstalledRow(r relation.Requirement, db *googetdb.GooDB) (client.Package
 }
 
 // resolveReplacements removes the concrete installed rows that ps replaces,
-// along with their dependent cascades ordered via remove.OrderSet, executing
-// against db via remove.UninstallRow.
+// along with their cascaded name-based orphans ordered via remove.OrderSet,
+// executing against db via remove.UninstallRow.
 func (ri *repoInstall) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec) error {
 	db := ri.db
 	state, err := db.FetchPkgs("")
 	if err != nil {
 		return err
 	}
-	_, removed, err := replaceRows(ps, state)
+	out, err := planReplacement(ps, state)
 	if err != nil {
 		return err
 	}
-	for _, row := range removed {
+	for _, row := range out.removed {
 		logger.Infof("%s replaces %s, removing", ps, row.PackageSpec)
 		if err := remove.UninstallRow(ctx, row, remove.Options{DBOnly: ri.opts.DBOnly, Downloader: ri.downloader}, db); err != nil {
 			return err

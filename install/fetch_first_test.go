@@ -197,6 +197,20 @@ func TestPlanningFailureChangesNothing(t *testing.T) {
 			wantLog:   "ERROR: package_conflict direction=reverse mode=error result=failed installed=X.noarch.1",
 		},
 		{
+			name: "orphaned dependent in default fail mode",
+			installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			available: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "1"},
+				{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}, PkgDependencies: map[string]string{"B": "1"}},
+			},
+			target:    "R",
+			wantErr:   "D.noarch.1 (requires P >= 1, broken by removing P.noarch.1 for R.noarch.1)",
+			wantErrIs: ErrOrphanedDependents,
+		},
+		{
 			name: "replacement whose dependents form a cycle",
 			installed: []goolib.PkgSpec{
 				{Name: "P", Arch: "noarch", Version: "1"},
@@ -260,6 +274,7 @@ func TestFetchFailureLeavesOnlyVerifiedArchives(t *testing.T) {
 		name      string
 		installed []goolib.PkgSpec
 		available []goolib.PkgSpec
+		opts      Options
 		sabotage  func(t *testing.T, f *relFixture)
 		wantErr   string
 		// partial lists the empty files a failed download leaves in the
@@ -323,6 +338,7 @@ func TestFetchFailureLeavesOnlyVerifiedArchives(t *testing.T) {
 				{Name: "T", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"D": "1"}, Replaces: []string{"P"}},
 				{Name: "D", Arch: "noarch", Version: "1"},
 			},
+			opts: Options{OrphanedDependents: OrphanRemove},
 			sabotage: func(t *testing.T, f *relFixture) {
 				for _, dir := range []string{f.cache, f.gooDir} {
 					if err := os.Remove(filepath.Join(dir, "P.noarch.1.goo")); err != nil {
@@ -342,7 +358,7 @@ func TestFetchFailureLeavesOnlyVerifiedArchives(t *testing.T) {
 			before := f.hostState(t)
 			var first hostState
 			for attempt := 1; attempt <= 2; attempt++ {
-				if err := f.install(t, "T"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				if err := f.installWith(t, tc.opts, "T"); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("attempt %d: install T = %v, want an error containing %q", attempt, err, tc.wantErr)
 				}
 				after := f.hostState(t)
@@ -378,7 +394,7 @@ func TestDBOnlyReplaceLeavesReplacedArchives(t *testing.T) {
 		},
 		[]goolib.PkgSpec{{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"P"}}})
 	before := f.hostState(t)
-	if err := f.installWith(t, Options{DBOnly: true}, "R"); err != nil {
+	if err := f.installWith(t, Options{DBOnly: true, OrphanedDependents: OrphanRemove}, "R"); err != nil {
 		t.Fatalf("database-only install of R: %v", err)
 	}
 	if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {

@@ -17,10 +17,12 @@ package update
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/cli/internal/policy"
@@ -28,6 +30,7 @@ import (
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/install"
+	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/repo"
 	"github.com/google/googet/v2/settings"
@@ -48,14 +51,14 @@ type updateCmd struct {
 func (*updateCmd) Name() string     { return "update" }
 func (*updateCmd) Synopsis() string { return "update all packages to the latest version available" }
 func (*updateCmd) Usage() string {
-	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore]\n", filepath.Base(os.Args[0]))
+	return fmt.Sprintf("%s update [-sources repo1,repo2...] [-dry_run] [-force] [-package_conflicts warn|error|ignore] [-orphaned_dependents fail|remove]\n", filepath.Base(os.Args[0]))
 }
 
 func (cmd *updateCmd) SetFlags(f *flag.FlagSet) {
 	f.BoolVar(&cmd.dbOnly, "db_only", false, "only make changes to DB, don't perform install system actions")
 	f.StringVar(&cmd.sources, "sources", "", "comma separated list of sources, setting this overrides local .repo files")
 	f.BoolVar(&cmd.dryRun, "dry_run", false, "check for updates and print them, but do not prompt to install")
-	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts)")
+	f.BoolVar(&cmd.force, "force", false, "force overwrite of conflicting files (only required if StrictConflicts is enabled in config; doesn't affect -package_conflicts or -orphaned_dependents)")
 	cmd.policyFlags.Register(f)
 }
 
@@ -123,6 +126,10 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 			continue
 		}
 		if err := ins.FromRepo(ctx, pi, r, rm, settings.Archs, downloader); err != nil {
+			if policy.OrphanOnly(err) {
+				logSkippedOrphans(err)
+				continue
+			}
 			logger.Errorf("Error updating %s %s %s: %v", pi.Arch, pi.Name, pi.Ver, policy.WrapError(err))
 			exitCode = subcommands.ExitFailure
 			continue
@@ -130,6 +137,24 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 	}
 
 	return exitCode
+}
+
+// logSkippedOrphans emits one structured warning log line per orphaned
+// dependent when update skips an orphaning replacement under OrphanFail mode.
+func logSkippedOrphans(err error) {
+	var oe *install.OrphanedDependentsError
+	if !errors.As(err, &oe) || len(oe.Dependents) == 0 {
+		logger.Warningf("dependency_unsatisfied op=replace mode=fail result=skipped err=%v", err)
+		return
+	}
+	for _, d := range oe.Dependents {
+		removed := make([]string, 0, len(d.Removed))
+		for _, r := range d.Removed {
+			removed = append(removed, r.String())
+		}
+		logger.Warningf("dependency_unsatisfied op=replace mode=fail result=skipped dependent=%s requirement=%q removed=%s replacer=%s",
+			d.Package, relation.FormatPackageRequirement(d.Requirement), strings.Join(removed, ","), d.ReplacedBy)
+	}
 }
 
 func updates(state client.GooGetState, rm client.RepoMap) []goolib.PackageInfo {

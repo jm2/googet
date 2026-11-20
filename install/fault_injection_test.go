@@ -42,7 +42,7 @@ func runUntilSimulatedDeath(t *testing.T, f *relFixture, hook func(applyStage, s
 				panicked = true
 			}
 		}()
-		_ = f.runWithHook(t, t.Context(), Options{}, "R", hook)
+		_ = f.runWithHook(t, t.Context(), Options{OrphanedDependents: OrphanRemove}, "R", hook)
 	})
 	if !panicked {
 		t.Fatal("expected simulatedDeath panic, but runWithHook returned normally")
@@ -141,7 +141,7 @@ func TestSimulatedDeathAtEachStagePreservesArchivesAndAllowsRecovery(t *testing.
 
 			// Rerunning FromRepo("R") completes cleanly without trying to
 			// uninstall rows that were already removed before the crash.
-			if err := f.install(t, "R"); err != nil {
+			if err := f.installWith(t, Options{OrphanedDependents: OrphanRemove}, "R"); err != nil {
 				t.Fatalf("rerun install(R) after simulated death at %s failed: %v", tc.name, err)
 			}
 			if diff := cmp.Diff([]string{"R.noarch.1"}, f.installed(t)); diff != "" {

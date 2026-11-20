@@ -17,7 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strings"
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
@@ -189,38 +188,6 @@ func resolveConflictsIn(ps *goolib.PkgSpec, ex exclusions, st client.GooGetState
 		}
 	}
 	return deferred, nil
-}
-
-// ConflictMode controls how reverse package conflicts are handled.
-type ConflictMode int
-
-// String returns the canonical lowercase configuration name for m.
-func (m ConflictMode) String() string {
-	switch m {
-	case ConflictWarn:
-		return "warn"
-	case ConflictError:
-		return "error"
-	case ConflictIgnore:
-		return "ignore"
-	default:
-		return fmt.Sprintf("ConflictMode(%d)", int(m))
-	}
-}
-
-// ParseConflictMode parses a case-insensitive conflict mode name ("warn",
-// "error", or "ignore") after trimming surrounding whitespace.
-func ParseConflictMode(s string) (ConflictMode, error) {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "warn":
-		return ConflictWarn, nil
-	case "error":
-		return ConflictError, nil
-	case "ignore":
-		return ConflictIgnore, nil
-	default:
-		return ConflictWarn, fmt.Errorf("invalid package conflict mode %q: want warn, error, or ignore", s)
-	}
 }
 
 // ErrPackageConflict marks an installation failure caused by an installed

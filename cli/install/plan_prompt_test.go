@@ -15,6 +15,9 @@ package install
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -31,8 +34,20 @@ import (
 // database holding installed and a repository holding available, and returns
 // the console output, the error and whether the database changed.
 func dryRun(t *testing.T, installed client.GooGetState, available []goolib.PkgSpec, name string) (string, error, bool) {
+	return dryRunWithConf(t, "", installed, available, name)
+}
+
+// dryRunWithConf runs installFromRepo for name with -dry_run under conf.
+func dryRunWithConf(t *testing.T, conf string, installed client.GooGetState, available []goolib.PkgSpec, name string) (string, error, bool) {
 	t.Helper()
-	settings.Initialize(t.TempDir(), false)
+	t.Cleanup(settings.Snapshot())
+	rootDir := t.TempDir()
+	if conf != "" {
+		if err := os.WriteFile(filepath.Join(rootDir, "googet.conf"), []byte(conf), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settings.Initialize(rootDir, false)
 	db, err := googetdb.NewDB(settings.DBFile())
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +85,8 @@ func dryRun(t *testing.T, installed client.GooGetState, available []goolib.PkgSp
 // TestInstallDryRunShowsRemovals checks that a dry run lists the installed
 // packages a replacement removes, and why, without changing anything.
 func TestInstallDryRunShowsRemovals(t *testing.T) {
-	out, err, changed := dryRun(t,
+	out, err, changed := dryRunWithConf(t,
+		"orphaneddependents: remove\n",
 		client.GooGetState{
 			{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1"}},
 			{PackageSpec: &goolib.PkgSpec{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}}},
@@ -175,6 +191,25 @@ func TestDryRunExitCodes(t *testing.T) {
 			available: []goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1"}},
 			want:      subcommands.ExitFailure,
 		},
+		{
+			name: "install that would orphan an installed dependent under default fail",
+			installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			available: []goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1", Replaces: []string{"P"}}},
+			want:      subcommands.ExitFailure,
+		},
+		{
+			name: "install that removes orphaned dependent under orphaneddependents: remove",
+			conf: "orphaneddependents: remove\n",
+			installed: []goolib.PkgSpec{
+				{Name: "P", Arch: "noarch", Version: "1"},
+				{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}},
+			},
+			available: []goolib.PkgSpec{{Name: "A", Arch: "noarch", Version: "1", Replaces: []string{"P"}}},
+			want:      subcommands.ExitSuccess,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, repoURL := testutil.SetupCLIRepo(t, tc.conf, tc.installed, tc.available)
@@ -186,6 +221,7 @@ func TestDryRunExitCodes(t *testing.T) {
 			for _, ps := range tc.installed {
 				want = append(want, ps.String())
 			}
+			slices.Sort(want)
 			if diff := cmp.Diff(want, testutil.InstalledNames(t)); diff != "" {
 				t.Errorf("installed (-want +got):\n%s", diff)
 			}

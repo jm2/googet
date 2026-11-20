@@ -14,6 +14,7 @@ limitations under the License.
 package install
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -43,7 +44,8 @@ func TestPlanZeroValue(t *testing.T) {
 // then does, and that planning writes nothing to the log or the console.
 func TestInstallerPlan(t *testing.T) {
 	c := corpusCase{
-		Target: "A",
+		Target:  "A",
+		Orphans: OrphanRemove,
 		Installed: []goolib.PkgSpec{
 			{Name: "A", Arch: "noarch", Version: "1"},
 			{Name: "P", Arch: "noarch", Version: "1"},
@@ -56,11 +58,14 @@ func TestInstallerPlan(t *testing.T) {
 		},
 	}
 	f := newRelFixture(t, c.Installed, c.Available)
+	if _, failErr := New(f.cache, f.db, Options{}).Plan(goolib.PackageInfo{Name: "A"}, "", f.rm, corpusArchs); !errors.Is(failErr, ErrOrphanedDependents) {
+		t.Fatalf("Plan (default OrphanFail) = %v, want ErrOrphanedDependents", failErr)
+	}
 	logs := testutil.CaptureLogs(t)
 	var p *Plan
 	var err error
 	stdout := captureStdout(t, func() {
-		p, err = New(f.cache, f.db, Options{}).Plan(goolib.PackageInfo{Name: "A"}, "", f.rm, corpusArchs)
+		p, err = New(f.cache, f.db, Options{OrphanedDependents: OrphanRemove}).Plan(goolib.PackageInfo{Name: "A"}, "", f.rm, corpusArchs)
 	})
 	if err != nil {
 		t.Fatalf("Plan: %v", err)
