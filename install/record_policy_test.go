@@ -29,46 +29,63 @@ import (
 // installer caller.
 func TestRecordPolicies(t *testing.T) {
 	t.Parallel()
+	captured := &client.PackageState{}
 	tests := []struct {
 		name         string
 		got          recordPolicy
+		captured     *client.PackageState
 		want         recordPolicy
 		wantSnapshot bool
 	}{
 		{
 			name:         "apply_step_real_install",
 			got:          applyStepPolicy(false),
-			want:         recordPolicy{cleanup: true, removeArchive: true, transfers: true},
+			want:         recordPolicy{cleanup: true, removeArchive: true, carryDirs: true, transfers: true},
 			wantSnapshot: true,
 		},
 		{
 			name:         "apply_step_db_only",
 			got:          applyStepPolicy(true),
-			want:         recordPolicy{cleanup: false, removeArchive: true, transfers: false},
+			want:         recordPolicy{cleanup: false, removeArchive: true, carryDirs: false, transfers: false},
 			wantSnapshot: true,
 		},
 		{
 			name:         "from_disk_real_install",
 			got:          fromDiskPolicy(false),
-			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: true},
+			want:         recordPolicy{cleanup: false, removeArchive: false, carryDirs: true, transfers: true},
 			wantSnapshot: true,
 		},
 		{
 			name:         "from_disk_db_only",
 			got:          fromDiskPolicy(true),
-			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: false},
+			want:         recordPolicy{cleanup: false, removeArchive: false, carryDirs: false, transfers: false},
 			wantSnapshot: false,
 		},
 		{
 			name:         "recover_reinstall",
-			got:          recoverPolicy(),
-			want:         recordPolicy{cleanup: false, removeArchive: false, transfers: false},
+			got:          recoverPolicy(false),
+			captured:     captured,
+			want:         recordPolicy{cleanup: false, removeArchive: false, carryDirs: true, transfers: false},
+			wantSnapshot: false,
+		},
+		{
+			name:         "recover_policy_without_captured_row_requires_snapshot",
+			got:          recoverPolicy(false),
+			captured:     nil,
+			want:         recordPolicy{cleanup: false, removeArchive: false, carryDirs: true, transfers: false},
+			wantSnapshot: true,
+		},
+		{
+			name:         "recover_db_only",
+			got:          recoverPolicy(true),
+			captured:     captured,
+			want:         recordPolicy{cleanup: false, removeArchive: false, carryDirs: false, transfers: false},
 			wantSnapshot: false,
 		},
 		{
 			name:         "reinstall",
 			got:          reinstallPolicy(),
-			want:         recordPolicy{cleanup: true, removeArchive: false, transfers: true},
+			want:         recordPolicy{cleanup: true, removeArchive: false, carryDirs: true, transfers: true},
 			wantSnapshot: true,
 		},
 	}
@@ -79,8 +96,8 @@ func TestRecordPolicies(t *testing.T) {
 			if tc.got != tc.want {
 				t.Errorf("policy = %+v, want %+v", tc.got, tc.want)
 			}
-			if gotSnap := tc.got.needsSnapshot(); gotSnap != tc.wantSnapshot {
-				t.Errorf("policy.needsSnapshot() = %t, want %t", gotSnap, tc.wantSnapshot)
+			if gotSnap := tc.got.needsSnapshot(tc.captured); gotSnap != tc.wantSnapshot {
+				t.Errorf("policy.needsSnapshot(%v) = %t, want %t", tc.captured != nil, gotSnap, tc.wantSnapshot)
 			}
 		})
 	}
@@ -148,7 +165,7 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 		}
 
 		var written []client.PackageState
-		err := recordInstall(reader, newRow, applyStepPolicy(false), func(got client.PackageState, _ []googetdb.FileTransfer) error {
+		err := recordInstall(reader, newRow, nil, applyStepPolicy(false), func(got client.PackageState, _ []googetdb.FileTransfer) error {
 			written = append(written, got)
 			return nil
 		})
@@ -202,7 +219,7 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 		}
 
 		writeCalls := 0
-		if err := recordInstall(reader, newRow, applyStepPolicy(true), func(client.PackageState, []googetdb.FileTransfer) error {
+		if err := recordInstall(reader, newRow, nil, applyStepPolicy(true), func(client.PackageState, []googetdb.FileTransfer) error {
 			writeCalls++
 			return nil
 		}); err != nil {
@@ -224,22 +241,115 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 
 	t.Run("no_snapshot_policies_do_not_call_fetch_pkgs", func(t *testing.T) {
 		t.Parallel()
-		for _, p := range []recordPolicy{fromDiskPolicy(true), recoverPolicy()} {
+		dir := t.TempDir()
+		survivingCapturedDir := filepath.Join(dir, "captured_dir")
+		missingCapturedDir := filepath.Join(dir, "gone_dir")
+		capturedFile := filepath.Join(dir, "captured_file.txt")
+		if err := os.MkdirAll(survivingCapturedDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(capturedFile, []byte("file"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		capturedState := &client.PackageState{
+			PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "1"},
+			InstalledFiles: map[string]string{
+				survivingCapturedDir: "",
+				missingCapturedDir:   "",
+				capturedFile:         "sum-file",
+			},
+		}
+		for _, tc := range []struct {
+			name     string
+			policy   recordPolicy
+			captured *client.PackageState
+			wantDirs map[string]string
+		}{
+			{
+				name:     "from_disk_db_only",
+				policy:   fromDiskPolicy(true),
+				captured: nil,
+				wantDirs: nil,
+			},
+			{
+				name:     "recover_real_install_carries_captured_dirs_without_snapshot",
+				policy:   recoverPolicy(false),
+				captured: capturedState,
+				wantDirs: map[string]string{survivingCapturedDir: ""},
+			},
+			{
+				name:     "recover_db_only_skips_carry_and_snapshot",
+				policy:   recoverPolicy(true),
+				captured: capturedState,
+				wantDirs: nil,
+			},
+		} {
 			reader := &countingStateReader{err: errors.New("unexpected snapshot read")}
-			writeCalls := 0
+			var written []client.PackageState
 			row := client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "1"}}
-			if err := recordInstall(reader, row, p, func(client.PackageState, []googetdb.FileTransfer) error {
-				writeCalls++
+			if err := recordInstall(reader, row, tc.captured, tc.policy, func(got client.PackageState, _ []googetdb.FileTransfer) error {
+				written = append(written, got)
 				return nil
 			}); err != nil {
-				t.Fatalf("recordInstall(%+v) unexpected error: %v", p, err)
+				t.Fatalf("%s: recordInstall(%+v) unexpected error: %v", tc.name, tc.policy, err)
 			}
 			if reader.calls != 0 {
-				t.Errorf("FetchPkgs call count for %+v = %d, want 0", p, reader.calls)
+				t.Errorf("%s: FetchPkgs call count = %d, want 0", tc.name, reader.calls)
 			}
-			if writeCalls != 1 {
-				t.Errorf("write call count for %+v = %d, want 1", p, writeCalls)
+			if len(written) != 1 {
+				t.Fatalf("%s: write call count = %d, want 1", tc.name, len(written))
 			}
+			if diff := cmp.Diff(tc.wantDirs, written[0].InstalledFiles); diff != "" {
+				t.Errorf("%s: InstalledFiles mismatch (-want +got):\n%s", tc.name, diff)
+			}
+		}
+	})
+
+	t.Run("carry_dirs_with_nil_captured_reads_snapshot_once_and_carries_old_dirs", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		survivingOldDir := filepath.Join(dir, "old_surviving_dir")
+		missingOldDir := filepath.Join(dir, "old_missing_dir")
+		if err := os.MkdirAll(survivingOldDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		reader := &countingStateReader{
+			state: client.GooGetState{
+				{
+					PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "1"},
+					InstalledFiles: map[string]string{
+						survivingOldDir: "",
+						missingOldDir:   "",
+					},
+				},
+			},
+		}
+		newFile := filepath.Join(dir, "new.txt")
+		row := client.PackageState{
+			PackageSpec:    &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "2"},
+			InstalledFiles: map[string]string{newFile: "sum-new"},
+		}
+		var written []client.PackageState
+		if err := recordInstall(reader, row, nil, recordPolicy{carryDirs: true}, func(got client.PackageState, _ []googetdb.FileTransfer) error {
+			written = append(written, got)
+			return nil
+		}); err != nil {
+			t.Fatalf("recordInstall(carryDirs only, captured=nil) unexpected error: %v", err)
+		}
+		if reader.calls != 1 {
+			t.Errorf("FetchPkgs call count = %d, want 1", reader.calls)
+		}
+		if len(written) != 1 {
+			t.Fatalf("write call count = %d, want 1", len(written))
+		}
+		wantFiles := map[string]string{
+			newFile:         "sum-new",
+			survivingOldDir: "",
+		}
+		if diff := cmp.Diff(wantFiles, written[0].InstalledFiles); diff != "" {
+			t.Errorf("written InstalledFiles mismatch (-want +got):\n%s", diff)
 		}
 	})
 
@@ -249,7 +359,7 @@ func TestRecordInstallSingleSnapshotRead(t *testing.T) {
 		reader := &countingStateReader{err: wantErr}
 		writeCalls := 0
 		row := client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "2"}}
-		err := recordInstall(reader, row, applyStepPolicy(false), func(client.PackageState, []googetdb.FileTransfer) error {
+		err := recordInstall(reader, row, nil, applyStepPolicy(false), func(client.PackageState, []googetdb.FileTransfer) error {
 			writeCalls++
 			return nil
 		})

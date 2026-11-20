@@ -247,6 +247,18 @@ set without `-force`.
   a structured `file_kept` line instead. Non-`-db_only` removals read the
   installed package rows before running the uninstall script (`googet remove
   -db_only` skips that read).
+- **Created parent directories.** Non-`-db_only` installs create missing parent
+  directories above a package's destination with mode `0755` (while applying
+  the archive's own mode to directories shipped inside the package). Any parent
+  directory GooGet creates that still exists as a directory once the install
+  script finishes is recorded in `InstalledFiles`, carried forward across
+  upgrades, `FromDisk` installs, replacement recovery, and reinstalls (along
+  with dropped payload directories kept non-empty by user or other packages'
+  files), and removed deepest-first on uninstall once empty and no longer
+  listed by any other installed row. If package A creates a parent directory
+  and package B later installs files under that already existing parent, only
+  A's row records the parent; removing A first leaves the non-empty parent for
+  B, and removing B afterwards leaves that unrecorded parent on disk.
 - **Windows path equivalence.** On Windows, file-conflict checks, ownership
   lookups, and upgrade cleanup clean paths, fold `/` to `\`, and upper-case
   each rune (`unicode.ToUpper`). GooGet does not resolve DOS 8.3 short names,

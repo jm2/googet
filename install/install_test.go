@@ -184,19 +184,19 @@ func TestInstallPkg(t *testing.T) {
 	}
 	defer db.Close()
 
-	dst, err := ioutil.TempDir("", "")
+	dstRoot, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatalf("Failed to create temp directory: %v", err)
 	}
-	dst += ("/this/is/an/extremely/long/filename/you/wouldnt/expect/to/see/it/" +
+	defer oswrap.RemoveAll(dstRoot)
+
+	dst := dstRoot + ("/this/is/an/extremely/long/filename/you/wouldnt/expect/to/see/it/" +
 		"in/the/wild/but/you/would/actually/be/surprised/at/some/of/the/" +
 		"stuff/that/pops/up/and/seriously/two/hundred/and/fify/five/chars" +
 		"is/quite/a/large/number/but/somehow/there/were/real/goo/packages" +
 		"which/exceeded/this/limit/hence/this/absurdly/long/string/in/" +
 		"this/unit/test")
 	dst = filepath.FromSlash(dst)
-
-	defer oswrap.RemoveAll(dst)
 
 	f, err := os.Create(filepath.Join(src, "test.goo"))
 	if err != nil {
@@ -208,7 +208,10 @@ func TestInstallPkg(t *testing.T) {
 	tw := tar.NewWriter(gw)
 
 	files := []string{"test1", "test2", "test3"}
-	want := map[string]string{dst: ""}
+	want := make(map[string]string)
+	for d := dst; d != dstRoot && filepath.Dir(d) != d; d = filepath.Dir(d) {
+		want[d] = ""
+	}
 	for _, n := range files {
 		f, err := oswrap.Create(filepath.Join(src, n))
 		if err != nil {
@@ -631,10 +634,13 @@ func TestInstallAddPkg(t *testing.T) {
 			if st.PackageSpec.Version != wantVer {
 				t.Errorf("installed version = %q, want %q", st.PackageSpec.Version, wantVer)
 			}
-			// The checksums that a dbOnly install records are not checked.
+			// The checksums that a dbOnly install records are not checked. The
+			// parent directory the install created is recorded with an empty
+			// checksum.
 			if tc.fault == addPkgOK && !tc.dbOnly {
 				wantFiles := map[string]string{
 					filepath.Join(dst, "keep"):         goolib.Checksum(strings.NewReader("new")),
+					filepath.Join(dst, "sub"):          "",
 					filepath.Join(dst, "sub", "added"): goolib.Checksum(strings.NewReader("added")),
 				}
 				if diff := cmp.Diff(wantFiles, st.InstalledFiles); diff != "" {
@@ -751,7 +757,7 @@ func TestReinstallRollback(t *testing.T) {
 				gotFiles = append(gotFiles, f)
 			}
 			slices.Sort(gotFiles)
-			wantFiles := []string{filepath.Join(dst, "keep"), filepath.Join(dst, "sub", "added")}
+			wantFiles := []string{filepath.Join(dst, "keep"), filepath.Join(dst, "sub"), filepath.Join(dst, "sub", "added")}
 			if diff := cmp.Diff(wantFiles, gotFiles); diff != "" {
 				t.Errorf("recorded InstalledFiles (-want +got):\n%s", diff)
 			}
@@ -780,8 +786,8 @@ func TestUndo(t *testing.T) {
 			write := func(rel string) {
 				t.Helper()
 				p := filepath.Join(root, rel)
-				if err := u.mkdirAll(filepath.Dir(p), 0755); err != nil {
-					t.Fatalf("mkdirAll(%q) = %v", filepath.Dir(p), err)
+				if err := u.ensureParents(filepath.Dir(p)); err != nil {
+					t.Fatalf("ensureParents(%q) = %v", filepath.Dir(p), err)
 				}
 				if err := u.prepare(p); err != nil {
 					t.Fatalf("prepare(%q) = %v", p, err)
@@ -818,13 +824,13 @@ func perm(t *testing.T, path string) os.FileMode {
 	return fi.Mode().Perm()
 }
 
-func TestUndoMkdirAllModes(t *testing.T) {
+func TestUndoMkdirsModes(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not report Unix permission bits")
 	}
 	root := t.TempDir()
 	// The umask applies to the reference directories as it does to the
-	// directories that mkdirAll creates.
+	// directories that ensurePackageDir creates.
 	refParent, refDir := filepath.Join(root, "ref-parent"), filepath.Join(root, "ref-dir")
 	for ref, mode := range map[string]os.FileMode{refParent: 0755, refDir: 0500} {
 		if err := os.Mkdir(ref, mode); err != nil {
@@ -834,24 +840,25 @@ func TestUndoMkdirAllModes(t *testing.T) {
 	parent := filepath.Join(root, "a")
 	dir := filepath.Join(parent, "b")
 	var u undo
-	if err := u.mkdirAll(dir, 0500); err != nil {
-		t.Fatalf("mkdirAll(%q, 0500) = %v", dir, err)
+	if err := u.ensurePackageDir(dir, 0500); err != nil {
+		t.Fatalf("ensurePackageDir(%q, 0500) = %v", dir, err)
 	}
 	for path, ref := range map[string]string{parent: refParent, dir: refDir} {
 		if got, want := perm(t, path), perm(t, ref); got != want {
-			t.Errorf("mkdirAll(%q, 0500) created %q with mode %v, want %v", dir, path, got, want)
+			t.Errorf("ensurePackageDir(%q, 0500) created %q with mode %v, want %v", dir, path, got, want)
 		}
 	}
 }
 
-func TestUndoMkdirAllExisting(t *testing.T) {
+func TestUndoMkdirsExisting(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(file, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
 	// top is the ancestor of file just below the volume root, such as /tmp or
 	// C:\Users. On Windows, oswrap.MkdirAll panics on a volume root, so
-	// mkdirAll must not call it on an existing directory or its parent.
+	// the directory helpers must not call it on an existing directory or its
+	// parent.
 	top := file
 	for filepath.Dir(filepath.Dir(top)) != filepath.Dir(top) {
 		top = filepath.Dir(top)
@@ -865,12 +872,17 @@ func TestUndoMkdirAllExisting(t *testing.T) {
 		{dir: filepath.Dir(file)},
 		{dir: file, wantErr: true},
 	} {
-		var u undo
-		if err := u.mkdirAll(tc.dir, 0755); (err != nil) != tc.wantErr {
-			t.Errorf("mkdirAll(%q) = %v, want error %t", tc.dir, err, tc.wantErr)
-		}
-		if len(u.changes) != 0 {
-			t.Errorf("mkdirAll(%q) recorded %v, want no changes", tc.dir, u.changes)
+		for name, mkdirs := range map[string]func(*undo, string) error{
+			"ensureParents":    (*undo).ensureParents,
+			"ensurePackageDir": func(u *undo, dir string) error { return u.ensurePackageDir(dir, 0755) },
+		} {
+			var u undo
+			if err := mkdirs(&u, tc.dir); (err != nil) != tc.wantErr {
+				t.Errorf("%s(%q) = %v, want error %t", name, tc.dir, err, tc.wantErr)
+			}
+			if len(u.changes) != 0 {
+				t.Errorf("%s(%q) recorded %v, want no changes", name, tc.dir, u.changes)
+			}
 		}
 	}
 }
