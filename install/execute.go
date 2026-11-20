@@ -37,12 +37,21 @@ const (
 	stageFetched applyStage = iota
 	// stageBeforeReplace precedes removing the packages a step replaces.
 	stageBeforeReplace
+	// stageBeforeUninstall precedes uninstalling one replaced package; the
+	// hook's step is that package.
+	stageBeforeUninstall
+	// stageAfterUninstall follows uninstalling one replaced package; the
+	// hook's step is that package.
+	stageAfterUninstall
 	// stageAfterReplace follows removing them.
 	stageAfterReplace
 	// stageAfterInstall follows installing a step's package, while its file
 	// changes can still be rolled back and before its database row is
 	// written.
 	stageAfterInstall
+	// stageAddPkg precedes each attempt to write a step's database row. An
+	// error from the hook fails that attempt in place of the database.
+	stageAddPkg
 	// stageCommitted follows writing a step's database row.
 	stageCommitted
 )
@@ -86,7 +95,7 @@ func (ri *repoInstall) fromRepo(ctx context.Context, pi goolib.PackageInfo, repo
 		return err
 	}
 	for i, s := range p.steps {
-		if err := ri.applyStep(ctx, s, archives[i]); err != nil {
+		if err := ri.applyStep(ctx, s, archives[i:]); err != nil {
 			return err
 		}
 	}
@@ -159,9 +168,17 @@ func archiveIntact(path, sum string) bool {
 // replaces, checks that no conflict the plan deferred has appeared, installs
 // the step's package from its fetched archive, cleans up the version it
 // overwrote and records it in the database.
-func (ri *repoInstall) applyStep(ctx context.Context, s planStep, a fetched) error {
+//
+// Replacing is best-effort, not a transaction. Until the step's package is
+// recorded, a failure, including a failure to record it, rolls back the
+// files the package placed and reinstalls the packages the step removed,
+// from the archives kept for that purpose. Install scripts and any installer
+// side effects aren't undone.
+func (ri *repoInstall) applyStep(ctx context.Context, s planStep, remaining []fetched) error {
+	a := remaining[0]
 	db := ri.db
 	ps := s.spec.PackageSpec
+	var rec *replaceRecord
 	if len(s.removed) > 0 {
 		if err := ri.checkRemovals(s); err != nil {
 			return err
@@ -169,24 +186,24 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, a fetched) err
 		if err := ri.atStage(stageBeforeReplace, ps.String()); err != nil {
 			return err
 		}
-		if err := ri.resolveReplacements(ctx, ps); err != nil {
-			return err
+		var err error
+		rec, err = ri.removeReplaced(ctx, s)
+		if err != nil {
+			return ri.recoverRemoved(ctx, rec, err)
 		}
 		if err := ri.atStage(stageAfterReplace, ps.String()); err != nil {
-			return err
+			return ri.recoverRemoved(ctx, rec, err)
 		}
 	}
 	if err := ri.recheckConflicts(s); err != nil {
-		return err
+		return ri.recoverRemoved(ctx, rec, err)
 	}
 
-	// Removing a package deletes its cached archive, which is the archive
-	// fetch put in the same place when the plan installs that same version
-	// again. Download it again only if it is gone or no longer matches its
+	// Download the archive again only if it is gone or no longer matches its
 	// checksum, so that an intact archive isn't downloaded or logged twice.
 	if !archiveIntact(a.path, s.spec.Checksum) {
 		if _, _, err := download.FromRepo(ctx, s.spec, s.repo, ri.cache, ri.downloader); err != nil {
-			return err
+			return ri.recoverRemoved(ctx, rec, err)
 		}
 	}
 	// The version this install overwrites, if any, is the installed package
@@ -194,33 +211,54 @@ func (ri *repoInstall) applyStep(ctx context.Context, s planStep, a fetched) err
 	// replaces it in the database.
 	old, err := db.FetchPkg(goolib.PackageInfo{Name: ps.Name, Arch: ps.Arch})
 	if err != nil {
-		return err
+		return ri.recoverRemoved(ctx, rec, err)
 	}
 	if old.PackageSpec == nil || old.PackageSpec.Name != ps.Name || old.PackageSpec.Arch != ps.Arch {
 		old = client.PackageState{}
+	}
+	row := client.PackageState{
+		SourceRepo:  s.repo,
+		DownloadURL: a.url,
+		Checksum:    s.spec.Checksum,
+		LocalPath:   a.path,
+		PackageSpec: ps,
 	}
 	insFiles, err := installPkg(a.path, ps, ri.opts, db, func(insFiles map[string]string) error {
 		if err := ri.atStage(stageAfterInstall, ps.String()); err != nil {
 			return err
 		}
-		return addPkg(db, client.PackageState{
-			SourceRepo:     s.repo,
-			DownloadURL:    a.url,
-			Checksum:       s.spec.Checksum,
-			LocalPath:      a.path,
-			PackageSpec:    ps,
-			InstalledFiles: insFiles,
-		})
+		row.InstalledFiles = insFiles
+		if err := ri.addPkg(row); err != nil {
+			if rec == nil {
+				return err
+			}
+			// Failing now rolls back the package's files and reinstalls the
+			// packages the step removed, so try once more to record it.
+			logger.Errorf("Recording %s failed, trying again: %v", ps, err)
+			return ri.addPkg(row)
+		}
+		return nil
 	})
 	if err != nil {
-		return err
+		// installPkg has already put back the files it changed.
+		return ri.recoverRemoved(ctx, rec, err)
 	}
 
 	logger.Infof("Installation of %s.%s.%s completed", ps.Name, ps.Arch, ps.Version)
 	fmt.Printf("Installation of %s.%s.%s and all dependencies completed\n", ps.Name, ps.Arch, ps.Version)
 	// The old version is cleaned up only once the new one is recorded.
 	cleanOld(old, insFiles, ri.opts.DBOnly)
+	rec.commit(remaining)
 	return ri.atStage(stageCommitted, ps.String())
+}
+
+// addPkg records row in the database, unless the test hook fails the
+// stageAddPkg stage in its place.
+func (ri *repoInstall) addPkg(row client.PackageState) error {
+	if err := ri.atStage(stageAddPkg, row.PackageSpec.String()); err != nil {
+		return err
+	}
+	return addPkg(ri.db, row)
 }
 
 // checkRemovals fails, changing nothing, unless removing the packages step s

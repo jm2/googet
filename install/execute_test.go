@@ -285,7 +285,7 @@ func TestApplyStages(t *testing.T) {
 		})
 	var got []string
 	ri := &repoInstall{Installer: New(f.cache, f.db, Options{}), rm: f.rm, archs: corpusArchs, downloader: f.downloader}
-	names := map[applyStage]string{stageFetched: "fetched", stageBeforeReplace: "before-replace", stageAfterReplace: "after-replace", stageAfterInstall: "after-install", stageCommitted: "committed"}
+	names := map[applyStage]string{stageFetched: "fetched", stageBeforeReplace: "before-replace", stageBeforeUninstall: "before-uninstall", stageAfterUninstall: "after-uninstall", stageAfterReplace: "after-replace", stageAfterInstall: "after-install", stageAddPkg: "add-pkg", stageCommitted: "committed"}
 	ri.stageHook = func(stage applyStage, step string) error {
 		got = append(got, strings.TrimSpace(names[stage]+" "+step))
 		return nil
@@ -295,8 +295,9 @@ func TestApplyStages(t *testing.T) {
 	}
 	want := []string{
 		"fetched",
-		"after-install D.noarch.1", "committed D.noarch.1",
-		"before-replace R.noarch.1", "after-replace R.noarch.1", "after-install R.noarch.1", "committed R.noarch.1",
+		"after-install D.noarch.1", "add-pkg D.noarch.1", "committed D.noarch.1",
+		"before-replace R.noarch.1", "before-uninstall P.noarch.1", "after-uninstall P.noarch.1", "after-replace R.noarch.1",
+		"after-install R.noarch.1", "add-pkg R.noarch.1", "committed R.noarch.1",
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("stages (-want +got):\n%s", diff)
@@ -308,7 +309,8 @@ func TestApplyStages(t *testing.T) {
 
 // TestApplyStopsWhenConflictReappears checks that a conflict the plan
 // expected the replacement to clear, but that the installed packages show
-// again once it has run, stops the install before the package is installed.
+// again once it has run, stops the install before the package is installed
+// and reinstalls the package the replacement removed.
 func TestApplyStopsWhenConflictReappears(t *testing.T) {
 	f := newRelFixture(t,
 		[]goolib.PkgSpec{{Name: "P", Arch: "noarch", Version: "1"}},
@@ -325,7 +327,8 @@ func TestApplyStopsWhenConflictReappears(t *testing.T) {
 	if !errors.Is(err, errPlanDivergence) || !strings.Contains(err.Error(), "conflict with installed package or provider: P") {
 		t.Fatalf("install R = %v, want errPlanDivergence naming the conflict with P", err)
 	}
-	if diff := cmp.Diff([]string{"P.x86_64.1"}, f.installed(t)); diff != "" {
+	// The replaced P.noarch is reinstalled.
+	if diff := cmp.Diff([]string{"P.noarch.1", "P.x86_64.1"}, f.installed(t)); diff != "" {
 		t.Errorf("installed packages (-want +got):\n%s", diff)
 	}
 }

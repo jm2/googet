@@ -84,9 +84,20 @@ func newRelFixture(t *testing.T, installed, available []goolib.PkgSpec) *relFixt
 	}))
 	t.Cleanup(srv.Close)
 
+	// built maps each installed package's name, arch and version to its spec
+	// and archive, so an available package with an identical spec is
+	// published from that archive instead of a rebuilt one. GenGoo stamps
+	// archive entries with the current time, so a rebuild can differ from the
+	// installed package's cached copy and its recorded checksum.
+	type builtArchive struct {
+		spec goolib.PkgSpec
+		rs   goolib.RepoSpec
+	}
+	built := make(map[string]builtArchive)
 	var state client.GooGetState
 	for _, ps := range installed {
 		rs := testutil.GenGoo(t, f.gooDir, f.dst, ps)
+		built[ps.String()] = builtArchive{spec: ps, rs: rs}
 		local := filepath.Join(f.cache, rs.Source)
 		copyFile(t, filepath.Join(f.gooDir, rs.Source), local)
 		file := filepath.Join(f.dst, ps.Name)
@@ -108,6 +119,14 @@ func newRelFixture(t *testing.T, installed, available []goolib.PkgSpec) *relFixt
 
 	var specs []goolib.RepoSpec
 	for _, ps := range available {
+		if b, ok := built[ps.String()]; ok && cmp.Equal(b.spec, ps) {
+			// Copy the spec so the repo and the installed row don't share it.
+			rs := b.rs
+			spec := *rs.PackageSpec
+			rs.PackageSpec = &spec
+			specs = append(specs, rs)
+			continue
+		}
 		specs = append(specs, testutil.GenGoo(t, f.gooDir, f.dst, ps))
 	}
 	f.rm = client.RepoMap{srv.URL: client.Repo{Priority: priority.Default, Packages: specs}}

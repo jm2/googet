@@ -14,6 +14,8 @@ limitations under the License.
 package remove
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -29,6 +31,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/client"
+	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 )
 
@@ -279,5 +282,62 @@ func TestLocalArchive(t *testing.T) {
 				t.Errorf("archive at %s = %q, %v; want %q", got, b, err, content)
 			}
 		})
+	}
+}
+
+// TestUninstallRow checks that UninstallRow removes exactly the row it is
+// given, refuses a row whose version is no longer installed, and keeps the
+// cached archive when asked to.
+func TestUninstallRow(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "foo.noarch.1.goo")
+	writeTestGoo(t, archive)
+	db, err := googetdb.NewDB(filepath.Join(dir, "googet.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	row := client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}, LocalPath: archive}
+	if err := db.WriteStateToDB(client.GooGetState{row}); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := row
+	stale.PackageSpec = &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "2"}
+	if err := UninstallRow(t.Context(), stale, Options{KeepCache: true}, db); err == nil || !strings.Contains(err.Error(), "foo.noarch.2 is no longer installed") {
+		t.Errorf("UninstallRow(foo.noarch.2) = %v, want a no-longer-installed error", err)
+	}
+	if state, _ := db.FetchPkgs(""); len(state) != 1 {
+		t.Fatalf("installed packages after refusing = %v, want foo still installed", state)
+	}
+
+	if err := UninstallRow(t.Context(), row, Options{KeepCache: true}, db); err != nil {
+		t.Fatalf("UninstallRow(foo.noarch.1): %v", err)
+	}
+	if state, _ := db.FetchPkgs(""); len(state) != 0 {
+		t.Errorf("installed packages = %v, want none", state)
+	}
+	if _, err := os.Stat(archive); err != nil {
+		t.Errorf("archive: %v, want it kept", err)
+	}
+}
+
+// writeTestGoo writes an empty package archive to path.
+func writeTestGoo(t *testing.T, path string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

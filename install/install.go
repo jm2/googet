@@ -40,34 +40,6 @@ import (
 	"github.com/google/logger"
 )
 
-// minInstalledRow returns the installed row db.FetchPkg picks for r if it
-// satisfies r's minimum version. Keep its selection and version gate in sync
-// with simulateReplacements (covered by
-// TestSimulateReplacementsMatchesResolveReplacements).
-func minInstalledRow(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
-	p, err := db.FetchPkg(r.PackageInfo())
-	if err != nil {
-		return client.PackageState{}, false, err
-	}
-	if p.PackageSpec == nil {
-		return client.PackageState{}, false, nil
-	}
-	ok, err := r.MinInstalled(p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version)
-	if err != nil {
-		return client.PackageState{}, false, err
-	}
-	if !ok {
-		return client.PackageState{}, false, nil
-	}
-	return p, true, nil
-}
-
-// replaceVictim returns the installed package that Replaces entry r removes:
-// the single row minInstalledRow selects for r.
-func replaceVictim(r relation.Requirement, db *googetdb.GooDB) (client.PackageState, bool, error) {
-	return minInstalledRow(r, db)
-}
-
 // minInstalledRowIn returns the row of the installed state st that
 // snapshot.Pick selects for r if it meets r's minimum version.
 func minInstalledRowIn(r relation.Requirement, st client.GooGetState) (client.PackageState, bool, error) {
@@ -97,10 +69,9 @@ func satisfiedIn(r relation.Requirement, st client.GooGetState) (bool, error) {
 	return false, nil
 }
 
-// simulateReplacements is an exact in-memory model of resolveReplacements over
-// the database snapshot taken after dependencies are installed. It returns
-// the simulated post-replacement state and true on completion, or nil and
-// false if resolveReplacements would fail. See replaceRows.
+// simulateReplacements returns the installed state after ps's replacements
+// are removed, as replaceRows works it out, and true, or nil and false if
+// removing them would fail.
 func simulateReplacements(ps *goolib.PkgSpec, installed client.GooGetState) (client.GooGetState, bool) {
 	post, _, err := replaceRows(ps, installed)
 	if err != nil {
@@ -109,14 +80,14 @@ func simulateReplacements(ps *goolib.PkgSpec, installed client.GooGetState) (cli
 	return post, true
 }
 
-// replaceRows replays resolveReplacements for ps over installed without
-// changing anything. It processes each ps.Replaces entry in order over a
-// shrinking copy of installed, using the same FetchPkg row selection,
-// MinInstalled version gate and remove.Plan cascade order as
-// resolveReplacements and remove.All. Like remove.All, it removes each
-// entry's root last by selecting it again once the entry's dependents are
-// gone. It returns the post-replacement state and the removed rows in removal
-// order, or the error resolveReplacements would return.
+// replaceRows works out, without changing anything, which installed packages
+// ps's Replaces entries remove, and in which order. For each entry in turn,
+// over a shrinking copy of installed, it takes the row FetchPkg would select
+// if that row meets the entry's minimum version, and removes the packages
+// that depend on it in remove.Plan's order and then, as remove.All does, the
+// entry's package, which it selects again once the dependents are gone. It
+// returns the post-replacement state and the removed rows in removal order,
+// or the error removing them would return.
 func replaceRows(ps *goolib.PkgSpec, installed client.GooGetState) (post client.GooGetState, removed []client.PackageState, err error) {
 	state := make(client.GooGetState, 0, len(installed))
 	for _, st := range installed {
@@ -182,37 +153,6 @@ type repoInstall struct {
 	// stageHook, if set, is called at each applyStage and can fail the
 	// install there. Only tests set it.
 	stageHook func(stage applyStage, step string) error
-}
-
-// resolveReplacements removes the installed packages that ps replaces, along
-// with the packages that depend on them. Keep this loop in sync with
-// simulateReplacements (covered by
-// TestSimulateReplacementsMatchesResolveReplacements).
-func (ri *repoInstall) resolveReplacements(ctx context.Context, ps *goolib.PkgSpec) error {
-	db := ri.db
-	// Check for and remove any package this replaces.
-	// TODO(ajackura): Make sure no replacements are listed as
-	// dependencies or subdependancies.
-	for _, pkg := range ps.Replaces {
-		r := relation.ParseRelation(pkg)
-		_, ins, err := replaceVictim(r, db)
-		if err != nil {
-			return err
-		}
-		if !ins {
-			continue
-		}
-		pi := r.PackageInfo()
-		deps, _, err := remove.EnumerateDeps(pi, db)
-		if err != nil {
-			return err
-		}
-		logger.Infof("%s replaces %s, removing", ps, pi)
-		if err := remove.All(ctx, pi, deps, ri.opts.DBOnly, ri.downloader, db); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // FromRepo installs pi and its dependencies from rm.
@@ -348,6 +288,15 @@ func copyPkg(src, dst string) (retErr error) {
 		return err
 	}
 	defer r.Close()
+
+	// Installing directly from an archive already in the cache (for example,
+	// recovering from a kept archive named by replace_record) must not
+	// truncate the archive onto itself.
+	if srcInfo, err := r.Stat(); err == nil {
+		if dstInfo, err := oswrap.Stat(dst); err == nil && os.SameFile(srcInfo, dstInfo) {
+			return nil
+		}
+	}
 
 	f, err := oswrap.Create(dst)
 	if err != nil {
