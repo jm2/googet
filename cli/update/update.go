@@ -98,8 +98,10 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 	}
 
 	rm := downloader.AvailableVersions(ctx, repos, cache, settings.CacheLife)
-	ud := updates(state, rm)
-	if ud == nil {
+	plan := planUpdates(state, rm, updateConfig{archs: settings.Archs, opts: cmd.policyFlags.Options(cmd.dbOnly, cmd.force)})
+	renderUpdates(os.Stdout, plan)
+	actions := plan.actions()
+	if len(actions) == 0 {
 		fmt.Println("No updates available for any installed packages.")
 		return subcommands.ExitSuccess
 	}
@@ -118,14 +120,11 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 
 	ins := install.New(cache, db, cmd.policyFlags.Options(cmd.dbOnly, cmd.force))
 	exitCode := subcommands.ExitSuccess
-	for _, pi := range ud {
-		r, err := client.WhatRepo(pi, rm)
-		if err != nil {
-			logger.Errorf("Error finding repo: %v.", err)
-			exitCode = subcommands.ExitFailure
-			continue
-		}
-		if err := ins.FromRepo(ctx, pi, r, rm, settings.Archs, downloader); err != nil {
+	for _, a := range actions {
+		// Install from the repository the plan printed, so that what update
+		// shows and what it installs never disagree.
+		pi := a.info()
+		if err := ins.FromRepo(ctx, pi, a.repo, rm, settings.Archs, downloader); err != nil {
 			if policy.OrphanOnly(err) {
 				logSkippedOrphans(err)
 				continue
@@ -157,10 +156,11 @@ func logSkippedOrphans(err error) {
 	}
 }
 
-// updates plans the updates of the installed packages in state from rm, prints
-// and logs the plan, and returns the packages to install, in order.
+// updates plans the updates of the installed packages in state from rm with
+// the archs and install policies in settings, prints and logs the plan, and
+// returns the packages to install, in order.
 func updates(state client.GooGetState, rm client.RepoMap) []goolib.PackageInfo {
-	plan := planUpdates(state, rm)
+	plan := planUpdates(state, rm, updateConfig{archs: settings.Archs, opts: install.OptionsFromSettings(false, false)})
 	renderUpdates(os.Stdout, plan)
 	return plan.packageInfos()
 }

@@ -29,10 +29,11 @@ import (
 	"github.com/google/googet/v2/settings"
 )
 
-// TestCharacterizeUpdatesReplaces pins that updates() never reads Replaces.
-// A replacing package is only reached through the Provides fallback, which
-// runs once the installed package is gone from every repo, and that fallback
-// picks the top-ranked provider without checking whether it is the only one.
+// TestCharacterizeUpdatesReplaces pins that updates() doesn't follow Replaces
+// by default. A replacing package is only reached through the Provides
+// fallback, which runs once the installed package is gone from every repo,
+// and when that provider also replaces the installed package, it must be the
+// only package name that replaces and provides it at the best priority.
 func TestCharacterizeUpdatesReplaces(t *testing.T) {
 	installed := client.GooGetState{
 		{PackageSpec: &goolib.PkgSpec{Name: "P", Version: "1.0", Arch: "x86_32"}},
@@ -85,10 +86,10 @@ func TestCharacterizeUpdatesReplaces(t *testing.T) {
 			want:     []goolib.PackageInfo{{Name: "R", Arch: "x86_32", Ver: "2.0"}},
 		},
 		{
-			name:     "top-ranked of several replacers is chosen once P is retired",
-			intent:   "Known wrong: when more than one package name both Replaces and Provides P, a fix should skip the migration and log why.",
+			name:     "several replacers at the best priority are skipped once P is retired",
+			intent:   "Intended: when more than one package name both Replaces and Provides P at the best priority, update skips the migration and logs why.",
 			packages: []goolib.RepoSpec{replacer("R1", "2.0", "P"), replacer("R2", "3.0", "P")},
-			want:     []goolib.PackageInfo{{Name: "R2", Arch: "x86_32", Ver: "3.0"}},
+			want:     nil,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
