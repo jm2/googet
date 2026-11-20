@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/logger"
 )
 
 const googetEnvPrefix = "GOOGET_"
@@ -79,4 +80,17 @@ func withContext(c *exec.Cmd, ic goolib.InstallerContext) *exec.Cmd {
 	}
 	c.Env = installerEnv(c.Environ(), ic)
 	return c
+}
+
+func logInstallerContext(hook string, ic goolib.InstallerContext) {
+	action := ic.Action.String()
+	if action == "" {
+		return
+	}
+	replacedBy := ic.ReplacedBy
+	if ic.Action != goolib.ActionReplace {
+		replacedBy = ""
+	}
+	logger.Infof("installer_context hook=%s action=%s package=%s previous=%s replaced_by=%s",
+		hook, action, sanitizeEnvValue(ic.Package), sanitizeEnvValue(ic.PreviousVersion), sanitizeEnvValue(replacedBy))
 }
