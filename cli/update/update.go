@@ -28,7 +28,6 @@ import (
 	"github.com/google/googet/v2/cli/internal/policy"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
-	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/install"
 	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/repo"
@@ -98,7 +97,14 @@ func (cmd *updateCmd) Execute(ctx context.Context, _ *flag.FlagSet, _ ...interfa
 	}
 
 	rm := downloader.AvailableVersions(ctx, repos, cache, settings.CacheLife)
-	plan := planUpdates(state, rm, updateConfig{archs: settings.Archs, opts: cmd.policyFlags.Options(cmd.dbOnly, cmd.force)})
+	// Plan and print everything, replacements and their skip reasons
+	// included, before -dry_run stops, so that a dry run shows exactly what a
+	// live run would do.
+	plan := planUpdates(state, rm, updateConfig{
+		archs:          settings.Archs,
+		opts:           cmd.policyFlags.Options(cmd.dbOnly, cmd.force),
+		followReplaces: cmd.policyFlags.FollowReplaces(),
+	})
 	renderUpdates(os.Stdout, plan)
 	actions := plan.actions()
 	if len(actions) == 0 {
@@ -154,13 +160,4 @@ func logSkippedOrphans(err error) {
 		logger.Warningf("dependency_unsatisfied op=replace mode=fail result=skipped dependent=%s requirement=%q removed=%s replacer=%s",
 			d.Package, relation.FormatPackageRequirement(d.Requirement), strings.Join(removed, ","), d.ReplacedBy)
 	}
-}
-
-// updates plans the updates of the installed packages in state from rm with
-// the archs and install policies in settings, prints and logs the plan, and
-// returns the packages to install, in order.
-func updates(state client.GooGetState, rm client.RepoMap) []goolib.PackageInfo {
-	plan := planUpdates(state, rm, updateConfig{archs: settings.Archs, opts: install.OptionsFromSettings(false, false)})
-	renderUpdates(os.Stdout, plan)
-	return plan.packageInfos()
 }
