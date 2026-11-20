@@ -225,6 +225,35 @@ replaces them is recorded, plus the previous versions of upgraded packages
 until each upgrade completes. `googet clean` deletes cached archives
 that don't belong to an installed package.
 
+## File ownership
+
+`strictconflicts` defaults to `false` in `googet.conf`: when a package installs
+a file at a path already owned by another installed package, GooGet logs a
+file-conflict warning and overwrites the file unless `strictconflicts: true` is
+set without `-force`.
+
+- **Ownership transfer on differing content.** When a non-`-db_only` install
+  overwrites a file listed by another installed row (including another
+  architecture of the same package name) with a different SHA-256 checksum,
+  GooGet removes that path from the previous owner's `InstalledFiles` in the
+  same database transaction that records the new package, and logs a
+  `file_owner_transfer` line once the commit succeeds. When both packages ship
+  identical file content (equal checksums), both rows keep listing the path so
+  removing either package leaves the shared file on disk. Empty-checksum
+  entries never transfer, and replacement recovery never transfers ownership
+  away from surviving packages.
+- **Preserving co-owned paths.** `googet remove` and upgrade file cleanup never
+  delete a file or directory that any other installed row still lists, logging
+  a structured `file_kept` line instead. Non-`-db_only` removals read the
+  installed package rows before running the uninstall script (`googet remove
+  -db_only` skips that read).
+- **Windows path equivalence.** On Windows, file-conflict checks, ownership
+  lookups, and upgrade cleanup clean paths, fold `/` to `\`, and upper-case
+  each rune (`unicode.ToUpper`). GooGet does not resolve DOS 8.3 short names,
+  NTFS junctions or symbolic links, drive-relative paths (`\foo` or `C:foo`
+  versus `C:\foo`), trailing dots or spaces, or case-insensitive APFS volumes
+  on macOS.
+
 ## Package relations
 
 Package specs declare relationships through `PkgDependencies`, `Provides`,

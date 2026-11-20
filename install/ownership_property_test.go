@@ -441,7 +441,7 @@ func TestRandomOwnershipRealFilesystemAndSQLite(t *testing.T) {
 			LocalPath:      gooV2,
 			InstalledFiles: v2Ins,
 		}
-		if err := recordInstall(db, rowV2, applyStepPolicy(false), db.AddPkg); err != nil {
+		if err := recordInstall(db, rowV2, applyStepPolicy(false), db.AddPkgWithTransfers); err != nil {
 			db.Close()
 			t.Fatalf("seed %d: recordInstall(P0 v2): %v", seed, err)
 		}

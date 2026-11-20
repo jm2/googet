@@ -514,7 +514,7 @@ func TestInstallAddPkg(t *testing.T) {
 			var placed map[string]string
 			orig := addPkg
 			t.Cleanup(func() { addPkg = orig })
-			addPkg = func(db *googetdb.GooDB, ps client.PackageState) error {
+			addPkg = func(db *googetdb.GooDB, ps client.PackageState, transfers []googetdb.FileTransfer) error {
 				placed = make(map[string]string)
 				for rel, body := range tree(t, dst) {
 					if i := strings.Index(rel, backupInfix); i >= 0 {
@@ -528,7 +528,7 @@ func TestInstallAddPkg(t *testing.T) {
 				case addPkgPanic:
 					panic(errAddPkg)
 				}
-				return orig(db, ps)
+				return orig(db, ps, transfers)
 			}
 
 			var panicked any
