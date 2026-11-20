@@ -16,9 +16,11 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -204,4 +206,123 @@ func TestAddFlags(t *testing.T) {
 			t.Errorf("flag %q value %q!=%q", fn, got, value)
 		}
 	}
+}
+
+// TestCheckRelations verifies that checkRelations writes warnings without
+// failing when no fatal syntax problem is present, and returns an error
+// wrapping goolib.ErrRelationSyntax when fatal problems exist.
+func TestCheckRelations(t *testing.T) {
+	t.Run("clean spec", func(t *testing.T) {
+		var buf bytes.Buffer
+		ps := &goolib.PkgSpec{
+			Name:      "foo",
+			Arch:      "noarch",
+			Version:   "1.0.0",
+			Conflicts: []string{"bar.noarch"},
+			Provides:  []string{"virt=1.0"},
+		}
+		if err := checkRelations(ps, &buf); err != nil {
+			t.Fatalf("checkRelations = %v, want nil", err)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("unexpected warning output: %q", buf.String())
+		}
+	})
+
+	t.Run("warning-only spec succeeds and prints warnings", func(t *testing.T) {
+		var buf bytes.Buffer
+		ps := &goolib.PkgSpec{
+			Name:      "foo",
+			Arch:      "noarch",
+			Version:   "1.0.0",
+			Conflicts: []string{"bar", "bad.noarch.notaver"},
+			Replaces:  []string{"bar"},
+		}
+		if err := checkRelations(ps, &buf); err != nil {
+			t.Fatalf("checkRelations on warning-only spec = %v, want nil", err)
+		}
+		for _, want := range []string{
+			`Warning: Conflicts entry "bad.noarch.notaver" has invalid version`,
+			`Warning: Replaces and Conflicts both name "bar"`,
+		} {
+			if !strings.Contains(buf.String(), want) {
+				t.Errorf("warnings missing %q; got:\n%s", want, buf.String())
+			}
+		}
+	})
+
+	t.Run("fatal spec prints warnings and returns ErrRelationSyntax", func(t *testing.T) {
+		var buf bytes.Buffer
+		ps := &goolib.PkgSpec{
+			Name:      "foo",
+			Arch:      "noarch",
+			Version:   "1.0.0",
+			Conflicts: []string{"bar>=1.0", "dotted.pkg"},
+		}
+		err := checkRelations(ps, &buf)
+		if !errors.Is(err, goolib.ErrRelationSyntax) {
+			t.Fatalf("checkRelations error = %v, want errors.Is(ErrRelationSyntax)", err)
+		}
+		if !strings.Contains(buf.String(), `Warning: Conflicts entry "dotted.pkg"`) {
+			t.Errorf("warnings missing dotted.pkg warning; got:\n%s", buf.String())
+		}
+	})
+}
+
+// TestBuildFromSpecEnforcesRelationsBeforeBuild checks that buildFromSpec
+// rejects fatal relation syntax before running build scripts, while allowing
+// warning-only specs to build a .goo archive.
+func TestBuildFromSpecEnforcesRelationsBeforeBuild(t *testing.T) {
+	t.Run("fatal relation rejected before build script runs", func(t *testing.T) {
+		dir := t.TempDir()
+		specPath := filepath.Join(dir, "bad.goospec")
+		// Build points to a nonexistent script; if createPackage ran, it would
+		// fail executing the missing script instead of returning ErrRelationSyntax.
+		specJSON := `{
+  "name": "badpkg",
+  "version": "1.0.0",
+  "arch": "noarch",
+  "conflicts": ["dep >= 2.0"],
+  "build": {
+    "linux": "missing-build-script.sh",
+    "windows": "missing-build-script.cmd"
+  }
+}`
+		if err := os.WriteFile(specPath, []byte(specJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+		var errBuf bytes.Buffer
+		err := buildFromSpec(specPath, dir, nil, &errBuf)
+		if !errors.Is(err, goolib.ErrRelationSyntax) {
+			t.Fatalf("buildFromSpec = %v, want errors.Is(ErrRelationSyntax)", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, "badpkg.noarch.1.0.0.goo")); !os.IsNotExist(statErr) {
+			t.Errorf("expected no .goo archive to be written, stat err = %v", statErr)
+		}
+	})
+
+	t.Run("warning-only spec builds archive and writes warning", func(t *testing.T) {
+		dir := t.TempDir()
+		specPath := filepath.Join(dir, "warn.goospec")
+		specJSON := `{
+  "name": "warnpkg",
+  "version": "1.0.0",
+  "arch": "noarch",
+  "conflicts": ["oldpkg"],
+  "replaces": ["oldpkg"]
+}`
+		if err := os.WriteFile(specPath, []byte(specJSON), 0644); err != nil {
+			t.Fatal(err)
+		}
+		var errBuf bytes.Buffer
+		if err := buildFromSpec(specPath, dir, nil, &errBuf); err != nil {
+			t.Fatalf("buildFromSpec = %v, want nil", err)
+		}
+		if !strings.Contains(errBuf.String(), `Warning: Replaces and Conflicts both name "oldpkg"`) {
+			t.Errorf("stderr warnings = %q, want overlap warning", errBuf.String())
+		}
+		if _, err := os.Stat(filepath.Join(dir, "warnpkg.noarch.1.0.0.goo")); err != nil {
+			t.Errorf("built .goo archive missing: %v", err)
+		}
+	})
 }

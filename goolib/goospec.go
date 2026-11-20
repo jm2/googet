@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/blang/semver"
 	"github.com/google/googet/v2/priority"
@@ -73,6 +75,12 @@ const (
 )
 
 var validArch = []string{"noarch", "x86_64", "x86_32", "arm", "arm64"}
+
+// ValidArchs returns a copy of the architecture names recognized by GooGet
+// package specifications.
+func ValidArchs() []string {
+	return slices.Clone(validArch)
+}
 
 // PkgSpec is an individual package specification.
 type PkgSpec struct {
@@ -526,4 +534,146 @@ func (ps PkgSpec) PrettyPrint(w io.Writer, fromRepo string) {
 			writeLines(pi.name, strings.Split(strings.TrimSpace(pi.value), "\n"))
 		}
 	}
+}
+
+// ErrRelationSyntax marks a RelationProblems error for fatal name or relation
+// syntax that build and upload tools must reject.
+var ErrRelationSyntax = errors.New("relation syntax")
+
+// hasForbiddenRelationChar reports whether s contains '<', '>', '=', or any
+// Unicode whitespace character.
+func hasForbiddenRelationChar(s string) bool {
+	for _, r := range s {
+		if r == '<' || r == '>' || r == '=' || unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkDotRelationEmpty checks whether trimmed (the TrimSpace form of raw in
+// field) is empty or contains an empty dot-delimited name, architecture, or
+// version segment.
+func checkDotRelationEmpty(field, raw, trimmed string) error {
+	if trimmed == "" {
+		return fmt.Errorf("%s %q is empty", field, raw)
+	}
+	parts := strings.SplitN(trimmed, ".", 3)
+	if parts[0] == "" {
+		return fmt.Errorf("%s %q has an empty package name", field, raw)
+	}
+	if len(parts) == 2 && parts[1] == "" {
+		return fmt.Errorf("%s %q has an empty architecture segment", field, raw)
+	}
+	if len(parts) == 3 && (parts[1] == "" || parts[2] == "") {
+		return fmt.Errorf("%s %q has an empty dot-delimited segment", field, raw)
+	}
+	return nil
+}
+
+// checkRelationEntry validates the common dot-delimited structure of raw for
+// field, returning the split PackageInfo, any syntax or architecture problems,
+// and whether field-specific checks should continue.
+func checkRelationEntry(field, raw string) (pi PackageInfo, probs []error, ok bool) {
+	trimmed := strings.TrimSpace(raw)
+	if hasForbiddenRelationChar(trimmed) {
+		return pi, []error{fmt.Errorf("%w: %s %q must not contain '<', '>', '=' or whitespace", ErrRelationSyntax, field, raw)}, false
+	}
+	if err := checkDotRelationEmpty(field, raw, trimmed); err != nil {
+		return pi, []error{err}, false
+	}
+	pi = PkgNameSplit(raw)
+	if pi.Arch != "" && !slices.Contains(validArch, pi.Arch) {
+		probs = append(probs, fmt.Errorf("%s %q has unknown architecture %q (often a dotted package name); matches only a package with that literal architecture", field, raw, pi.Arch))
+	}
+	return pi, probs, true
+}
+
+// checkRelationVersion checks that pi.Ver, when present on raw in field, parses
+// as a valid GooGet version.
+func checkRelationVersion(field, raw string, pi PackageInfo) error {
+	if pi.Ver == "" {
+		return nil
+	}
+	if _, err := ParseVersion(pi.Ver); err != nil {
+		return fmt.Errorf("%s %q has invalid version %q (%v): install fails whenever %s is installed", field, raw, pi.Ver, err, pi.Name)
+	}
+	return nil
+}
+
+// RelationProblems reports problems in ps's name and relation fields that
+// verify does not check. Errors that wrap ErrRelationSyntax should fail a
+// build or upload; the rest are warnings. Order: Name, Conflicts, Replaces,
+// Provides, then PkgDependencies keys sorted.
+func (ps *PkgSpec) RelationProblems() []error {
+	if ps == nil {
+		return nil
+	}
+	var probs []error
+
+	if hasForbiddenRelationChar(ps.Name) {
+		probs = append(probs, fmt.Errorf("%w: package name %q must not contain '<', '>', '=' or whitespace", ErrRelationSyntax, ps.Name))
+	}
+
+	conflictNames := make(map[string]bool)
+	for _, raw := range ps.Conflicts {
+		pi, entryProbs, ok := checkRelationEntry("Conflicts entry", raw)
+		probs = append(probs, entryProbs...)
+		if !ok {
+			continue
+		}
+		conflictNames[pi.Name] = true
+		if err := checkRelationVersion("Conflicts entry", raw, pi); err != nil {
+			probs = append(probs, err)
+		}
+	}
+
+	warnedBoth := make(map[string]bool)
+	for _, raw := range ps.Replaces {
+		pi, entryProbs, ok := checkRelationEntry("Replaces entry", raw)
+		probs = append(probs, entryProbs...)
+		if !ok {
+			continue
+		}
+		if err := checkRelationVersion("Replaces entry", raw, pi); err != nil {
+			probs = append(probs, err)
+		}
+		if conflictNames[pi.Name] && !warnedBoth[pi.Name] {
+			warnedBoth[pi.Name] = true
+			probs = append(probs, fmt.Errorf("Replaces and Conflicts both name %q: googet before 3.5.0 refuses to install this package while %s is installed", pi.Name, pi.Name))
+		}
+		if ps.Name != "" && pi.Name == ps.Name && (pi.Arch == "" || pi.Arch == ps.Arch) {
+			probs = append(probs, fmt.Errorf("Replaces entry %q names this package itself: upgrading removes the installed version and its dependents first", raw))
+		}
+	}
+
+	for _, raw := range ps.Provides {
+		name, ver, hasEq := strings.Cut(raw, "=")
+		if hasForbiddenRelationChar(name) || (hasEq && hasForbiddenRelationChar(ver)) {
+			probs = append(probs, fmt.Errorf("%w: Provides entry %q must not contain '<', '>', extra '=', or whitespace", ErrRelationSyntax, raw))
+			continue
+		}
+		if name == "" || (hasEq && ver == "") {
+			probs = append(probs, fmt.Errorf("Provides entry %q has an empty name or version", raw))
+			continue
+		}
+		if hasEq {
+			if _, err := ParseVersion(ver); err != nil {
+				probs = append(probs, fmt.Errorf("Provides entry %q has invalid version %q (%v): never satisfies a versioned requirement", raw, ver, err))
+			}
+		}
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(ps.PkgDependencies)) {
+		pi, entryProbs, ok := checkRelationEntry("PkgDependencies key", key)
+		probs = append(probs, entryProbs...)
+		if !ok {
+			continue
+		}
+		if pi.Ver != "" {
+			probs = append(probs, fmt.Errorf("PkgDependencies key %q embeds version %q, which is ignored in favour of map value %q", key, pi.Ver, ps.PkgDependencies[key]))
+		}
+	}
+
+	return probs
 }
