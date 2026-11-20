@@ -20,13 +20,13 @@ import (
 	"maps"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/download"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/internal/ownership"
 	"github.com/google/googet/v2/internal/relation"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/system"
@@ -89,6 +89,14 @@ func UninstallRow(ctx context.Context, row client.PackageState, opts Options, db
 // deletes the archive. label names the package in messages.
 func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.PackageState, dbOnly, keepCache bool, downloader *client.Downloader, db *googetdb.GooDB) error {
 	if !dbOnly {
+		state, err := db.FetchPkgs("")
+		if err != nil {
+			return err
+		}
+		ix := ownership.NewIndex(state, ownership.RowID{
+			Name: ps.PackageSpec.Name,
+			Arch: ps.PackageSpec.Arch,
+		})
 		archive, err := localArchive(ctx, label, ps, downloader)
 		if err != nil {
 			return err
@@ -106,24 +114,13 @@ func uninstallRow(ctx context.Context, label goolib.PackageInfo, ps client.Packa
 		}
 
 		if len(ps.InstalledFiles) > 0 {
-			var dirs []string
-			for file, chksum := range ps.InstalledFiles {
-				if chksum == "" {
-					dirs = append(dirs, file)
-					continue
-				}
-				logger.Infof("Removing %q", file)
-				if _, err := client.RemoveOrRename(file); err != nil {
-					logger.Error(err)
-				}
-			}
-			sort.Sort(sort.Reverse(sort.StringSlice(dirs)))
-			for _, dir := range dirs {
-				logger.Infof("Removing %q", dir)
-				if _, err := client.RemoveOrRename(dir); err != nil {
-					logger.Info(err)
-				}
-			}
+			ownership.Execute(
+				ownership.PlanDelete(ps.InstalledFiles, ix),
+				"remove",
+				ps.PackageSpec.String(),
+				client.RemoveOrRename,
+				ownership.Logger{Infof: logger.Infof, Errorf: logger.Errorf},
+			)
 		}
 		if !keepCache {
 			if err := oswrap.RemoveAll(archive); err != nil {

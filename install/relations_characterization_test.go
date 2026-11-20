@@ -365,11 +365,9 @@ func TestCharacterizeConflictsOneWay(t *testing.T) {
 	}
 }
 
-// TestCharacterizeOverwrittenFileDeletedOnRemove pins that when B overwrites
-// a file that A installed, removing A deletes the file even though B's
-// database row still lists it.
-//
-// Known wrong: a fix should keep the file, because B owns it.
+// TestCharacterizeOverwrittenFileDeletedOnRemove checks that when B overwrites
+// a file that A installed, removing A keeps the file on disk with B's content
+// because B's database row still lists it.
 func TestCharacterizeOverwrittenFileDeletedOnRemove(t *testing.T) {
 	f := newRelFixture(t, nil, nil)
 	shared := filepath.Join(f.dst, "shared")
@@ -380,8 +378,8 @@ func TestCharacterizeOverwrittenFileDeletedOnRemove(t *testing.T) {
 	}
 
 	f.remove(t, "A")
-	if _, err := os.Stat(shared); !os.IsNotExist(err) {
-		t.Errorf("shared file: Stat error = %v, want it deleted with A (today removal ignores ownership)", err)
+	if b, err := os.ReadFile(shared); err != nil || string(b) != "from B" {
+		t.Errorf("shared file after removing A = %q, %v; want kept with %q", b, err, "from B")
 	}
 	b, err := f.db.FetchPkg(goolib.PackageInfo{Name: "B", Arch: "noarch"})
 	if err != nil {
