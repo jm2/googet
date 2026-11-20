@@ -130,22 +130,34 @@ func minInstalled(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
 	return ok, err
 }
 
-// isSatisfied reports whether the package dependency is satisfied by an installed package
-// or a package that provides it.
+// isSatisfied reports whether the package dependency r is satisfied by any
+// installed database row matching r's name, arch, and minimum version, or by
+// any installed package that provides r. It queries SQLite directly without
+// calling relation.Resolve so it serves as an independent reference for
+// satisfiedIn.
 func isSatisfied(r relation.Requirement, db *googetdb.GooDB) (bool, error) {
-	// First check if the package itself is installed.
-	ok, err := minInstalled(r, db)
-	if err != nil {
-		return false, err
-	}
-	if ok {
-		return true, nil
-	}
-
-	// Check if any installed package provides this dependency.
 	pkgs, err := db.FetchPkgs("")
 	if err != nil {
 		return false, err
+	}
+	matched := false
+	for _, p := range pkgs {
+		if p.PackageSpec == nil {
+			continue
+		}
+		ps := p.PackageSpec
+		if ps.Name == r.Name && (r.Arch == "" || ps.Arch == r.Arch) {
+			c, err := goolib.Compare(r.Ver, ps.Version)
+			if err != nil {
+				return false, err
+			}
+			if c < 1 {
+				matched = true
+			}
+		}
+	}
+	if matched {
+		return true, nil
 	}
 	for _, p := range pkgs {
 		if p.PackageSpec == nil {
