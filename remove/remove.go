@@ -17,8 +17,11 @@ package remove
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
+	"slices"
 	"sort"
+	"strings"
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/download"
@@ -113,23 +116,25 @@ func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, dbOnly bool, downl
 // DepMap is a map of packages to dependant packages.
 type DepMap map[string][]string
 
+// remove deletes name from the map and from every list of dependents.
 func (deps DepMap) remove(name string) {
 	for dep, s := range deps {
-		for i, d := range s {
-			if d == name {
-				s[i] = s[len(s)-1]
-				s = s[:len(s)-1]
-				deps[dep] = s
-				break
-			}
-		}
+		deps[dep] = slices.DeleteFunc(s, func(d string) bool { return d == name })
 	}
 	delete(deps, name)
 }
 
+// build adds name.arch and, transitively, every installed package that
+// depends on it. Each package is visited once, so a dependency cycle ends,
+// and each dependent is listed once per package even if it names the
+// package by more than one dependency key.
 func (deps DepMap) build(name, arch string, state client.GooGetState) {
+	key := name + "." + arch
+	if _, ok := deps[key]; ok {
+		return
+	}
 	logger.Infof("Building dependency map for %q", name)
-	deps[name+"."+arch] = nil
+	deps[key] = nil
 	for _, p := range state {
 		if p.PackageSpec.Name == name && p.PackageSpec.Arch == arch {
 			continue
@@ -138,11 +143,59 @@ func (deps DepMap) build(name, arch string, state client.GooGetState) {
 			di := goolib.PkgNameSplit(d)
 			if di.Name == name && (di.Arch == arch || di.Arch == "") {
 				n, a := p.PackageSpec.Name, p.PackageSpec.Arch
-				deps[name+"."+arch] = append(deps[name+"."+arch], n+"."+a)
+				if dep := n + "." + a; !slices.Contains(deps[key], dep) {
+					deps[key] = append(deps[key], dep)
+				}
 				deps.build(n, a, state)
 			}
 		}
 	}
+}
+
+// removalOrder returns the packages in deps other than root, ordered so that
+// each one comes after every package that depends on it. Root is removed last
+// by contract, so root's own dependencies are removed before it even when
+// they depend on root in turn; rootCycle lists those that do. If the
+// remaining packages depend on each other in a cycle that doesn't include
+// root, removalOrder returns an error naming them, and nothing should be
+// removed. deps is not modified.
+func removalOrder(deps DepMap, root string) (order, rootCycle []string, err error) {
+	pending := make(DepMap, len(deps))
+	for pkg, dependents := range deps {
+		pending[pkg] = slices.Clone(dependents)
+		// A dependent that isn't a key would otherwise never be removed.
+		for _, d := range dependents {
+			if _, ok := deps[d]; !ok {
+				pending[d] = nil
+			}
+		}
+	}
+	if _, ok := pending[root]; ok {
+		for _, pkg := range slices.Sorted(maps.Keys(pending)) {
+			if slices.Contains(pending[pkg], root) {
+				rootCycle = append(rootCycle, pkg)
+			}
+		}
+		pending.remove(root)
+	}
+	for len(pending) > 0 {
+		var ready []string
+		for pkg, dependents := range pending {
+			if len(dependents) == 0 {
+				ready = append(ready, pkg)
+			}
+		}
+		if len(ready) == 0 {
+			remaining := slices.Sorted(maps.Keys(pending))
+			return nil, nil, fmt.Errorf("cannot remove %s: these packages depend on each other in a cycle: %s; remove one of them first", root, strings.Join(remaining, ", "))
+		}
+		slices.Sort(ready)
+		for _, pkg := range ready {
+			pending.remove(pkg)
+		}
+		order = append(order, ready...)
+	}
+	return order, rootCycle, nil
 }
 
 // EnumerateDeps returns a DepMap and list of dependencies for a package.
@@ -166,20 +219,23 @@ func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string,
 }
 
 // All removes a package and all dependent packages. Packages with no dependent packages
-// will be removed first.
+// will be removed first. The removal order is worked out before anything is
+// removed, so a dependency cycle that prevents it fails without removing
+// anything. deps is not modified.
 func All(ctx context.Context, pi goolib.PackageInfo, deps DepMap, dbOnly bool, downloader *client.Downloader, db *googetdb.GooDB) error {
-	// deps includes an entry for pi itself, but we don't need to iterate over it
+	// deps includes an entry for pi itself, which removalOrder leaves out
 	// because pi is always uninstalled at the end.
-	delete(deps, pi.Name+"."+pi.Arch)
-	for len(deps) > 0 {
-		for dep := range deps {
-			if len(deps[dep]) == 0 {
-				di := goolib.PkgNameSplit(dep)
-				if err := uninstallPkg(ctx, di, dbOnly, downloader, db); err != nil {
-					return err
-				}
-				deps.remove(dep)
-			}
+	root := pi.Name + "." + pi.Arch
+	order, rootCycle, err := removalOrder(deps, root)
+	if err != nil {
+		return err
+	}
+	for _, pkg := range rootCycle {
+		logger.Infof("%s is in a dependency cycle with %s, which is being removed; removing %s first", pkg, root, pkg)
+	}
+	for _, dep := range order {
+		if err := uninstallPkg(ctx, goolib.PkgNameSplit(dep), dbOnly, downloader, db); err != nil {
+			return err
 		}
 	}
 	return uninstallPkg(ctx, pi, dbOnly, downloader, db)
