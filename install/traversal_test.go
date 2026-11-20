@@ -62,7 +62,7 @@ func TestInstallPkgFileSourceOutsideDir(t *testing.T) {
 
 	dst := t.TempDir()
 	ps := goolib.PkgSpec{Files: map[string]string{"../secret": filepath.Join(dst, "copied")}}
-	if _, err := installPkg(pkg, &ps, false, false, db); err == nil || !strings.Contains(err.Error(), "path traversal") {
+	if _, err := installPkg(pkg, &ps, false, false, db, nil); err == nil || !strings.Contains(err.Error(), "path traversal") {
 		t.Errorf("installPkg error = %v, want a path traversal error", err)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "copied")); !os.IsNotExist(err) {
