@@ -470,6 +470,9 @@ func main() {
 		}
 	}
 	if err := createPackage(gs, baseDir, outDir, *compression); err != nil {
-		log.Fatal(err)
+		log.Print(err)
+		goolib.Reraise(goolib.Interrupted())
+		os.Exit(1)
 	}
+	goolib.Reraise(goolib.Interrupted())
 }

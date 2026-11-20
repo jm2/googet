@@ -17,15 +17,19 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -323,5 +327,56 @@ func TestPackageFilesInvalidCompression(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("packageFiles left %d entries in the output dir, want none", len(entries))
+	}
+}
+
+func TestMainInterruptedReraises(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux build script and Unix signal forwarding")
+	}
+	const envKey = "GOOPACK_INTERRUPT_SPEC"
+	if spec := os.Getenv(envKey); spec != "" {
+		os.Args = []string{"goopack", "-output_dir=" + filepath.Dir(spec), spec}
+		main()
+		return
+	}
+
+	for _, tt := range []struct {
+		name    string
+		script  string
+		wantGoo bool
+	}{
+		{"during build", "#!/bin/sh\nkill -TERM $PPID\nsleep 10\n", false},
+		// Signal arrives once Run has reaped the build step while draining
+		// stdout, so createPackage succeeds and main's trailing Reraise handles it.
+		{"after build exit", "#!/bin/sh\n(while kill -0 $$ 2>/dev/null; do sleep 0.01; done; kill -TERM $PPID; sleep 0.5) &\nexit 0\n", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "build.sh"), []byte(tt.script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			specPath := filepath.Join(dir, "pkg.goospec")
+			spec := `{"name":"pkg","version":"1.0.0@1","arch":"noarch","build":{"linux":"build.sh"}}`
+			if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(os.Args[0], "-test.run=^TestMainInterruptedReraises$")
+			cmd.Env = append(os.Environ(), envKey+"="+specPath, "GORACE=atexit_sleep_ms=0")
+			out, err := cmd.CombinedOutput()
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) {
+				t.Fatalf("goopack helper Wait() = %v, want *exec.ExitError\noutput:\n%s", err, out)
+			}
+			ws := ee.Sys().(syscall.WaitStatus)
+			if !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
+				t.Fatalf("goopack helper exit status = %v, want killed by SIGTERM\noutput:\n%s", ee, out)
+			}
+			_, serr := os.Stat(filepath.Join(dir, "pkg.noarch.1.0.0@1.goo"))
+			if got := serr == nil; got != tt.wantGoo {
+				t.Errorf(".goo output exists = %v (stat err = %v), want %v", got, serr, tt.wantGoo)
+			}
+		})
 	}
 }
