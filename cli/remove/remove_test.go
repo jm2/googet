@@ -65,6 +65,51 @@ func TestRemoveOne(t *testing.T) {
 			},
 			wantState: []string{},
 		},
+		{
+			desc:    "dotted-name-bare",
+			pkgName: "foo.bar",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "x86_64", Version: "1"}},
+			},
+			wantState: []string{"foo.noarch.1"},
+		},
+		{
+			desc:    "dotted-name-arch",
+			pkgName: "foo.bar.x86_64",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "x86_64", Version: "1"}},
+			},
+			wantState: []string{"foo.bar.noarch.1", "foo.noarch.1"},
+		},
+		{
+			desc:    "dotted-name-missing-preserves-prefix-pkg",
+			pkgName: "foo.bar",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+			},
+			wantState: []string{"foo.noarch.1"},
+		},
+		{
+			desc:    "dotted-name-arch-missing-preserves-sibling-and-prefix",
+			pkgName: "foo.bar.arm64",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "foo.bar", Arch: "noarch", Version: "1"}},
+			},
+			wantState: []string{"foo.bar.noarch.1", "foo.noarch.1"},
+		},
+		{
+			desc:    "legacy-name-arch-ver",
+			pkgName: "A.noarch.1",
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1"}},
+				{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "2"}},
+			},
+			wantState: []string{"B.noarch.2"},
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			settings.Initialize(t.TempDir(), false)

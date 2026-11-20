@@ -268,3 +268,20 @@ func TestResolve(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitKey(t *testing.T) {
+	for _, tc := range []struct {
+		key  string
+		want goolib.PackageInfo
+	}{
+		{key: "P.noarch", want: goolib.PackageInfo{Name: "P", Arch: "noarch"}},
+		{key: "P.", want: goolib.PackageInfo{Name: "P"}},
+		{key: "foo.bar.noarch", want: goolib.PackageInfo{Name: "foo.bar", Arch: "noarch"}},
+		{key: "a.b.c.x86_64", want: goolib.PackageInfo{Name: "a.b.c", Arch: "x86_64"}},
+		{key: "nodot", want: goolib.PackageInfo{Name: "nodot"}},
+	} {
+		if got := SplitKey(tc.key); got != tc.want {
+			t.Errorf("SplitKey(%q) = %+v, want %+v", tc.key, got, tc.want)
+		}
+	}
+}
