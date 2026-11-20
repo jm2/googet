@@ -16,6 +16,7 @@ package install
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
@@ -232,7 +233,13 @@ func TestGoldenInstalls(t *testing.T) {
 		"dependency installed before the next one's reverse conflict fails",
 		"dependency installs a row that a Replaces entry doesn't remove",
 	}
-	var flipped []string
+	wantMultiArchVictimFlips := []string{
+		"replaced package selected again after its dependents",
+		"seed 113",
+		"seed 45",
+		"seed 62",
+	}
+	var flipped, multiArchFlipped []string
 	for _, gc := range cases {
 		c := gc.Scenario.corpusCase()
 		want := gc.Trace
@@ -243,6 +250,14 @@ func TestGoldenInstalls(t *testing.T) {
 			}
 			want.Installs, want.Removed, want.Final = nil, nil, before
 		}
+		if adjusted, ok := applyMultiArchVictimFlip(gc.Scenario, want); ok {
+			id := gc.Scenario.Name
+			if id == "" {
+				id = fmt.Sprintf("seed %d", gc.Scenario.Seed)
+			}
+			multiArchFlipped = append(multiArchFlipped, id)
+			want = adjusted
+		}
 		got := runLive(t, c, newRelFixture(t, c.Installed, c.Available))
 		if diff := cmp.Diff(want, got); diff != "" {
 			t.Errorf("scenario %q seed %d: FromRepo differs from the recording (-recorded +now):\n%s", gc.Scenario.Name, gc.Scenario.Seed, diff)
@@ -251,6 +266,36 @@ func TestGoldenInstalls(t *testing.T) {
 	slices.Sort(flipped)
 	if diff := cmp.Diff(wantFlipped, flipped); diff != "" {
 		t.Errorf("recorded failures that changed packages before failing (-want +got):\n%s", diff)
+	}
+	slices.Sort(multiArchFlipped)
+	if diff := cmp.Diff(wantMultiArchVictimFlips, multiArchFlipped); diff != "" {
+		t.Errorf("multi-arch victim scenarios flipped (-want +got):\n%s", diff)
+	}
+}
+
+// applyMultiArchVictimFlip returns the updated trace expected now that Replaces
+// resolves every qualifying architecture row and uninstalls concrete gated rows
+// without re-picking by name after removing dependents.
+func applyMultiArchVictimFlip(s goldenScenario, t trace) (trace, bool) {
+	switch {
+	case s.Name == "replaced package selected again after its dependents":
+		t.Final = []string{"P.noarch.1", "R.noarch.1"}
+		t.Removed = []string{`"P"`}
+		return t, true
+	case s.Name == "" && s.Seed == 45:
+		t.Final = slices.DeleteFunc(slices.Clone(t.Final), func(p string) bool { return p == "P.x86_64.1" })
+		t.Removed = append(slices.Clone(t.Removed), `"P"`)
+		return t, true
+	case s.Name == "" && s.Seed == 62:
+		t.Final = slices.DeleteFunc(slices.Clone(t.Final), func(p string) bool { return p == "D.x86_64.2" })
+		t.Removed = append(slices.Clone(t.Removed), `"D"`)
+		return t, true
+	case s.Name == "" && s.Seed == 113:
+		t.Final = slices.DeleteFunc(slices.Clone(t.Final), func(p string) bool { return p == "Q.x86_64.1" })
+		t.Removed = append(slices.Clone(t.Removed), `"Q"`)
+		return t, true
+	default:
+		return t, false
 	}
 }
 

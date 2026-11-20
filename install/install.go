@@ -32,27 +32,12 @@ import (
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/internal/relation"
-	"github.com/google/googet/v2/internal/snapshot"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/progress"
 	"github.com/google/googet/v2/remove"
 	"github.com/google/googet/v2/system"
 	"github.com/google/logger"
 )
-
-// minInstalledRowIn returns the row of the installed state st that
-// snapshot.Pick selects for r if it meets r's minimum version.
-func minInstalledRowIn(r relation.Requirement, st client.GooGetState) (client.PackageState, bool, error) {
-	p, ok := snapshot.Pick(r.PackageInfo(), st)
-	if !ok {
-		return client.PackageState{}, false, nil
-	}
-	ok, err := r.MinInstalled(p.PackageSpec.Name, p.PackageSpec.Arch, p.PackageSpec.Version)
-	if err != nil || !ok {
-		return client.PackageState{}, false, err
-	}
-	return p, true, nil
-}
 
 // satisfiedIn reports whether the dependency r is satisfied in the installed
 // state st: either some installed row meets r by package identity at r's
@@ -83,54 +68,70 @@ func simulateReplacements(ps *goolib.PkgSpec, installed client.GooGetState) (cli
 }
 
 // replaceRows works out, without changing anything, which installed packages
-// ps's Replaces entries remove, and in which order. For each entry in turn,
-// over a shrinking copy of installed, it takes the row FetchPkg would select
-// if that row meets the entry's minimum version, and removes the packages
-// that depend on it in remove.Plan's order and then, as remove.All does, the
-// entry's package, which it selects again once the dependents are gone. It
-// returns the post-replacement state and the removed rows in removal order,
-// or the error removing them would return.
+// ps's Replaces entries remove, and in which order. It resolves every
+// qualifying installed row across architectures via victimsIn, unions the
+// name-based dependent cascades per Replaces entry, and orders the combined
+// removal set topologically via remove.OrderSet.
 func replaceRows(ps *goolib.PkgSpec, installed client.GooGetState) (post client.GooGetState, removed []client.PackageState, err error) {
 	state := make(client.GooGetState, 0, len(installed))
+	byKey := make(map[string]client.PackageState, len(installed))
 	for _, st := range installed {
 		if st.PackageSpec != nil {
 			state = append(state, st)
+			byKey[pkgKey(st.PackageSpec)] = st
 		}
 	}
-	drop := func(pi goolib.PackageInfo) error {
-		pick, found := snapshot.Pick(pi, state)
-		if !found {
-			return fmt.Errorf("package %q not found in state database", pi.Name)
-		}
-		removed = append(removed, pick)
-		name, arch := pick.PackageSpec.Name, pick.PackageSpec.Arch
-		state = slices.DeleteFunc(state, func(st client.PackageState) bool {
-			return st.PackageSpec.Name == name && st.PackageSpec.Arch == arch
-		})
-		return nil
+	victims, err := victimsIn(ps, state)
+	if err != nil {
+		return nil, nil, err
 	}
+	if len(victims) == 0 {
+		return state, nil, nil
+	}
+	var rootKeys, allKeys []string
+	seen := make(map[string]bool, len(victims))
+	addKey := func(k string) {
+		if !seen[k] {
+			seen[k] = true
+			allKeys = append(allKeys, k)
+		}
+	}
+	for _, v := range victims {
+		k := pkgKey(v.PackageSpec)
+		rootKeys = append(rootKeys, k)
+		addKey(k)
+	}
+	specs := specsFromState(state)
 	for _, raw := range ps.Replaces {
 		r := relation.ParseRelation(raw)
-		pi := r.PackageInfo()
-		if _, ok, err := minInstalledRowIn(r, state); err != nil {
-			return nil, nil, err
-		} else if !ok {
-			continue
-		}
-		order, err := remove.Plan(pi, state)
+		matches, err := relation.Resolve(r, specs)
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, dep := range order {
-			if err := drop(relation.SplitKey(dep)); err != nil {
-				return nil, nil, err
-			}
+		if len(matches) == 0 {
+			continue
 		}
-		if err := drop(pi); err != nil {
+		depOrder, err := remove.Plan(r.PackageInfo(), state)
+		if err != nil {
 			return nil, nil, err
 		}
+		for _, dep := range depOrder {
+			addKey(dep)
+		}
 	}
-	return state, removed, nil
+	order, _, err := remove.OrderSet(allKeys, rootKeys, state)
+	if err != nil {
+		return nil, nil, err
+	}
+	removedSet := make(map[string]bool, len(order))
+	for _, k := range order {
+		removed = append(removed, byKey[k])
+		removedSet[k] = true
+	}
+	post = slices.DeleteFunc(state, func(st client.PackageState) bool {
+		return removedSet[pkgKey(st.PackageSpec)]
+	})
+	return post, removed, nil
 }
 
 const (

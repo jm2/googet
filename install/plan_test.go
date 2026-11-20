@@ -192,11 +192,11 @@ func TestBuildPlanSteps(t *testing.T) {
 	}
 }
 
-// TestBuildPlanReplacesRootBySelectingItAgain checks that the plan removes a
-// Replaces entry's package the way FromRepo does: once the entry's dependents
-// are gone, the package is selected again, which can pick a row other than
-// the one that met the entry's minimum version.
-func TestBuildPlanReplacesRootBySelectingItAgain(t *testing.T) {
+// TestBuildPlanReplacesOnlyVersionGatedRow checks that a versioned arch-less
+// Replaces entry removes only the concrete rows meeting its minimum version and
+// does not remove another architecture below the minimum version after
+// uninstalling dependents.
+func TestBuildPlanReplacesOnlyVersionGatedRow(t *testing.T) {
 	c := corpusCase{
 		Target: "R",
 		Installed: []goolib.PkgSpec{
@@ -212,11 +212,11 @@ func TestBuildPlanReplacesRootBySelectingItAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	planned := runPlan(c, f.rm, state)
-	if want := []string{`"P"`, `"P"`}; !slices.Equal(planned.Removed, want) {
+	if want := []string{`"P"`}; !slices.Equal(planned.Removed, want) {
 		t.Errorf("plan removed %v, want %v", planned.Removed, want)
 	}
-	if want := []string{"R.noarch.1"}; !slices.Equal(planned.Final, want) {
-		t.Errorf("plan final state %v, want %v (P.noarch.1 is removed although it is below the minimum version)", planned.Final, want)
+	if want := []string{"P.noarch.1", "R.noarch.1"}; !slices.Equal(planned.Final, want) {
+		t.Errorf("plan final state %v, want %v", planned.Final, want)
 	}
 	if diff := cmp.Diff(runLive(t, c, f), planned); diff != "" {
 		t.Errorf("plan differs from FromRepo (-FromRepo +plan):\n%s", diff)

@@ -65,4 +65,13 @@ func TestCharacterizeMultiArchRowSelection(t *testing.T) {
 	if ok, err := satisfiedIn(relation.ParseDependency("foo.noarch", "2"), state); err != nil || !ok {
 		t.Errorf("satisfiedIn(foo.noarch >= 2) = %t, %v; want true, nil", ok, err)
 	}
+	// Replaces selects every qualifying row across architectures while keeping
+	// rows below the minimum version.
+	_, removed, err := replaceRows(&goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Replaces: []string{"foo..2"}}, state)
+	if err != nil {
+		t.Fatalf("replaceRows(foo..2): %v", err)
+	}
+	if len(removed) != 1 || removed[0].PackageSpec.String() != "foo.noarch.3" {
+		t.Errorf("replaceRows(foo..2) removed %v, want [foo.noarch.3]", removed)
+	}
 }
