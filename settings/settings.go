@@ -47,6 +47,10 @@ var (
 	// values to "", so readConf only ever stores "" or a string accepted by
 	// install.ParseOrphanMode.
 	OrphanedDependents string
+	// FollowReplaces makes googet update replace an installed package with a
+	// package that declares Replaces and Provides for it; set from googet.conf
+	// (default false) and overridden by an explicit -follow_replaces flag.
+	FollowReplaces bool
 	// Progress enables the download progress bar and install spinner on
 	// interactive terminals; set from googet.conf (default true) and
 	// overridden by an explicit -progress flag.
@@ -67,6 +71,7 @@ func Snapshot() func() {
 	strictConflicts := StrictConflicts
 	packageConflicts := PackageConflicts
 	orphanedDependents := OrphanedDependents
+	followReplaces := FollowReplaces
 	progress := Progress
 	return func() {
 		RootDir = rootDir
@@ -79,6 +84,7 @@ func Snapshot() func() {
 		StrictConflicts = strictConflicts
 		PackageConflicts = packageConflicts
 		OrphanedDependents = orphanedDependents
+		FollowReplaces = followReplaces
 		Progress = progress
 	}
 }
@@ -137,6 +143,7 @@ type conf struct {
 	StrictConflicts    bool
 	PackageConflicts   string
 	OrphanedDependents string
+	FollowReplaces     bool
 	// Progress is a pointer so an absent key keeps the default of true.
 	Progress *bool
 }
@@ -155,6 +162,7 @@ func unmarshalConfFile(filename string) (*conf, error) {
 func readConf(filename string) {
 	PackageConflicts = ""
 	OrphanedDependents = ""
+	FollowReplaces = false
 	gc, err := unmarshalConfFile(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -214,6 +222,7 @@ func readConf(filename string) {
 	StrictConflicts = gc.StrictConflicts
 	PackageConflicts = validatePolicySetting(gc.PackageConflicts, "packageconflicts", filename, "warn", NormalizeConflictMode)
 	OrphanedDependents = validatePolicySetting(gc.OrphanedDependents, "orphaneddependents", filename, "fail", NormalizeOrphanMode)
+	FollowReplaces = gc.FollowReplaces
 	Progress = true
 	if gc.Progress != nil {
 		Progress = *gc.Progress
