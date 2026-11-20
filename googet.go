@@ -19,8 +19,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
+	"github.com/google/googet/v2/cli"
+	"github.com/google/googet/v2/cli/remove"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/progress"
@@ -38,7 +41,6 @@ import (
 	_ "github.com/google/googet/v2/cli/installed"
 	_ "github.com/google/googet/v2/cli/latest"
 	_ "github.com/google/googet/v2/cli/listrepos"
-	_ "github.com/google/googet/v2/cli/remove"
 	_ "github.com/google/googet/v2/cli/rmrepo"
 	_ "github.com/google/googet/v2/cli/update"
 	_ "github.com/google/googet/v2/cli/verify"
@@ -58,6 +60,12 @@ var (
 	version string
 	// Optional function to handle flag parsing. If unset, we use flag.Parse.
 	flagParse func()
+	// isAdmin returns an error if the process lacks administrator rights. It
+	// is a variable so that tests can replace it.
+	isAdmin = system.IsAdmin
+	// obtainLock takes the googet lock file. It is a variable so that tests
+	// can replace it.
+	obtainLock = system.ObtainLock
 
 	// rotateRename and rotateRemove are used by rotateLog so tests can
 	// simulate files that can't be moved or deleted, such as files locked
@@ -184,18 +192,29 @@ func run(ctx context.Context) int {
 	}
 
 	dbFile := settings.DBFile()
+	dbExists := googetdb.Exists(dbFile)
 
 	// "googet installed" is allowed to execute without a lock if the googet
 	// database has already been created.
-	if googetdb.Exists(dbFile) && cmdName == "installed" {
+	if dbExists && cmdName == "installed" {
 		return int(cmdr.Execute(ctx))
 	}
 
-	if err := system.IsAdmin(); err != nil {
+	// "googet remove -dry_run" only reads the database, so it is allowed to
+	// execute without admin rights or a lock on the same terms. It doesn't
+	// write googet.log or the system log; with -verbose, info logs still go to
+	// stdout.
+	if !needsPrivilege(cmdName, flag.Args()[1:], dbExists) {
+		logger.Init("GooGet", *verbose, false, io.Discard)
+		defer logger.Close()
+		return int(cmdr.Execute(ctx))
+	}
+
+	if err := isAdmin(); err != nil {
 		logger.Errorf("Failed admin check: %v", err)
 		return 1
 	}
-	cleanup, err := system.ObtainLock(settings.LockFile(), settings.LockFileMaxAge)
+	cleanup, err := obtainLock(settings.LockFile(), settings.LockFileMaxAge)
 	if err != nil {
 		logger.Errorf("Failed to obtain lock: %v", err)
 		return 1
@@ -203,6 +222,7 @@ func run(ctx context.Context) int {
 	if cleanup != nil {
 		defer cleanup()
 	}
+	ctx = cli.WithPrivileged(ctx)
 
 	logFile := settings.LogFile()
 	rotateWarnings := rotateLog(logFile, logSize, logKeep)
@@ -239,6 +259,19 @@ func run(ctx context.Context) int {
 		return 1
 	}
 	return int(cmdr.Execute(ctx))
+}
+
+// needsPrivilege reports whether the subcommand cmd, run with the arguments
+// args that follow it, needs the admin check, the lock and the log file.
+// dbExists reports whether the googet database already exists. It fails
+// closed: only a remove whose flags parse and request a dry run, against an
+// existing database, may run without privileges. Install and update dry runs
+// still write repo indexes, so they stay privileged.
+func needsPrivilege(cmd string, args []string, dbExists bool) bool {
+	if cmd != "remove" || !dbExists {
+		return true
+	}
+	return !remove.DryRunRequested(args)
 }
 
 // wantProgress reports whether progress output should be rendered, given the
