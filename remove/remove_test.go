@@ -22,6 +22,7 @@ import (
 	"log"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/googet/v2/client"
@@ -29,12 +30,8 @@ import (
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/settings"
-	"github.com/google/logger"
+	"github.com/google/googet/v2/testutil"
 )
-
-func init() {
-	logger.Init("test", true, false, ioutil.Discard)
-}
 
 func TestUninstallPkg(t *testing.T) {
 	settings.Initialize(t.TempDir(), false)
@@ -196,5 +193,66 @@ func TestRemoveDep(t *testing.T) {
 
 	if !reflect.DeepEqual(deps, want) {
 		t.Errorf("returned dependancy map does not match expected one: got %v, want %v", deps, want)
+	}
+}
+
+func TestPlan(t *testing.T) {
+	state := client.GooGetState{
+		{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "x86_64", Version: "1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "D", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1"}}},
+		{PackageSpec: &goolib.PkgSpec{Name: "Top", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"D.noarch": "1"}}},
+	}
+
+	// Arch-less root matches dependents with arch-less or arch-qualified deps
+	// via SameIdentity(name, ""), omits the root itself, removes leaf
+	// dependents before intermediate ones, and emits no log output.
+	logs := testutil.CaptureLogs(t)
+	got, err := Plan(goolib.PackageInfo{Name: "P"}, state)
+	if err != nil {
+		t.Fatalf("Plan(P): %v", err)
+	}
+	want := []string{"Top.noarch", "D.noarch"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Plan(P) = %v, want %v", got, want)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("Plan emitted unexpected log output:\n%s", logs.String())
+	}
+
+	// Non-root dependency cycles fail without removing anything.
+	cycleState := client.GooGetState{
+		{PackageSpec: &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"P": "1", "B": "1"}}},
+		{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"A": "1"}}},
+	}
+	if _, err := Plan(goolib.PackageInfo{Name: "P", Arch: "noarch"}, cycleState); err == nil {
+		t.Error("Plan on non-root cycle = nil, want error")
+	}
+
+	// Dotted package names fail state lookup via PkgNameSplit just like EnumerateDeps.
+	dottedState := client.GooGetState{
+		{PackageSpec: &goolib.PkgSpec{Name: "dotted.pkg", Arch: "noarch", Version: "1"}},
+	}
+	if _, err := Plan(goolib.PackageInfo{Name: "dotted.pkg", Arch: "noarch"}, dottedState); err == nil {
+		t.Error("Plan on dotted package name = nil, want error")
+	}
+	if logs.Len() != 0 {
+		t.Errorf("Plan error paths emitted unexpected log output:\n%s", logs.String())
+	}
+}
+
+func TestUninstallPkgMissingFromDB(t *testing.T) {
+	db, err := googetdb.NewDB(filepath.Join(t.TempDir(), "googet.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	for _, dbOnly := range []bool{false, true} {
+		err := uninstallPkg(context.Background(), goolib.PackageInfo{Name: "missing"}, dbOnly, nil, db)
+		if err == nil || !strings.Contains(err.Error(), "not found in state database") {
+			t.Errorf("uninstallPkg(missing, dbOnly=%t) = %v, want error containing %q", dbOnly, err, "not found in state database")
+		}
 	}
 }

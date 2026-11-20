@@ -1011,7 +1011,7 @@ func TestResolveConflicts_Provides(t *testing.T) {
 		Conflicts: []string{"libconflict"},
 	}
 
-	err = resolveConflicts(ps, exclusions{}, db)
+	_, err = resolveConflicts(ps, exclusions{}, db)
 	if err == nil {
 		t.Error("resolveConflicts expected error, got nil")
 	} else {
