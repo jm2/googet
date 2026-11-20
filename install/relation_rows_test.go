@@ -60,7 +60,7 @@ func TestCharacterizeMultiArchRowSelection(t *testing.T) {
 
 	// Known wrong: installed foo.noarch 3 should conflict.
 	conflicting := &goolib.PkgSpec{Name: "R", Arch: "noarch", Version: "1", Conflicts: []string{"foo.noarch.2"}}
-	if err := resolveConflicts(conflicting, f.db); err != nil {
+	if err := resolveConflicts(conflicting, exclusions{}, f.db); err != nil {
 		t.Errorf("resolveConflicts(Conflicts: foo.noarch.2) = %v, want nil (today the x86_64 row is checked)", err)
 	}
 	// Known wrong: installed foo.noarch 3 should satisfy the dependency.

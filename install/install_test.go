@@ -30,7 +30,6 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -41,36 +40,8 @@ import (
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
-	"github.com/google/logger"
+	"github.com/google/googet/v2/testutil"
 )
-
-// testLog receives the log output of the tests.
-var testLog syncBuffer
-
-func init() {
-	logger.Init("test", true, false, &testLog)
-}
-
-// syncBuffer is a bytes.Buffer that is safe for concurrent use.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-// take returns the buffered output and empties the buffer.
-func (b *syncBuffer) take() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s := b.buf.String()
-	b.buf.Reset()
-	return s
-}
 
 // captureStdout returns what f writes to os.Stdout.
 func captureStdout(t *testing.T, f func()) (out string) {
@@ -587,14 +558,14 @@ func TestInstallAddPkg(t *testing.T) {
 					return FromDisk(pkg, cache, tc.dbOnly, false, false, db)
 				}
 			}
-			testLog.take()
+			logBuf := testutil.CaptureLogs(t)
 			out := captureStdout(t, func() {
 				err = func() error {
 					defer func() { panicked = recover() }()
 					return install()
 				}()
 			})
-			logs := testLog.take()
+			logs := logBuf.String()
 
 			// The files are placed, the backup is kept and the old version is
 			// not yet cleaned up by the time the install is recorded. A dbOnly
@@ -712,11 +683,11 @@ func TestReinstallRollback(t *testing.T) {
 				},
 			}
 
-			testLog.take()
+			logBuf := testutil.CaptureLogs(t)
 			out := captureStdout(t, func() {
 				err = Reinstall(t.Context(), ps, false, false, nil, db)
 			})
-			logs := testLog.take()
+			logs := logBuf.String()
 
 			if gotErr, wantErr := err != nil, tc.installer != ""; gotErr != wantErr {
 				t.Errorf("Reinstall() = %v, want error %t", err, wantErr)
@@ -1040,7 +1011,7 @@ func TestResolveConflicts_Provides(t *testing.T) {
 		Conflicts: []string{"libconflict"},
 	}
 
-	err = resolveConflicts(ps, db)
+	err = resolveConflicts(ps, exclusions{}, db)
 	if err == nil {
 		t.Error("resolveConflicts expected error, got nil")
 	} else {
