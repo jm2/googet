@@ -3,7 +3,6 @@ package settings
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/system"
 	"github.com/google/logger"
 	"gopkg.in/yaml.v3"
@@ -109,7 +109,7 @@ type conf struct {
 // It returns an error if the file exists but can't be read.
 func readConf(filename string) error {
 	gc := &conf{}
-	b, err := ioutil.ReadFile(filename)
+	b, err := oswrap.ReadFileShared(filename)
 	switch {
 	case os.IsNotExist(err):
 		// A missing file keeps the defaults.
