@@ -19,9 +19,11 @@ import (
 	"compress/gzip"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,9 +35,12 @@ import (
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
+	"github.com/google/googet/v2/testutil"
 	"github.com/google/logger"
 )
 
@@ -81,6 +86,51 @@ func TestDownloadUnknownSize(t *testing.T) {
 	}
 }
 
+// failingReader returns data and then err.
+type failingReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestDownloadFailureRemovesFile checks that download, which the GCS path
+// uses, removes dst on any error, so no empty, partial or corrupt file is left.
+func TestDownloadFailureRemovesFile(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789"), 100)
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	readErr := errors.New("connection reset")
+	for _, tc := range []struct {
+		desc    string
+		r       io.Reader
+		chksum  string
+		wantErr error
+	}{
+		{desc: "checksum mismatch", r: bytes.NewReader(payload), chksum: "badsum"},
+		{desc: "read fails partway", r: &failingReader{data: payload[:400], err: readErr}, chksum: chksum, wantErr: readErr},
+		{desc: "read fails before any data", r: &failingReader{err: readErr}, chksum: chksum, wantErr: readErr},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			dst := filepath.Join(t.TempDir(), "pkg.goo")
+			err := download(tc.r, int64(len(payload)), dst, tc.chksum)
+			if err == nil {
+				t.Fatal("download() = nil, want an error")
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("download() = %v, want %v", err, tc.wantErr)
+			}
+			assertNoFile(t, dst)
+		})
+	}
+}
+
 // rangeServer serves payload, advertising range support on HEAD. When
 // honorRange is false it answers ranged GETs with the whole file and 200 OK,
 // as some proxies do. When rejectHEAD is true it answers HEAD with 405.
@@ -117,6 +167,79 @@ func rangeServer(t *testing.T, payload []byte, honorRange, rejectHEAD bool, requ
 		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
 		w.Write(payload)
 	}))
+}
+
+// methodServer answers HEAD requests with head and GET requests with get,
+// and counts the requests it receives per method.
+type methodServer struct {
+	*httptest.Server
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func newMethodServer(t *testing.T, head, get http.HandlerFunc) *methodServer {
+	t.Helper()
+	s := &methodServer{counts: map[string]int{}}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.counts[r.Method]++
+		s.mu.Unlock()
+		switch r.Method {
+		case http.MethodHead:
+			head(w, r)
+		case http.MethodGet:
+			get(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func (s *methodServer) count(method string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.counts[method]
+}
+
+// statusHandler answers every request with code and no body.
+func statusHandler(code int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) }
+}
+
+// headOK answers HEAD with the payload size, advertising range support only
+// when ranges is true.
+func headOK(size int, ranges bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if ranges {
+			w.Header().Set("Accept-Ranges", "bytes")
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+	}
+}
+
+// resetConn closes the connection before sending any response headers.
+func resetConn(w http.ResponseWriter, _ *http.Request) {
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		panic(err)
+	}
+	if tc, ok := conn.(interface{ SetLinger(int) error }); ok {
+		tc.SetLinger(0) // Send RST rather than FIN.
+	}
+	conn.Close()
+}
+
+// assertNoFile fails the test if path exists.
+func assertNoFile(t *testing.T, path string) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err == nil {
+		t.Errorf("%s exists with %d bytes after a failed download, want no file", filepath.Base(path), fi.Size())
+	} else if !os.IsNotExist(err) {
+		t.Errorf("os.Stat(%s) = %v, want IsNotExist", path, err)
+	}
 }
 
 func TestPackageHTTP(t *testing.T) {
@@ -223,6 +346,117 @@ func TestPackageHTTP(t *testing.T) {
 			t.Errorf("os.Stat(dst) after checksum mismatch = %v, want IsNotExist", err)
 		}
 	})
+}
+
+func TestExtractPkgSiblingTraversal(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "foo.goo")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+	// ExtractPkg extracts foo.goo to dir/foo, so this entry targets the sibling
+	// dir/foo-evil, whose path has dir/foo as a string prefix.
+	body := []byte("escaped")
+	if err := tw.WriteHeader(&tar.Header{Name: "../foo-evil/x", Mode: 0644, Size: int64(len(body))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ExtractPkg(src); err == nil || !strings.Contains(err.Error(), "path traversal") {
+		t.Errorf("ExtractPkg error = %v, want a path traversal error", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "foo-evil", "x")); !os.IsNotExist(err) {
+		t.Errorf("ExtractPkg wrote outside the destination directory: stat error = %v", err)
+	}
+}
+
+// TestPackageHTTPFailureLeavesNoEmptyFile checks that a failed HTTP download
+// never leaves a 0-byte file at dst, however dst came to be empty.
+func TestPackageHTTPFailureLeavesNoEmptyFile(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	payload := bytes.Repeat([]byte("0123456789"), 100)
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	downloader, err := client.NewDownloader("")
+	if err != nil {
+		t.Fatalf("client.NewDownloader: %v", err)
+	}
+	for _, tc := range []struct {
+		desc     string
+		existing []byte // Written to dst before the download; nil means no file.
+		head     http.HandlerFunc
+		get      http.HandlerFunc
+	}{
+		{
+			desc: "no file and 404",
+			head: statusHandler(http.StatusNotFound),
+			get:  statusHandler(http.StatusNotFound),
+		},
+		{
+			desc: "no file and connection reset before headers",
+			head: headOK(len(payload), true),
+			get:  resetConn,
+		},
+		{
+			// Without Accept-Ranges, restart() truncates the partial file
+			// before the GET fails.
+			desc:     "partial file truncated by restart then 503",
+			existing: payload[:400],
+			head:     headOK(len(payload), false),
+			get:      statusHandler(http.StatusServiceUnavailable),
+		},
+		{
+			// A full-size file with the wrong checksum is
+			// truncated before the GET fails.
+			desc:     "full-size corrupt file then 404",
+			existing: bytes.Repeat([]byte("x"), len(payload)),
+			head:     headOK(len(payload), true),
+			get:      statusHandler(http.StatusNotFound),
+		},
+		{
+			// An empty file left by an older googet.
+			desc:     "empty file left behind then 404",
+			existing: []byte{},
+			head:     statusHandler(http.StatusNotFound),
+			get:      statusHandler(http.StatusNotFound),
+		},
+		{
+			desc:     "empty file left behind then connection reset",
+			existing: []byte{},
+			head:     headOK(len(payload), true),
+			get:      resetConn,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			srv := newMethodServer(t, tc.head, tc.get)
+			dst := filepath.Join(t.TempDir(), "pkg.goo")
+			if tc.existing != nil {
+				if err := os.WriteFile(dst, tc.existing, 0644); err != nil {
+					t.Fatalf("writing existing file: %v", err)
+				}
+			}
+			if err := Package(context.Background(), srv.URL+"/pkg.goo", dst, chksum, downloader); err == nil {
+				t.Fatal("Package() = nil, want an error")
+			}
+			if srv.count(http.MethodGet) == 0 {
+				t.Errorf("server got no GET request, want at least 1")
+			}
+			assertNoFile(t, dst)
+		})
+	}
 }
 
 func TestLatest(t *testing.T) {
@@ -426,8 +660,8 @@ func TestPackageRetries(t *testing.T) {
 			wantRanges: []string{"bytes=0-"},
 		},
 		{
-			desc:       "any error is retried until maxAttempts",
-			steps:      slices.Repeat([]step{{status: http.StatusNotFound}}, maxAttempts),
+			desc:       "server error is retried until maxAttempts",
+			steps:      slices.Repeat([]step{{status: http.StatusServiceUnavailable}}, maxAttempts),
 			wantRanges: slices.Repeat([]string{"bytes=0-"}, maxAttempts),
 			wantErr:    true,
 		},
@@ -458,6 +692,139 @@ func TestPackageRetries(t *testing.T) {
 				t.Errorf("GET ranges = %q, want %q", ranges, tc.wantRanges)
 			}
 		})
+	}
+}
+
+// timeoutError is a net.Error that reports a timeout.
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// TestIsPermanent checks that only 4xx statuses other than 408, 425 and 429,
+// and a missing GCS object, are permanent.
+func TestIsPermanent(t *testing.T) {
+	status := func(code int) error {
+		return &statusError{url: "http://example.com/pkg.goo", code: code, status: fmt.Sprintf("%d %s", code, http.StatusText(code))}
+	}
+	for _, tc := range []struct {
+		desc string
+		err  error
+		want bool
+	}{
+		{"400", status(http.StatusBadRequest), true},
+		{"401", status(http.StatusUnauthorized), true},
+		{"403", status(http.StatusForbidden), true},
+		{"404", status(http.StatusNotFound), true},
+		{"410", status(http.StatusGone), true},
+		{"wrapped 404", fmt.Errorf("attempt: %w", status(http.StatusNotFound)), true},
+		{"304", status(http.StatusNotModified), false},
+		{"408", status(http.StatusRequestTimeout), false},
+		{"425", status(http.StatusTooEarly), false},
+		{"429", status(http.StatusTooManyRequests), false},
+		{"500", status(http.StatusInternalServerError), false},
+		{"503", status(http.StatusServiceUnavailable), false},
+		{"GCS object not found", storage.ErrObjectNotExist, true},
+		{"destination not a regular file", fmt.Errorf("not replacing download destination x: %w", errNotRegularFile), true},
+		{"net timeout", &url.Error{Op: "Get", URL: "http://example.com", Err: timeoutError{}}, false},
+		{"stall", fmt.Errorf("downloading x: %w", client.ErrStalled), false},
+		{"context deadline", context.DeadlineExceeded, false},
+		{"checksum mismatch", errors.New("checksum doesn't match: got a, want b"), false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if got := isPermanent(tc.err); got != tc.want {
+				t.Errorf("isPermanent(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPackageRetriesByStatus checks that Package stops after one attempt on a
+// permanent GET status and retries the rest up to maxAttempts.
+func TestPackageRetriesByStatus(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	payload := bytes.Repeat([]byte("0123456789"), 100)
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	downloader, err := client.NewDownloader("")
+	if err != nil {
+		t.Fatalf("client.NewDownloader: %v", err)
+	}
+	for _, tc := range []struct {
+		code     int
+		wantGETs int
+	}{
+		{http.StatusNotFound, 1},
+		{http.StatusTooManyRequests, maxAttempts},
+		{http.StatusServiceUnavailable, maxAttempts},
+	} {
+		t.Run(strconv.Itoa(tc.code), func(t *testing.T) {
+			srv := newMethodServer(t, headOK(len(payload), true), statusHandler(tc.code))
+			err := Package(context.Background(), srv.URL+"/pkg.goo", filepath.Join(t.TempDir(), "pkg.goo"), chksum, downloader)
+			var sErr *statusError
+			if !errors.As(err, &sErr) || sErr.code != tc.code {
+				t.Errorf("Package() = %v, want a *statusError with code %d", err, tc.code)
+			}
+			if got := srv.count(http.MethodGet); got != tc.wantGETs {
+				t.Errorf("GET requests = %d, want %d", got, tc.wantGETs)
+			}
+		})
+	}
+
+	// Only the GET status is classified, so a 404 HEAD followed by a good
+	// GET succeeds on the first attempt.
+	t.Run("HEAD 404 then GET 200", func(t *testing.T) {
+		srv := newMethodServer(t, statusHandler(http.StatusNotFound), func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.Write(payload)
+		})
+		dst := filepath.Join(t.TempDir(), "pkg.goo")
+		if err := Package(context.Background(), srv.URL+"/pkg.goo", dst, chksum, downloader); err != nil {
+			t.Fatalf("Package() = %v, want nil", err)
+		}
+		if got := srv.count(http.MethodGet); got != 1 {
+			t.Errorf("GET requests = %d, want 1", got)
+		}
+	})
+}
+
+// TestPackageRetriesChecksumMismatch checks that a checksum mismatch is retried
+// and that the retry starts from an empty file.
+func TestPackageRetriesChecksumMismatch(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	payload := bytes.Repeat([]byte("0123456789"), 100)
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	downloader, err := client.NewDownloader("")
+	if err != nil {
+		t.Fatalf("client.NewDownloader: %v", err)
+	}
+	dst := filepath.Join(t.TempDir(), "pkg.goo")
+	var gets atomic.Int32
+	var sizeAtRetry atomic.Int64
+	srv := newMethodServer(t, headOK(len(payload), true), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		if gets.Add(1) == 1 {
+			w.Write(bytes.Repeat([]byte("x"), len(payload)))
+			return
+		}
+		// packageHTTP has reopened dst by now; the corrupt bytes must be gone.
+		if fi, err := os.Stat(dst); err == nil {
+			sizeAtRetry.Store(fi.Size())
+		}
+		w.Write(payload)
+	})
+	if err := Package(context.Background(), srv.URL+"/pkg.goo", dst, chksum, downloader); err != nil {
+		t.Fatalf("Package() = %v, want nil", err)
+	}
+	if got := srv.count(http.MethodGet); got != 2 {
+		t.Errorf("GET requests = %d, want 2", got)
+	}
+	if got := sizeAtRetry.Load(); got != 0 {
+		t.Errorf("dst had %d bytes when the retry started, want 0", got)
+	}
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, payload) {
+		t.Errorf("downloaded file = %d bytes, %v; want the payload", len(got), err)
 	}
 }
 
@@ -495,6 +862,66 @@ func TestPackageGCSRetries(t *testing.T) {
 	}
 }
 
+// TestPackageGCSFailureLeavesNoFile checks end to end through the GCS emulator
+// that dst doesn't exist after the last attempt fails.
+func TestPackageGCSFailureLeavesNoFile(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	payload := bytes.Repeat([]byte("0123456789"), 100)
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	for _, tc := range []struct {
+		desc    string
+		handler http.HandlerFunc
+	}{
+		{
+			desc: "checksum mismatch on every attempt",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+				w.Write(bytes.Repeat([]byte("x"), len(payload)))
+			},
+		},
+		{
+			desc: "body cut short on every attempt",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+				w.Write(payload[:400])
+				w.(http.Flusher).Flush()
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err == nil {
+					conn.Close()
+				}
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
+			dst := filepath.Join(t.TempDir(), "pkg.goo")
+			if err := Package(context.Background(), "gs://bkt/pkg.goo", dst, chksum, stallDownloader(2*time.Second)); err == nil {
+				t.Fatal("Package(gs://bkt/pkg.goo) = nil, want an error")
+			}
+			assertNoFile(t, dst)
+		})
+	}
+}
+
+// TestPackageGCSDoesNotRetryNotFound checks that a missing GCS object is not
+// retried.
+func TestPackageGCSDoesNotRetryNotFound(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	srv := newMethodServer(t, http.NotFound, http.NotFound)
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
+	dst := filepath.Join(t.TempDir(), "pkg.goo")
+	err := Package(context.Background(), "gs://bkt/pkg.goo", dst, "sum", stallDownloader(2*time.Second))
+	if !client.IsGCSNotFound(err) {
+		t.Errorf("Package(gs://bkt/pkg.goo) = %v, want an error that client.IsGCSNotFound accepts", err)
+	}
+	if got := srv.count(http.MethodGet) + srv.count(http.MethodHead); got != 1 {
+		t.Errorf("GCS requests = %d, want 1", got)
+	}
+	assertNoFile(t, dst)
+}
+
 func TestPackageResumesAfterGivingUp(t *testing.T) {
 	var gotRetries []int
 	setRetryDelay(t, func(retry int) time.Duration {
@@ -513,6 +940,10 @@ func TestPackageResumesAfterGivingUp(t *testing.T) {
 	}
 	if !slices.Equal(gotRetries, []int{1, 2}) {
 		t.Errorf("retryDelay calls = %v, want [1 2]", gotRetries)
+	}
+	// The failed download keeps the non-empty partial file (#216).
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, payload[:300]) {
+		t.Fatalf("partial file after giving up = %d bytes, %v; want the first 300 payload bytes", len(got), err)
 	}
 	// A later run, such as the next googet invocation, resumes the partial
 	// file.
@@ -553,95 +984,281 @@ func TestPackageStopsOnCancel(t *testing.T) {
 	}
 }
 
-func TestExtractPkg(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatalf("error creating temp directory: %v", err)
-	}
-	defer oswrap.RemoveAll(tempDir)
-	tempFile := filepath.Join(tempDir, "test.pkg")
-	f, err := oswrap.Create(tempFile)
+// writePkg writes a package holding files, compressed with format, to a
+// test.pkg file in a new temporary directory and returns its path.
+func writePkg(t *testing.T, format string, files []testutil.File) string {
+	t.Helper()
+	src := filepath.Join(t.TempDir(), "test.pkg")
+	f, err := oswrap.Create(src)
 	if err != nil {
 		t.Fatalf("error creating temp file: %v", err)
 	}
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
-
-	name := "foo/../test"
-	body := "this is a test file"
-	if err := tw.WriteHeader(&tar.Header{
-		Name: name,
-		Mode: 0600,
-		Size: int64(len(body)),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tw.Write([]byte(body)); err != nil {
-		t.Fatalf("error writing file: %v", err)
-	}
-
-	if err := tw.Close(); err != nil {
-		t.Fatalf("error closing tar: %v", err)
-	}
-	if err := gw.Close(); err != nil {
-		t.Fatalf("error closing gzip: %v", err)
-	}
+	testutil.WritePackage(t, f, format, files)
 	if err := f.Close(); err != nil {
 		t.Fatalf("error closing file: %v", err)
 	}
+	return src
+}
 
-	dst, err := ExtractPkg(tempFile)
-	if err != nil {
-		t.Fatalf("error running ExtractPkg: %v", err)
-	}
+// extractedFile describes a file written by ExtractPkg.
+type extractedFile struct {
+	Body string
+	Mode os.FileMode
+}
 
-	cts, err := os.ReadFile(filepath.Join(dst, filepath.Clean(name)))
+// readTree returns the regular files under dir, keyed by slash-separated
+// relative path.
+func readTree(t *testing.T, dir string) map[string]extractedFile {
+	t.Helper()
+	got := make(map[string]extractedFile)
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		got[filepath.ToSlash(rel)] = extractedFile{Body: string(b), Mode: fi.Mode()}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("error opening test file: %v", err)
+		t.Fatalf("error reading extracted files: %v", err)
 	}
-	if string(cts) != body {
-		t.Errorf("contents of extracted file does not match expected contents: got: %q, want: %q", string(cts), body)
+	return got
+}
+
+func TestExtractPkg(t *testing.T) {
+	files := []testutil.File{
+		{Name: "foo/../test", Mode: 0600, Body: []byte("this is a test file")},
+		{Name: "dir/sub/tool.exe", Mode: 0755, Body: []byte("binary contents")},
+		{Name: "empty", Mode: 0644},
+	}
+	wantBodies := map[string]string{
+		"test":             "this is a test file",
+		"dir/sub/tool.exe": "binary contents",
+		"empty":            "",
+	}
+	trees := make(map[string]map[string]extractedFile)
+	for _, format := range goolib.CompressionFormats() {
+		t.Run(format, func(t *testing.T) {
+			src := writePkg(t, format, files)
+			dst, err := ExtractPkg(src)
+			if err != nil {
+				t.Fatalf("error running ExtractPkg: %v", err)
+			}
+			if want := ExtractDir(src); dst != want {
+				t.Errorf("ExtractPkg(%q) extracted to %q, want ExtractDir's %q", src, dst, want)
+			}
+			got := readTree(t, dst)
+			gotBodies := make(map[string]string)
+			for name, f := range got {
+				gotBodies[name] = f.Body
+			}
+			if diff := cmp.Diff(wantBodies, gotBodies); diff != "" {
+				t.Errorf("extracted files mismatch (-want +got):\n%s", diff)
+			}
+			trees[format] = got
+		})
+	}
+	// File sets, contents and modes must not depend on the compression format.
+	if t.Failed() {
+		return
+	}
+	if diff := cmp.Diff(trees[goolib.CompressionGzip], trees[goolib.CompressionZstd]); diff != "" {
+		t.Errorf("zstd extraction differs from gzip (-gzip +zstd):\n%s", diff)
 	}
 }
 
 func TestExtractPkgPathTraversal(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "")
-	if err != nil {
-		t.Fatalf("error creating temp directory: %v", err)
+	// The package extracts to <tmp>/test, so these names resolve outside it.
+	// Avoid names like "foo/../../test" that resolve to the destination
+	// directory itself and fail for an unrelated reason.
+	for _, name := range []string{"foo/../../escaped", "../escaped"} {
+		files := []testutil.File{{Name: name, Mode: 0600, Body: []byte("this is a test file")}}
+		for _, format := range goolib.CompressionFormats() {
+			t.Run(format+" "+name, func(t *testing.T) {
+				src := writePkg(t, format, files)
+				_, err := ExtractPkg(src)
+				if err == nil || !strings.Contains(err.Error(), "path traversal") {
+					t.Fatalf("ExtractPkg error = %v, want path traversal error", err)
+				}
+				if _, err := os.Stat(filepath.Join(filepath.Dir(src), "escaped")); !os.IsNotExist(err) {
+					t.Errorf("ExtractPkg wrote outside the destination directory: stat error = %v", err)
+				}
+			})
+		}
 	}
-	defer oswrap.RemoveAll(tempDir)
-	tempFile := filepath.Join(tempDir, "test.pkg")
-	f, err := oswrap.Create(tempFile)
-	if err != nil {
-		t.Fatalf("error creating temp file: %v", err)
-	}
-	gw := gzip.NewWriter(f)
-	tw := tar.NewWriter(gw)
+}
 
-	name := "foo/../../test"
+func TestExtractPkgNotCompressed(t *testing.T) {
+	var rawTar bytes.Buffer
+	tw := tar.NewWriter(&rawTar)
 	body := "this is a test file"
-	if err := tw.WriteHeader(&tar.Header{
-		Name: name,
-		Mode: 0600,
-		Size: int64(len(body)),
-	}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: "test", Mode: 0600, Size: int64(len(body))}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tw.Write([]byte(body)); err != nil {
-		t.Fatalf("error writing file: %v", err)
+		t.Fatal(err)
 	}
-
 	if err := tw.Close(); err != nil {
-		t.Fatalf("error closing tar: %v", err)
+		t.Fatal(err)
 	}
-	if err := gw.Close(); err != nil {
-		t.Fatalf("error closing gzip: %v", err)
+	for _, tc := range []struct {
+		name    string
+		content []byte
+	}{
+		{"uncompressed tar", rawTar.Bytes()},
+		{"garbage", []byte("this is not a package")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := filepath.Join(t.TempDir(), "test.pkg")
+			if err := os.WriteFile(src, tc.content, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ExtractPkg(src); !errors.Is(err, gzip.ErrHeader) {
+				t.Errorf("ExtractPkg error = %v, want %v", err, gzip.ErrHeader)
+			}
+			if got := readTree(t, strings.TrimSuffix(src, ".pkg")); len(got) != 0 {
+				t.Errorf("ExtractPkg extracted %v, want no files", got)
+			}
+		})
 	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("error closing file: %v", err)
+}
+
+func TestExtractDir(t *testing.T) {
+	dir := filepath.Join("cache", "dir.d")
+	for _, tc := range []struct {
+		src, want string
+	}{
+		{filepath.Join(dir, "foo.noarch.1.0.0@1.goo"), filepath.Join(dir, "foo.noarch.1.0.0@1")},
+		{filepath.Join(dir, "test.pkg"), filepath.Join(dir, "test")},
+		// With no extension, the directory is the package path itself.
+		{filepath.Join(dir, "foo"), filepath.Join(dir, "foo")},
+		{"", ""},
+	} {
+		if got := ExtractDir(tc.src); got != tc.want {
+			t.Errorf("ExtractDir(%q) = %q, want %q", tc.src, got, tc.want)
+		}
+	}
+}
+
+// newGCSEmulator serves payload for every request through a fake GCS endpoint
+// and returns the number of requests it has received.
+func newGCSEmulator(t *testing.T, payload []byte) *atomic.Int32 {
+	t.Helper()
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.Write(payload)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
+	return &requests
+}
+
+func TestPackageGCSReplacesFile(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	payload := []byte("package payload")
+	newGCSEmulator(t, payload)
+	dst := filepath.Join(t.TempDir(), "pkg.goo")
+	if err := os.WriteFile(dst, []byte("old partial download"), 0644); err != nil {
+		t.Fatalf("writing %q: %v", dst, err)
 	}
 
-	if _, err := ExtractPkg(tempFile); err == nil {
-		t.Fatal("error expected because of path traversal")
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	if err := Package(context.Background(), "gs://bkt/pkg.goo", dst, chksum, stallDownloader(time.Second)); err != nil {
+		t.Fatalf("Package(gs://bkt/pkg.goo) = %v, want nil", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("reading downloaded file: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("downloaded file = %q, want %q", got, payload)
+	}
+}
+
+func TestPackageGCSRefusesNonRegular(t *testing.T) {
+	setRetryDelay(t, func(int) time.Duration { return 0 })
+	payload := []byte("package payload")
+	chksum := goolib.Checksum(bytes.NewReader(payload))
+	requests := newGCSEmulator(t, payload)
+	refuse := func(t *testing.T, dst string) {
+		t.Helper()
+		requests.Store(0)
+		err := Package(context.Background(), "gs://bkt/pkg.goo", dst, chksum, stallDownloader(time.Second))
+		if !errors.Is(err, errNotRegularFile) {
+			t.Errorf("Package(gs://bkt/pkg.goo) = %v, want an error matching errNotRegularFile", err)
+		}
+		if n := requests.Load(); n != 0 {
+			t.Errorf("Package made %d GCS requests, want 0", n)
+		}
+	}
+
+	t.Run("directory", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "pkg.goo")
+		inner := filepath.Join(dst, "keep.txt")
+		if err := os.Mkdir(dst, 0755); err != nil {
+			t.Fatalf("creating %q: %v", dst, err)
+		}
+		if err := os.WriteFile(inner, []byte("keep"), 0644); err != nil {
+			t.Fatalf("writing %q: %v", inner, err)
+		}
+		refuse(t, dst)
+		if b, err := os.ReadFile(inner); err != nil || string(b) != "keep" {
+			t.Errorf("file inside the destination directory = %q, %v; want %q, nil", b, err, "keep")
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		dst := filepath.Join(dir, "pkg.goo")
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, []byte("target"), 0644); err != nil {
+			t.Fatalf("writing %q: %v", target, err)
+		}
+		if err := os.Symlink(target, dst); err != nil {
+			t.Skipf("can't create a symlink: %v", err)
+		}
+		refuse(t, dst)
+		if got, err := os.Readlink(dst); err != nil || got != target {
+			t.Errorf("Readlink(%q) = %q, %v; want %q, nil", dst, got, err, target)
+		}
+		if b, err := os.ReadFile(target); err != nil || string(b) != "target" {
+			t.Errorf("symlink target = %q, %v; want %q, nil", b, err, "target")
+		}
+	})
+}
+
+func TestRemoveFile(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, []byte("x"), 0644); err != nil {
+		t.Fatalf("writing %q: %v", file, err)
+	}
+	if err := removeFile(file); err != nil {
+		t.Errorf("removeFile(regular file) = %v, want nil", err)
+	}
+	if _, err := os.Lstat(file); !os.IsNotExist(err) {
+		t.Errorf("removeFile(regular file) left it in place (Lstat error: %v)", err)
+	}
+	if err := removeFile(filepath.Join(dir, "missing")); err != nil {
+		t.Errorf("removeFile(missing) = %v, want nil", err)
+	}
+	if err := removeFile(dir); !errors.Is(err, errNotRegularFile) {
+		t.Errorf("removeFile(directory) = %v, want an error matching errNotRegularFile", err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("removeFile(directory) removed it: %v", err)
 	}
 }

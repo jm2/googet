@@ -15,30 +15,230 @@ package install
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"log"
+	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
+	"github.com/google/googet/v2/remove"
 	"github.com/google/googet/v2/settings"
+	"github.com/google/googet/v2/testutil"
+	"github.com/google/googet/v2/verify"
 	"github.com/google/logger"
 )
 
+// testLog receives the log output of the tests.
+var testLog syncBuffer
+
 func init() {
-	logger.Init("test", true, false, ioutil.Discard)
+	logger.Init("test", true, false, &testLog)
+}
+
+// testPayload is the content of the test packages, keyed by the slash-separated
+// path under the package's payload directory. A nil value is a directory.
+var testPayload = map[string][]byte{
+	"bin":          nil,
+	"bin/tool.exe": []byte("tool binary"),
+	"etc":          nil,
+	"etc/sub":      nil,
+	"etc/sub/conf": []byte("key=value\n"),
+	"README":       []byte("read me"),
+}
+
+// writeTestPackage writes a .goo package named name.noarch.version under dir
+// that installs files (as testPayload describes) to dst, and returns its path.
+func writeTestPackage(t *testing.T, dir, name, version, dst string, files map[string][]byte) string {
+	t.Helper()
+	spec := goolib.PkgSpec{
+		Name:    name,
+		Version: version,
+		Arch:    "noarch",
+		Files:   map[string]string{"payload": dst},
+	}
+	specJSON, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gw)
+	write := func(h *tar.Header, content []byte) {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(&tar.Header{Name: "payload/", Typeflag: tar.TypeDir, Mode: 0755}, nil)
+	for p, content := range files {
+		if content == nil {
+			write(&tar.Header{Name: "payload/" + p + "/", Typeflag: tar.TypeDir, Mode: 0755}, nil)
+			continue
+		}
+		write(&tar.Header{Name: "payload/" + p, Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(content))}, content)
+	}
+	write(&tar.Header{Name: name + ".pkgspec", Typeflag: tar.TypeReg, Mode: 0644, Size: int64(len(specJSON))}, specJSON)
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name+".noarch."+version+".goo")
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// wantFiles returns the InstalledFiles map a real install of files to dst
+// records: the SHA256 of each file and "" for each directory.
+func wantFiles(dst string, files map[string][]byte) map[string]string {
+	want := map[string]string{dst: ""}
+	for p, content := range files {
+		if content == nil {
+			want[filepath.Join(dst, filepath.FromSlash(p))] = ""
+			continue
+		}
+		sum := sha256.Sum256(content)
+		want[filepath.Join(dst, filepath.FromSlash(p))] = hex.EncodeToString(sum[:])
+	}
+	return want
+}
+
+// putPayload writes files under dst as a real install would.
+func putPayload(t *testing.T, dst string, files map[string][]byte) {
+	t.Helper()
+	for p, content := range files {
+		path := filepath.Join(dst, filepath.FromSlash(p))
+		if content == nil {
+			if err := os.MkdirAll(path, 0755); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, content, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// newDB returns a database in a fresh googet root.
+func newDB(t *testing.T) *googetdb.GooDB {
+	t.Helper()
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
+	db, err := googetdb.NewDB(settings.DBFile())
+	if err != nil {
+		t.Fatalf("googetdb.NewDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+// setStrictConflicts sets settings.StrictConflicts to v for the duration of t.
+func setStrictConflicts(t *testing.T, v bool) {
+	t.Helper()
+	old := settings.StrictConflicts
+	settings.StrictConflicts = v
+	t.Cleanup(func() { settings.StrictConflicts = old })
+}
+
+// fetchPkg returns the state of the installed noarch package name, failing t
+// if it isn't installed.
+func fetchPkg(t *testing.T, db *googetdb.GooDB, name string) client.PackageState {
+	t.Helper()
+	ps, err := db.FetchPkg(goolib.PackageInfo{Name: name, Arch: "noarch"})
+	if err != nil {
+		t.Fatalf("db.FetchPkg(%s): %v", name, err)
+	}
+	if ps.PackageSpec == nil {
+		t.Fatalf("package %s is not installed", name)
+	}
+	return ps
+}
+
+// syncBuffer is a bytes.Buffer that is safe for concurrent use.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// take returns the buffered output and empties the buffer.
+func (b *syncBuffer) take() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	b.buf.Reset()
+	return s
+}
+
+// captureStdout returns what f writes to os.Stdout.
+func captureStdout(t *testing.T, f func()) (out string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan string)
+	go func() {
+		b, _ := io.ReadAll(r)
+		r.Close()
+		done <- string(b)
+	}()
+	orig := os.Stdout
+	os.Stdout = w
+	// The deferred call also restores os.Stdout if f calls t.Fatal.
+	defer func() {
+		os.Stdout = orig
+		w.Close()
+		out = <-done
+	}()
+	f()
+	return ""
 }
 
 func TestMinInstalled(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	state := []client.PackageState{
 		{
 			PackageSpec: &goolib.PkgSpec{
@@ -84,7 +284,9 @@ func TestMinInstalled(t *testing.T) {
 }
 
 func TestNeedsInstallation(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	state := []client.PackageState{
 		{
 			PackageSpec: &goolib.PkgSpec{
@@ -142,7 +344,9 @@ func TestInstallPkg(t *testing.T) {
 	}
 	defer oswrap.RemoveAll(src)
 
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	db, err := googetdb.NewDB(settings.DBFile())
 	if err != nil {
 		t.Fatalf("googetdb.NewDB: %v", err)
@@ -208,7 +412,7 @@ func TestInstallPkg(t *testing.T) {
 	}
 
 	ps := goolib.PkgSpec{Files: map[string]string{"./": dst}}
-	got, err := installPkg(f.Name(), &ps, false, false, db)
+	got, err := installPkg(f.Name(), &ps, false, false, db, nil)
 	if err != nil {
 		t.Fatalf("Error running installPkg: %v", err)
 	}
@@ -221,6 +425,594 @@ func TestInstallPkg(t *testing.T) {
 		want := filepath.Join(dst, n)
 		if _, err := oswrap.Stat(want); err != nil {
 			t.Errorf("Expected test file %s does not exist", want)
+		}
+	}
+}
+
+// tree returns the files and directories under root, mapping each slash-
+// separated relative path to its contents, or to "/" for a directory.
+func tree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	got := make(map[string]string)
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || path == root {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			got[filepath.ToSlash(rel)] = "/"
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		got[filepath.ToSlash(rel)] = string(b)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("walking %s: %v", root, err)
+	}
+	return got
+}
+
+// writeGoo writes a package archive at path holding files, which maps
+// slash-separated names to contents. Names ending in .sh are executable.
+func writeGoo(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+	for name, body := range files {
+		mode := int64(0644)
+		if strings.HasSuffix(name, ".sh") {
+			mode = 0755
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: mode, Size: int64(len(body))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []io.Closer{tw, gw, f} {
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestInstallPkgRollback(t *testing.T) {
+	pkgFiles := map[string]string{"keep": "new", "sub/added": "added"}
+	before := map[string]string{"keep": "old"}
+	for _, tc := range []struct {
+		desc      string
+		files     map[string]string // Package Files, with destinations relative to dst.
+		installer string            // A missing installer makes the install fail.
+		want      map[string]string // The tree of dst after the install; nil means before.
+	}{
+		{
+			desc:  "success",
+			files: map[string]string{"./": "."},
+			want:  map[string]string{"keep": "new", "sub": "/", "sub/added": "added"},
+		},
+		{
+			desc:  "success with new parent directories",
+			files: map[string]string{"keep": "p/q/keep"},
+			want:  map[string]string{"keep": "old", "p": "/", "p/q": "/", "p/q/keep": "new"},
+		},
+		{
+			desc:      "installer fails",
+			files:     map[string]string{"./": "."},
+			installer: "missing-installer",
+		},
+		{
+			// The second mapping writes sub/added again after the first
+			// created it; its original state is still "missing".
+			desc:      "installer fails after a path is written twice",
+			files:     map[string]string{"sub": "sub", "sub/added": "sub/added"},
+			installer: "missing-installer",
+		},
+		{
+			desc:      "installer fails after creating parent directories",
+			files:     map[string]string{"./": "a/b", "keep": "p/q/keep"},
+			installer: "missing-installer",
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			dst := t.TempDir()
+			for name, body := range before {
+				if err := os.WriteFile(filepath.Join(dst, name), []byte(body), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pkg := filepath.Join(t.TempDir(), "test.goo")
+			writeGoo(t, pkg, pkgFiles)
+			ps := goolib.PkgSpec{Files: map[string]string{}, Install: goolib.ExecFile{Path: tc.installer}}
+			for src, rel := range tc.files {
+				ps.Files[src] = filepath.Join(dst, rel)
+			}
+
+			_, err = installPkg(pkg, &ps, false, false, db, nil)
+			want := tc.want
+			if want == nil {
+				want = before
+			}
+			if gotErr, wantErr := err != nil, tc.installer != ""; gotErr != wantErr {
+				t.Errorf("installPkg(%q) = %v, want error %t", pkg, err, wantErr)
+			}
+			if tc.installer != "" {
+				// system.Install creates its log (googet_install.log, or
+				// <installer>.log on Windows) in the extraction directory
+				// before it runs the installer, which happens only after
+				// every file is copied.
+				extracted := strings.TrimSuffix(pkg, filepath.Ext(pkg))
+				if logs, _ := filepath.Glob(filepath.Join(extracted, "*.log")); len(logs) == 0 {
+					t.Errorf("installPkg(%q) = %v before running the installer, want installer failure", pkg, err)
+				}
+			}
+			if diff := cmp.Diff(want, tree(t, dst)); diff != "" {
+				t.Errorf("installPkg(%q) left an unexpected tree in dst (-want +got):\n%s", pkg, diff)
+			}
+			if tc.installer == "" && runtime.GOOS != "windows" {
+				// The umask applies to ref as it does to the directories
+				// that the install creates.
+				ref := filepath.Join(t.TempDir(), "ref")
+				if err := os.Mkdir(ref, 0755); err != nil {
+					t.Fatal(err)
+				}
+				for rel, body := range want {
+					if body != "/" {
+						continue
+					}
+					if got, wantPerm := perm(t, filepath.Join(dst, rel)), perm(t, ref); got != wantPerm {
+						t.Errorf("installPkg(%q) created %q with mode %v, want %v", pkg, rel, got, wantPerm)
+					}
+				}
+			}
+		})
+	}
+}
+
+// errAddPkg is the error that the addPkg stub returns or panics with.
+var errAddPkg = errors.New("injected AddPkg failure")
+
+// addPkgFault is how the addPkg stub fails, if at all.
+type addPkgFault int
+
+const (
+	addPkgOK addPkgFault = iota
+	addPkgError
+	addPkgPanic
+)
+
+// TestInstallAddPkg checks that FromDisk and FromRepo roll back the
+// files of an upgrade when recording it in the database fails or panics, and
+// that on success they record it and FromRepo cleans up the old version. A
+// dbOnly install changes no installed files either way. The completion
+// message is printed only after the install is recorded.
+func TestInstallAddPkg(t *testing.T) {
+	before := map[string]string{"keep": "old", "oldonly": "old"}
+	// The tree when the new files are placed, the backup of the overwritten
+	// file is not yet deleted and the old version is not yet cleaned up. The
+	// random suffix of the backup name is dropped.
+	placedTree := map[string]string{"keep": "new", "keep" + backupInfix: "old", "oldonly": "old", "sub": "/", "sub/added": "added"}
+	for _, tc := range []struct {
+		desc      string
+		fromRepo  bool
+		dbOnly    bool
+		installer bool // The package has an install script that succeeds.
+		fault     addPkgFault
+		want      map[string]string
+	}{
+		{desc: "FromDisk success", want: map[string]string{"keep": "new", "oldonly": "old", "sub": "/", "sub/added": "added"}},
+		{desc: "FromDisk error", fault: addPkgError, want: before},
+		{desc: "FromDisk error after the installer ran", installer: true, fault: addPkgError, want: before},
+		{desc: "FromDisk panic", fault: addPkgPanic, want: before},
+		{desc: "FromRepo success", fromRepo: true, want: map[string]string{"keep": "new", "sub": "/", "sub/added": "added"}},
+		{desc: "FromRepo error", fromRepo: true, fault: addPkgError, want: before},
+		{desc: "FromRepo panic", fromRepo: true, fault: addPkgPanic, want: before},
+		{desc: "FromDisk dbOnly success", dbOnly: true, want: before},
+		{desc: "FromDisk dbOnly error", dbOnly: true, fault: addPkgError, want: before},
+		{desc: "FromRepo dbOnly success", fromRepo: true, dbOnly: true, want: before},
+		{desc: "FromRepo dbOnly error", fromRepo: true, dbOnly: true, fault: addPkgError, want: before},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if tc.installer && runtime.GOOS != "linux" {
+				// goolib.Exec runs shell scripts only on Linux. On Windows,
+				// a successful installer also adds an uninstall entry under
+				// HKLM.
+				t.Skip("install scripts run only on Linux")
+			}
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			dst, cache := t.TempDir(), t.TempDir()
+			for name, body := range before {
+				if err := os.WriteFile(filepath.Join(dst, name), []byte(body), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			oldGoo := filepath.Join(cache, "pkg.noarch.1.0.0@1.goo")
+			if err := os.WriteFile(oldGoo, []byte("old package"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.AddPkg(client.PackageState{
+				LocalPath:   oldGoo,
+				PackageSpec: &goolib.PkgSpec{Name: "pkg", Arch: "noarch", Version: "1.0.0@1"},
+				InstalledFiles: map[string]string{
+					filepath.Join(dst, "keep"):    goolib.Checksum(strings.NewReader("old")),
+					filepath.Join(dst, "oldonly"): goolib.Checksum(strings.NewReader("old")),
+				},
+			}); err != nil {
+				t.Fatalf("db.AddPkg: %v", err)
+			}
+
+			spec := &goolib.PkgSpec{
+				Name:    "pkg",
+				Arch:    "noarch",
+				Version: "2.0.0@1",
+				Files: map[string]string{
+					"keep":      filepath.Join(dst, "keep"),
+					"sub/added": filepath.Join(dst, "sub", "added"),
+				},
+			}
+			files := map[string]string{"keep": "new", "sub/added": "added"}
+			if tc.installer {
+				spec.Install = goolib.ExecFile{Path: "install.sh"}
+				files["install.sh"] = "#!/bin/sh\n"
+			}
+			b, err := json.Marshal(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files["pkg.pkgspec"] = string(b)
+			pkg := filepath.Join(t.TempDir(), "pkg.goo")
+			writeGoo(t, pkg, files)
+
+			var placed map[string]string
+			orig := addPkg
+			t.Cleanup(func() { addPkg = orig })
+			addPkg = func(db *googetdb.GooDB, ps client.PackageState) error {
+				placed = make(map[string]string)
+				for rel, body := range tree(t, dst) {
+					if i := strings.Index(rel, backupInfix); i >= 0 {
+						rel = rel[:i+len(backupInfix)]
+					}
+					placed[rel] = body
+				}
+				switch tc.fault {
+				case addPkgError:
+					return errAddPkg
+				case addPkgPanic:
+					panic(errAddPkg)
+				}
+				return orig(db, ps)
+			}
+
+			var panicked any
+			var install func() error
+			if tc.fromRepo {
+				goo, err := os.ReadFile(pkg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rs := goolib.RepoSpec{Checksum: goolib.Checksum(bytes.NewReader(goo)), Source: "pkg.goo", PackageSpec: spec}
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					http.ServeFile(w, r, pkg)
+				}))
+				defer srv.Close()
+				repo := srv.URL + "/repo"
+				downloader, err := client.NewDownloader("")
+				if err != nil {
+					t.Fatal(err)
+				}
+				install = func() error {
+					return FromRepo(t.Context(),
+						goolib.PackageInfo{Name: "pkg", Arch: "noarch", Ver: "2.0.0@1"},
+						repo, cache,
+						client.RepoMap{repo: {Packages: []goolib.RepoSpec{rs}}},
+						[]string{"noarch"}, tc.dbOnly, false, downloader, db)
+				}
+			} else {
+				install = func() error {
+					return FromDisk(pkg, cache, tc.dbOnly, false, false, db)
+				}
+			}
+			testLog.take()
+			out := captureStdout(t, func() {
+				err = func() error {
+					defer func() { panicked = recover() }()
+					return install()
+				}()
+			})
+			logs := testLog.take()
+
+			// The files are placed, the backup is kept and the old version is
+			// not yet cleaned up by the time the install is recorded. A dbOnly
+			// install places no files.
+			wantPlaced := placedTree
+			if tc.dbOnly {
+				wantPlaced = before
+			}
+			if diff := cmp.Diff(wantPlaced, placed); diff != "" {
+				t.Errorf("tree when recording the install (-want +got):\n%s", diff)
+			}
+			switch tc.fault {
+			case addPkgError:
+				if !errors.Is(err, errAddPkg) {
+					t.Errorf("install = %v, want %v", err, errAddPkg)
+				}
+			case addPkgPanic:
+				if panicked != errAddPkg {
+					t.Errorf("install panicked with %v, want %v", panicked, errAddPkg)
+				}
+			default:
+				if err != nil || panicked != nil {
+					t.Errorf("install = %v, panic %v, want success", err, panicked)
+				}
+			}
+			if got, want := strings.Contains(out, "completed"), tc.fault == addPkgOK; got != want {
+				t.Errorf("install printed a completion message = %t, want %t; output:\n%s", got, want, out)
+			}
+			// The log says that the installer's changes stay only if an
+			// installer ran.
+			wantLog := ""
+			if tc.fault == addPkgError {
+				wantLog = "Recording pkg.noarch.2.0.0@1 in the database failed: " + errAddPkg.Error()
+				if tc.installer {
+					wantLog = "Recording pkg.noarch.2.0.0@1 in the database failed after its installer ran; rolling back its files, but not the changes made by the installer: " + errAddPkg.Error()
+				}
+			}
+			if got, want := strings.Contains(logs, "in the database failed"), wantLog != ""; got != want || !strings.Contains(logs, wantLog) {
+				t.Errorf("install log mentions a database failure = %t, want %t with %q; log:\n%s", got, want, wantLog, logs)
+			}
+			if strings.Contains(logs, "Rollback:") {
+				t.Errorf("install logged a rollback problem; log:\n%s", logs)
+			}
+			if diff := cmp.Diff(tc.want, tree(t, dst)); diff != "" {
+				t.Errorf("tree after the install (-want +got):\n%s", diff)
+			}
+			_, err = os.Stat(oldGoo)
+			if gotOld, wantOld := err == nil, !tc.fromRepo || tc.fault != addPkgOK; gotOld != wantOld {
+				t.Errorf("old package %s exists = %t (%v), want %t", oldGoo, gotOld, err, wantOld)
+			}
+			st, err := db.FetchPkg(goolib.PackageInfo{Name: "pkg"})
+			if err != nil {
+				t.Fatalf("db.FetchPkg: %v", err)
+			}
+			wantVer := "2.0.0@1"
+			if tc.fault != addPkgOK {
+				wantVer = "1.0.0@1"
+			}
+			if st.PackageSpec.Version != wantVer {
+				t.Errorf("installed version = %q, want %q", st.PackageSpec.Version, wantVer)
+			}
+			// The checksums that a dbOnly install records are not checked.
+			if tc.fault == addPkgOK && !tc.dbOnly {
+				wantFiles := map[string]string{
+					filepath.Join(dst, "keep"):         goolib.Checksum(strings.NewReader("new")),
+					filepath.Join(dst, "sub", "added"): goolib.Checksum(strings.NewReader("added")),
+				}
+				if diff := cmp.Diff(wantFiles, st.InstalledFiles); diff != "" {
+					t.Errorf("recorded installed files (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+// TestReinstallRollback checks that Reinstall, which records nothing in the
+// database, deletes the backups when it succeeds and rolls the files back
+// exactly once when the installer fails.
+func TestReinstallRollback(t *testing.T) {
+	before := map[string]string{"keep": "old"}
+	for _, tc := range []struct {
+		desc      string
+		installer string // A missing installer makes the reinstall fail.
+		want      map[string]string
+	}{
+		{desc: "success", want: map[string]string{"keep": "new", "sub": "/", "sub/added": "added"}},
+		{desc: "installer fails", installer: "missing-installer", want: before},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			dst := t.TempDir()
+			for name, body := range before {
+				if err := os.WriteFile(filepath.Join(dst, name), []byte(body), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pkg := filepath.Join(t.TempDir(), "pkg.goo")
+			writeGoo(t, pkg, map[string]string{"keep": "new", "sub/added": "added"})
+			ps := client.PackageState{
+				LocalPath: pkg,
+				PackageSpec: &goolib.PkgSpec{
+					Name:    "pkg",
+					Arch:    "noarch",
+					Version: "1.0.0@1",
+					Files: map[string]string{
+						"keep":      filepath.Join(dst, "keep"),
+						"sub/added": filepath.Join(dst, "sub", "added"),
+					},
+					Install: goolib.ExecFile{Path: tc.installer},
+				},
+			}
+
+			testLog.take()
+			out := captureStdout(t, func() {
+				err = Reinstall(t.Context(), ps, false, false, nil, db)
+			})
+			logs := testLog.take()
+
+			if gotErr, wantErr := err != nil, tc.installer != ""; gotErr != wantErr {
+				t.Errorf("Reinstall() = %v, want error %t", err, wantErr)
+			}
+			if tc.installer != "" {
+				// system.Install creates its log in the extraction directory
+				// just before it runs the installer.
+				extracted := strings.TrimSuffix(pkg, filepath.Ext(pkg))
+				if installerLogs, _ := filepath.Glob(filepath.Join(extracted, "*.log")); len(installerLogs) == 0 {
+					t.Errorf("Reinstall() = %v before running the installer, want installer failure", err)
+				}
+			}
+			if got, want := strings.Contains(out, "completed"), tc.installer == ""; got != want {
+				t.Errorf("Reinstall() printed a completion message = %t, want %t; output:\n%s", got, want, out)
+			}
+			// A second rollback would remove the restored file and then fail
+			// to restore it from the backup that is already gone.
+			if strings.Contains(logs, "Rollback:") || strings.Contains(logs, "in the database failed") {
+				t.Errorf("Reinstall() logged an unexpected problem; log:\n%s", logs)
+			}
+			if diff := cmp.Diff(tc.want, tree(t, dst)); diff != "" {
+				t.Errorf("tree after Reinstall() (-want +got):\n%s", diff)
+			}
+			pkgs, err := db.FetchPkgs("")
+			if err != nil {
+				t.Fatalf("db.FetchPkgs: %v", err)
+			}
+			if len(pkgs) != 0 {
+				t.Errorf("Reinstall() recorded %v in the database, want nothing", pkgs)
+			}
+		})
+	}
+}
+
+func TestUndo(t *testing.T) {
+	for _, tc := range []struct {
+		desc   string
+		commit bool
+		want   map[string]string
+	}{
+		{desc: "rollback", want: map[string]string{"old": "old"}},
+		{desc: "commit", commit: true, want: map[string]string{"old": "new", "empty": "new", "a": "/", "a/b": "/", "a/b/new": "new"}},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "old"), []byte("old"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(filepath.Join(root, "empty"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			var u undo
+			write := func(rel string) {
+				t.Helper()
+				p := filepath.Join(root, rel)
+				if err := u.mkdirAll(filepath.Dir(p), 0755); err != nil {
+					t.Fatalf("mkdirAll(%q) = %v", filepath.Dir(p), err)
+				}
+				if err := u.prepare(p); err != nil {
+					t.Fatalf("prepare(%q) = %v", p, err)
+				}
+				if err := os.WriteFile(p, []byte("new"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Each path is written twice; the second write must not replace
+			// the record of its original state.
+			for _, rel := range []string{"old", "a/b/new", "old", "a/b/new", "empty"} {
+				write(rel)
+			}
+			if tc.commit {
+				u.commit()
+			} else {
+				// The empty directory that a file replaced is not recreated.
+				u.rollback()
+			}
+			if diff := cmp.Diff(tc.want, tree(t, root)); diff != "" {
+				t.Errorf("tree after %s (-want +got):\n%s", tc.desc, diff)
+			}
+		})
+	}
+}
+
+// perm returns the permission bits of path.
+func perm(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fi.Mode().Perm()
+}
+
+func TestUndoMkdirAllModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not report Unix permission bits")
+	}
+	root := t.TempDir()
+	// The umask applies to the reference directories as it does to the
+	// directories that mkdirAll creates.
+	refParent, refDir := filepath.Join(root, "ref-parent"), filepath.Join(root, "ref-dir")
+	for ref, mode := range map[string]os.FileMode{refParent: 0755, refDir: 0500} {
+		if err := os.Mkdir(ref, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent := filepath.Join(root, "a")
+	dir := filepath.Join(parent, "b")
+	var u undo
+	if err := u.mkdirAll(dir, 0500); err != nil {
+		t.Fatalf("mkdirAll(%q, 0500) = %v", dir, err)
+	}
+	for path, ref := range map[string]string{parent: refParent, dir: refDir} {
+		if got, want := perm(t, path), perm(t, ref); got != want {
+			t.Errorf("mkdirAll(%q, 0500) created %q with mode %v, want %v", dir, path, got, want)
+		}
+	}
+}
+
+func TestUndoMkdirAllExisting(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// top is the ancestor of file just below the volume root, such as /tmp or
+	// C:\Users. On Windows, oswrap.MkdirAll panics on a volume root, so
+	// mkdirAll must not call it on an existing directory or its parent.
+	top := file
+	for filepath.Dir(filepath.Dir(top)) != filepath.Dir(top) {
+		top = filepath.Dir(top)
+	}
+	for _, tc := range []struct {
+		dir     string
+		wantErr bool
+	}{
+		{dir: filepath.Dir(top)},
+		{dir: top},
+		{dir: filepath.Dir(file)},
+		{dir: file, wantErr: true},
+	} {
+		var u undo
+		if err := u.mkdirAll(tc.dir, 0755); (err != nil) != tc.wantErr {
+			t.Errorf("mkdirAll(%q) = %v, want error %t", tc.dir, err, tc.wantErr)
+		}
+		if len(u.changes) != 0 {
+			t.Errorf("mkdirAll(%q) recorded %v, want no changes", tc.dir, u.changes)
 		}
 	}
 }
@@ -298,7 +1090,9 @@ func TestResolveDst(t *testing.T) {
 }
 
 func TestIsSatisfied(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	state := []client.PackageState{
 		{
 			PackageSpec: &goolib.PkgSpec{
@@ -371,7 +1165,9 @@ func TestIsSatisfied(t *testing.T) {
 }
 
 func TestResolveConflicts_Provides(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	state := []client.PackageState{
 		{
 			PackageSpec: &goolib.PkgSpec{
@@ -414,7 +1210,9 @@ func TestFromRepo_SatisfiedByProvider(t *testing.T) {
 	// We mock the DB state and call installDeps directly or via a wrapper if accessible.
 	// installDeps is unexported, but we are in package install.
 
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	state := []client.PackageState{
 		{
 			PackageSpec: &goolib.PkgSpec{
@@ -451,7 +1249,9 @@ func TestFromRepo_SatisfiedByProvider(t *testing.T) {
 }
 
 func TestFromRepo_SatisfiedByUninstalledProvider(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	db, err := googetdb.NewDB(settings.DBFile())
 	if err != nil {
 		t.Fatalf("googetdb.NewDB: %v", err)
@@ -503,8 +1303,259 @@ func TestFromRepo_SatisfiedByUninstalledProvider(t *testing.T) {
 	}
 }
 
+func TestListDeps_SatisfiedByProvider(t *testing.T) {
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
+	db, err := googetdb.NewDB(settings.DBFile())
+	if err != nil {
+		t.Fatalf("googetdb.NewDB: %v", err)
+	}
+	defer db.Close()
+	rm := client.RepoMap{
+		"repo1": client.Repo{
+			Priority: priority.Value(500),
+			Packages: []goolib.RepoSpec{
+				{PackageSpec: &goolib.PkgSpec{Name: "consumer_pkg", Version: "1.0.0@1", Arch: "x86_64",
+					PkgDependencies: map[string]string{"libvirt": "0.0.0"}}},
+				{PackageSpec: &goolib.PkgSpec{Name: "provider_pkg", Version: "2.0.0@1", Arch: "noarch",
+					Provides: []string{"libvirt"}}},
+			},
+		},
+	}
+	pi := goolib.PackageInfo{Name: "consumer_pkg", Arch: "x86_64", Ver: "1.0.0@1"}
+	got, err := ListDeps(pi, rm, "repo1", []string{"x86_64", "noarch"}, db)
+	if err != nil {
+		t.Fatalf("ListDeps: %v", err)
+	}
+	want := []goolib.PackageInfo{pi, {Name: "provider_pkg", Arch: "noarch", Ver: "2.0.0@1"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ListDeps = %v, want %v", got, want)
+	}
+}
+
+func TestListDeps_SelfDependency(t *testing.T) {
+	for _, tc := range []struct {
+		desc    string
+		pkgs    []*goolib.PkgSpec // pkgs[0] is passed to ListDeps
+		want    []goolib.PackageInfo
+		wantErr string
+	}{
+		{
+			desc: "depends on a name it provides",
+			pkgs: []*goolib.PkgSpec{
+				{Name: "self_pkg", Version: "1.0.0", Arch: "noarch", Provides: []string{"virt"},
+					PkgDependencies: map[string]string{"virt": "0.0.0"}},
+			},
+			wantErr: "resolves to the package itself",
+		},
+		{
+			desc: "depends on itself",
+			pkgs: []*goolib.PkgSpec{
+				{Name: "self_pkg", Version: "1.0.0", Arch: "noarch",
+					PkgDependencies: map[string]string{"self_pkg": "0.0.0"}},
+			},
+			wantErr: "resolves to the package itself",
+		},
+		{
+			desc: "depends on another arch of itself",
+			pkgs: []*goolib.PkgSpec{
+				{Name: "self_pkg", Version: "1.0.0", Arch: "x86_64",
+					PkgDependencies: map[string]string{"self_pkg.x86_32": "0.0.0"}},
+				{Name: "self_pkg", Version: "1.0.0", Arch: "x86_32"},
+			},
+			want: []goolib.PackageInfo{{Name: "self_pkg", Arch: "x86_32", Ver: "1.0.0"}},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			var specs []goolib.RepoSpec
+			for _, ps := range tc.pkgs {
+				specs = append(specs, goolib.RepoSpec{PackageSpec: ps})
+			}
+			rm := client.RepoMap{"repo1": client.Repo{Priority: priority.Value(500), Packages: specs}}
+			pi := goolib.PackageInfo{Name: tc.pkgs[0].Name, Arch: tc.pkgs[0].Arch, Ver: tc.pkgs[0].Version}
+			got, err := ListDeps(pi, rm, "repo1", []string{"x86_64", "x86_32", "noarch"}, db)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ListDeps = %v, %v; want error containing %q", got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ListDeps: %v", err)
+			}
+			want := append([]goolib.PackageInfo{pi}, tc.want...)
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("ListDeps mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestInstallDeps_SelfDependency(t *testing.T) {
+	for _, tc := range []struct {
+		desc     string
+		pkgs     []*goolib.PkgSpec // pkgs[0] is passed to installDeps
+		wantSelf bool              // whether to expect the "resolves to the package itself" error
+	}{
+		{
+			desc: "depends on a name it provides",
+			pkgs: []*goolib.PkgSpec{
+				{Name: "self_pkg", Version: "1.0.0", Arch: "noarch", Provides: []string{"virt"},
+					PkgDependencies: map[string]string{"virt": "0.0.0"}},
+			},
+			wantSelf: true,
+		},
+		{
+			desc: "depends on itself",
+			pkgs: []*goolib.PkgSpec{
+				{Name: "self_pkg", Version: "1.0.0", Arch: "noarch",
+					PkgDependencies: map[string]string{"self_pkg": "0.0.0"}},
+			},
+			wantSelf: true,
+		},
+		{
+			// Resolution succeeds and the install then fails at the download,
+			// because the test repo has no real package files.
+			desc: "depends on another arch of itself",
+			pkgs: []*goolib.PkgSpec{
+				{Name: "self_pkg", Version: "1.0.0", Arch: "x86_64",
+					PkgDependencies: map[string]string{"self_pkg.x86_32": "0.0.0"}},
+				{Name: "self_pkg", Version: "1.0.0", Arch: "x86_32"},
+			},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			var specs []goolib.RepoSpec
+			for _, ps := range tc.pkgs {
+				specs = append(specs, goolib.RepoSpec{PackageSpec: ps})
+			}
+			rm := client.RepoMap{"repo1": client.Repo{Priority: priority.Value(500), Packages: specs}}
+			downloader, err := client.NewDownloader("")
+			if err != nil {
+				t.Fatalf("NewDownloader: %v", err)
+			}
+			err = installDeps(t.Context(), tc.pkgs[0], t.TempDir(), rm, []string{"x86_64", "x86_32", "noarch"}, false, false, downloader, db)
+			const selfErr = "resolves to the package itself"
+			if gotSelf := err != nil && strings.Contains(err.Error(), selfErr); gotSelf != tc.wantSelf {
+				t.Errorf("installDeps = %v; want an error containing %q: %v", err, selfErr, tc.wantSelf)
+			}
+		})
+	}
+}
+
+func TestListDeps_VersionRequirement(t *testing.T) {
+	for _, tc := range []struct {
+		desc    string
+		dep     map[string]string
+		pkgs    []*goolib.PkgSpec
+		want    []goolib.PackageInfo // excluding the consumer itself
+		wantErr string               // substring of the expected error, if any
+	}{
+		{
+			desc: "versioned provides meets requirement, provider package version lower",
+			dep:  map[string]string{"virt": "3.0.0"},
+			pkgs: []*goolib.PkgSpec{
+				{Name: "provider_pkg", Version: "1.0.0", Arch: "noarch", Provides: []string{"virt=5.0.0"}},
+			},
+			want: []goolib.PackageInfo{{Name: "provider_pkg", Arch: "noarch", Ver: "1.0.0"}},
+		},
+		{
+			desc: "unversioned provides meets any required version",
+			dep:  map[string]string{"virt": "3.0.0"},
+			pkgs: []*goolib.PkgSpec{
+				{Name: "provider_pkg", Version: "1.0.0", Arch: "noarch", Provides: []string{"virt"}},
+			},
+			want: []goolib.PackageInfo{{Name: "provider_pkg", Arch: "noarch", Ver: "1.0.0"}},
+		},
+		{
+			desc: "versioned provides below requirement",
+			dep:  map[string]string{"virt": "3.0.0"},
+			pkgs: []*goolib.PkgSpec{
+				{Name: "provider_pkg", Version: "4.0.0", Arch: "noarch", Provides: []string{"virt=2.0.0"}},
+			},
+			wantErr: "cannot resolve dependency virt version 3.0.0 or greater",
+		},
+		{
+			desc: "direct dependency meets requirement",
+			dep:  map[string]string{"dep_pkg": "3.0.0"},
+			pkgs: []*goolib.PkgSpec{
+				{Name: "dep_pkg", Version: "3.1.0", Arch: "noarch"},
+			},
+			want: []goolib.PackageInfo{{Name: "dep_pkg", Arch: "noarch", Ver: "3.1.0"}},
+		},
+		{
+			desc: "direct dependency below requirement",
+			dep:  map[string]string{"dep_pkg": "3.0.0"},
+			pkgs: []*goolib.PkgSpec{
+				{Name: "dep_pkg", Version: "1.0.0", Arch: "noarch"},
+			},
+			wantErr: "cannot resolve dependency dep_pkg version 3.0.0 or greater",
+		},
+		{
+			desc: "direct dependency below requirement, provider meets it",
+			dep:  map[string]string{"dep_pkg": "3.0.0"},
+			pkgs: []*goolib.PkgSpec{
+				{Name: "dep_pkg", Version: "1.0.0", Arch: "noarch"},
+				{Name: "provider_pkg", Version: "1.0.0", Arch: "noarch", Provides: []string{"dep_pkg=3.0.0"}},
+			},
+			want: []goolib.PackageInfo{{Name: "provider_pkg", Arch: "noarch", Ver: "1.0.0"}},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			consumer := &goolib.PkgSpec{Name: "consumer_pkg", Version: "1.0.0", Arch: "noarch", PkgDependencies: tc.dep}
+			specs := []goolib.RepoSpec{{PackageSpec: consumer}}
+			for _, ps := range tc.pkgs {
+				specs = append(specs, goolib.RepoSpec{PackageSpec: ps})
+			}
+			rm := client.RepoMap{"repo1": client.Repo{Priority: priority.Value(500), Packages: specs}}
+			pi := goolib.PackageInfo{Name: "consumer_pkg", Arch: "noarch", Ver: "1.0.0"}
+			got, err := ListDeps(pi, rm, "repo1", []string{"noarch"}, db)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("ListDeps = %v, %v; want error containing %q", got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ListDeps: %v", err)
+			}
+			want := append([]goolib.PackageInfo{pi}, tc.want...)
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("ListDeps mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestBuildConflictMap(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	state := []client.PackageState{
 		{
 			PackageSpec: &goolib.PkgSpec{Name: "pkgA", Version: "1.0.0@1", Arch: "noarch"},
@@ -573,14 +1624,14 @@ func TestMakeInstallFunction(t *testing.T) {
 	f.Close()
 
 	// Test 1: Conflict without force -> Success by default
-	fnBlock := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, false, cm)
+	fnBlock := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, false, cm, &undo{})
 	errBlock := fnBlock(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errBlock != nil {
 		t.Errorf("expected no conflict error by default, got %v", errBlock)
 	}
 
 	// Test 2: Conflict with force -> Success
-	fnForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, true, cm)
+	fnForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, true, cm, &undo{})
 	errForce := fnForce(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errForce != nil {
 		t.Errorf("expected no error with force, got %v", errForce)
@@ -589,16 +1640,388 @@ func TestMakeInstallFunction(t *testing.T) {
 	// Test 3: Conflict without force in strict mode -> Error
 	settings.StrictConflicts = true
 	defer func() { settings.StrictConflicts = false }()
-	fnStrict := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, false, cm)
+	fnStrict := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, false, cm, &undo{})
 	errStrict := fnStrict(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errStrict == nil {
 		t.Errorf("expected conflict error in strict mode, got nil")
 	}
 
 	// Test 4: Conflict with force in strict mode -> Success
-	fnStrictForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, true, cm)
+	fnStrictForce := makeInstallFunction(srcDir, dstDir, make(map[string]string), false, true, cm, &undo{})
 	errStrictForce := fnStrictForce(filepath.Join(srcDir, "conflicting_file"), fi, nil)
 	if errStrictForce != nil {
 		t.Errorf("expected no error with force in strict mode, got %v", errStrictForce)
+	}
+}
+
+// A replaced package is removed as dbOnly says: with dbOnly only its database
+// entry goes, otherwise its uninstall command runs. A's uninstall script needs
+// the package, which is not cached and can't be downloaded.
+func TestResolveReplacementsMode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dbOnly  bool
+		wantErr error
+	}{
+		{"db_only", true, nil},
+		{"run uninstaller", false, remove.ErrPackageUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(srv.Close)
+			d, err := client.NewDownloader("")
+			if err != nil {
+				t.Fatalf("NewDownloader: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			file := filepath.Join(t.TempDir(), "a.exe")
+			if err := os.WriteFile(file, []byte("a"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.WriteStateToDB(client.GooGetState{{
+				PackageSpec:    &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1.0.0@1", Uninstall: goolib.ExecFile{Path: "uninstall.sh"}},
+				InstalledFiles: map[string]string{file: "chksum"},
+				LocalPath:      filepath.Join(t.TempDir(), "A.noarch.1.0.0@1.goo"),
+				DownloadURL:    srv.URL + "/A.noarch.1.0.0@1.goo",
+				Checksum:       "0000",
+			}}); err != nil {
+				t.Fatalf("WriteStateToDB: %v", err)
+			}
+
+			ps := &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1.0.0@1", Replaces: []string{"A"}}
+			err = resolveReplacements(t.Context(), ps, tc.dbOnly, d, db)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("resolveReplacements(dbOnly=%v) = %v, want %v", tc.dbOnly, err, tc.wantErr)
+			}
+			a, err := db.FetchPkg(goolib.PackageInfo{Name: "A", Arch: "noarch"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := a.PackageSpec != nil, tc.wantErr != nil; got != want {
+				t.Errorf("A still installed = %v, want %v", got, want)
+			}
+			// db_only and a failed uninstall both leave A's files in place.
+			if _, err := os.Stat(file); err != nil {
+				t.Errorf("A's installed file was removed: %v", err)
+			}
+			if gotRequests := requests.Load() > 0; gotRequests != !tc.dbOnly {
+				t.Errorf("download requested = %v, want %v", gotRequests, !tc.dbOnly)
+			}
+		})
+	}
+}
+
+func TestFromDiskCompressed(t *testing.T) {
+	for _, format := range goolib.CompressionFormats() {
+		t.Run(format, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+
+			src, dst, cache := t.TempDir(), t.TempDir(), t.TempDir()
+			ps := goolib.PkgSpec{Name: "zpkg", Version: "1.0.0@1", Arch: "noarch"}
+			rs := testutil.GenGooCompressed(t, src, dst, ps, format)
+			if err := FromDisk(filepath.Join(src, rs.Source), cache, false, false, false, db); err != nil {
+				t.Fatalf("FromDisk: %v", err)
+			}
+
+			got, err := os.ReadFile(filepath.Join(dst, ps.Name))
+			if err != nil {
+				t.Fatalf("installed file: %v", err)
+			}
+			if want := ps.String(); string(got) != want {
+				t.Errorf("installed file contents = %q, want %q", got, want)
+			}
+			state, err := db.FetchPkg(goolib.PackageInfo{Name: ps.Name, Arch: ps.Arch})
+			if err != nil {
+				t.Fatalf("FetchPkg: %v", err)
+			}
+			if state.PackageSpec == nil || state.PackageSpec.Version != ps.Version {
+				t.Errorf("database entry = %+v, want version %s", state.PackageSpec, ps.Version)
+			}
+		})
+	}
+}
+
+// TestDBOnlyRecordsChecksums checks that a db_only install records the
+// payload's checksum for each file and an empty hash for each directory,
+// without writing anything to disk.
+func TestDBOnlyRecordsChecksums(t *testing.T) {
+	db := newDB(t)
+	dst := filepath.Join(t.TempDir(), "install")
+	goo := writeTestPackage(t, t.TempDir(), "dbonly", "1.0.0@1", dst, testPayload)
+
+	if err := FromDisk(goo, t.TempDir(), true, false, false, db); err != nil {
+		t.Fatalf("FromDisk(dbOnly=true) = %v, want nil", err)
+	}
+	got := fetchPkg(t, db, "dbonly").InstalledFiles
+	if want := wantFiles(dst, testPayload); !maps.Equal(got, want) {
+		t.Errorf("db_only InstalledFiles = %v, want %v", got, want)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Errorf("os.Stat(%s) = %v, want IsNotExist: a db_only install must not write files", dst, err)
+	}
+}
+
+// TestDBOnlyVerify checks that, once the payload is on disk, verify passes for
+// a db_only row and flags an edited file.
+func TestDBOnlyVerify(t *testing.T) {
+	db := newDB(t)
+	dst := filepath.Join(t.TempDir(), "install")
+	goo := writeTestPackage(t, t.TempDir(), "dbonly", "1.0.0@1", dst, testPayload)
+	if err := FromDisk(goo, t.TempDir(), true, false, false, db); err != nil {
+		t.Fatalf("FromDisk(dbOnly=true) = %v, want nil", err)
+	}
+	putPayload(t, dst, testPayload)
+	ps := fetchPkg(t, db, "dbonly")
+	if ok, err := verify.Files(ps); err != nil || !ok {
+		t.Errorf("verify.Files() with the payload on disk = %v, %v; want true, nil", ok, err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "etc", "sub", "conf"), []byte("key=edited\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := verify.Files(ps); err != nil || ok {
+		t.Errorf("verify.Files() after editing a file = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// TestDBOnlyConflicts checks that db_only rows take part in file-conflict
+// checks and that legacy rows with empty checksums don't.
+func TestDBOnlyConflicts(t *testing.T) {
+	shared := map[string][]byte{"README": []byte("other read me")}
+	for _, tc := range []struct {
+		desc    string
+		legacy  bool // Install the owner as a legacy row with "" checksums.
+		strict  bool
+		force   bool
+		dbOnly  bool // Install the second package db_only, as `googet check` does.
+		wantErr bool
+	}{
+		{desc: "strict", strict: true, wantErr: true},
+		{desc: "strict forced", strict: true, force: true},
+		{desc: "not strict", strict: false},
+		{desc: "not strict forced", strict: false, force: true},
+		{desc: "strict db_only, as googet check", strict: true, dbOnly: true, wantErr: true},
+		{desc: "strict forced db_only", strict: true, force: true, dbOnly: true},
+		{desc: "strict against legacy row", legacy: true, strict: true},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			db := newDB(t)
+			setStrictConflicts(t, tc.strict)
+			dst := filepath.Join(t.TempDir(), "install")
+			if tc.legacy {
+				legacy := map[string]string{}
+				for f := range wantFiles(dst, testPayload) {
+					legacy[f] = ""
+				}
+				if err := db.AddPkg(client.PackageState{
+					PackageSpec:    &goolib.PkgSpec{Name: "owner", Version: "1.0.0@1", Arch: "noarch"},
+					InstalledFiles: legacy,
+				}); err != nil {
+					t.Fatalf("db.AddPkg: %v", err)
+				}
+			} else {
+				goo := writeTestPackage(t, t.TempDir(), "owner", "1.0.0@1", dst, testPayload)
+				if err := FromDisk(goo, t.TempDir(), true, false, false, db); err != nil {
+					t.Fatalf("FromDisk(owner, dbOnly=true) = %v, want nil", err)
+				}
+			}
+			ownerBefore := fetchPkg(t, db, "owner").InstalledFiles
+
+			goo := writeTestPackage(t, t.TempDir(), "other", "1.0.0@1", dst, shared)
+			err := FromDisk(goo, t.TempDir(), tc.dbOnly, tc.force, false, db)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "file conflict") || !strings.Contains(err.Error(), "owned by package owner") {
+					t.Errorf("FromDisk(other) = %v, want a file conflict with package owner", err)
+				}
+			} else if err != nil {
+				t.Errorf("FromDisk(other) = %v, want nil", err)
+			}
+			if got := fetchPkg(t, db, "owner").InstalledFiles; !maps.Equal(got, ownerBefore) {
+				t.Errorf("owner's InstalledFiles changed from %v to %v", ownerBefore, got)
+			}
+		})
+	}
+}
+
+// TestDBOnlyRemove checks that a normal removal of a db_only package deletes
+// its files and directories.
+func TestDBOnlyRemove(t *testing.T) {
+	db := newDB(t)
+	dst := filepath.Join(t.TempDir(), "install")
+	goo := writeTestPackage(t, t.TempDir(), "dbonly", "1.0.0@1", dst, testPayload)
+	if err := FromDisk(goo, t.TempDir(), true, false, false, db); err != nil {
+		t.Fatalf("FromDisk(dbOnly=true) = %v, want nil", err)
+	}
+	putPayload(t, dst, testPayload)
+	pi := goolib.PackageInfo{Name: "dbonly", Arch: "noarch"}
+	deps, _, err := remove.EnumerateDeps(pi, db)
+	if err != nil {
+		t.Fatalf("remove.EnumerateDeps: %v", err)
+	}
+	downloader, err := client.NewDownloader("")
+	if err != nil {
+		t.Fatalf("client.NewDownloader: %v", err)
+	}
+	if err := remove.All(context.Background(), pi, deps, remove.RunUninstaller, downloader, db); err != nil {
+		t.Fatalf("remove.All() = %v, want nil", err)
+	}
+	for f := range wantFiles(dst, testPayload) {
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Errorf("os.Stat(%s) after removal = %v, want IsNotExist", f, err)
+		}
+	}
+	if ps, err := db.FetchPkg(pi); err != nil || ps.PackageSpec != nil {
+		t.Errorf("db.FetchPkg after removal = %v, %v; want no package", ps.PackageSpec, err)
+	}
+}
+
+// cleanOldChildEnv, when set, names the directory in which
+// TestCleanOldFilesFilePass runs cleanOldFiles in a child process.
+const cleanOldChildEnv = "GOOGET_TEST_CLEANOLD_DIR"
+
+// cleanOldLogKey is the start of the message cleanOldFiles logs for each
+// stale file it removes in the file pass.
+const cleanOldLogKey = "Cleaning up old file"
+
+// cleanOldLayout returns the old and new InstalledFiles for an upgrade under
+// dst. The new version keeps keep.txt and the locked directory, and drops
+// stale.txt, the staledir directory with its file, and locked/stuck.txt.
+func cleanOldLayout(dst string) (oldFiles, newFiles map[string]string) {
+	p := func(s string) string { return filepath.Join(dst, filepath.FromSlash(s)) }
+	oldFiles = map[string]string{
+		dst:                     "",
+		p("keep.txt"):           "11",
+		p("stale.txt"):          "22",
+		p("staledir"):           "",
+		p("staledir/inner.txt"): "33",
+		p("locked"):             "",
+		p("locked/stuck.txt"):   "44",
+	}
+	newFiles = map[string]string{
+		dst:           "",
+		p("keep.txt"): "11",
+		p("locked"):   "",
+	}
+	return oldFiles, newFiles
+}
+
+// cleanedUpPaths returns the paths named by the cleanOldLogKey lines in out.
+// Each path is unquoted if it was logged quoted.
+func cleanedUpPaths(out string) map[string]bool {
+	paths := make(map[string]bool)
+	for _, line := range strings.Split(out, "\n") {
+		_, rest, ok := strings.Cut(line, cleanOldLogKey)
+		if !ok {
+			continue
+		}
+		path := strings.TrimSpace(rest)
+		if s, err := strconv.Unquote(path); err == nil {
+			path = s
+		}
+		paths[path] = true
+	}
+	return paths
+}
+
+// TestCleanOldFilesFilePass checks that files the new version no longer ships
+// go through the file pass, which logs each one and reports a failed removal
+// as an error, while directories go through the directory pass.
+//
+// The two passes differ only in what they log, so the test has to read the
+// log. init() installs the package's default logger once, with its log file
+// discarded, info logs on stdout and error logs on stderr. google/logger never
+// replaces an initialized default logger, so the output can't be redirected
+// in-process. Instead the test re-runs itself in a child process that calls
+// cleanOldFiles, and reads the child's stdout and stderr.
+func TestCleanOldFilesFilePass(t *testing.T) {
+	if dst := os.Getenv(cleanOldChildEnv); dst != "" {
+		oldFiles, newFiles := cleanOldLayout(dst)
+		cleanOldFiles(client.PackageState{PackageSpec: &goolib.PkgSpec{Name: "pkg"}, InstalledFiles: oldFiles}, newFiles)
+		return
+	}
+
+	// A file in a read-only directory can't be removed or renamed on unix,
+	// unless running as root. Windows doesn't honor the directory mode.
+	canLock := runtime.GOOS != "windows" && os.Geteuid() != 0
+	dst := t.TempDir()
+	oldFiles, _ := cleanOldLayout(dst)
+	for f, sum := range oldFiles {
+		if sum == "" {
+			if err := os.MkdirAll(f, 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for f, sum := range oldFiles {
+		if sum != "" {
+			if err := os.WriteFile(f, []byte(sum), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	locked := filepath.Join(dst, "locked")
+	stuck := filepath.Join(locked, "stuck.txt")
+	if canLock {
+		if err := os.Chmod(locked, 0555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(locked, 0755) })
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCleanOldFilesFilePass$", "-test.count=1")
+	cmd.Env = append(os.Environ(), cleanOldChildEnv+"="+dst)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("child process: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+
+	cleaned := cleanedUpPaths(stdout.String())
+	for _, f := range []string{"stale.txt", "staledir/inner.txt", "locked/stuck.txt"} {
+		if path := filepath.Join(dst, filepath.FromSlash(f)); !cleaned[path] {
+			t.Errorf("child stdout has no %q line for %s; the stale file didn't take the file pass\nstdout:\n%s", cleanOldLogKey, path, stdout.String())
+		}
+	}
+	for _, d := range []string{"staledir", "locked"} {
+		if path := filepath.Join(dst, d); cleaned[path] {
+			t.Errorf("child stdout has a %q line for %s; directories must take the directory pass", cleanOldLogKey, path)
+		}
+	}
+	for _, f := range []string{"stale.txt", "staledir/inner.txt", "staledir"} {
+		if _, err := os.Stat(filepath.Join(dst, filepath.FromSlash(f))); !os.IsNotExist(err) {
+			t.Errorf("os.Stat(%s) = %v, want IsNotExist", f, err)
+		}
+	}
+	for _, f := range []string{"keep.txt", "locked"} {
+		if _, err := os.Stat(filepath.Join(dst, f)); err != nil {
+			t.Errorf("os.Stat(%s) = %v, want it kept", f, err)
+		}
+	}
+	if canLock {
+		if _, err := os.Stat(stuck); err != nil {
+			t.Fatalf("os.Stat(%s) = %v; the locked file should still exist", stuck, err)
+		}
+		// Only error logs go to stderr; the directory pass logs failures at
+		// info level, on stdout.
+		if !strings.Contains(stderr.String(), stuck) {
+			t.Errorf("child stderr doesn't mention %s; a failed file removal must be logged as an error\nstderr:\n%s", stuck, stderr.String())
+		}
 	}
 }

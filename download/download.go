@@ -16,7 +16,6 @@ package download
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -50,22 +49,31 @@ var retryDelay = func(retry int) time.Duration {
 
 // Package downloads a package from the given url,
 // the provided SHA256 checksum will be checked during download.
-// A failed or stalled download is tried up to maxAttempts times in all. An
-// HTTP download resumes from the partial file when the server supports it.
+// A failed or stalled download is tried up to maxAttempts times in all,
+// unless the failure is permanent, such as a 404. An HTTP download resumes
+// from the partial file when the server supports it.
 func Package(ctx context.Context, pkgURL, dst, chksum string, downloader *client.Downloader) error {
 	isGCSURL, bucket, object := goolib.SplitGCSUrl(pkgURL)
+	if isGCSURL {
+		// Refuse a destination that isn't a regular file before the first
+		// attempt; retrying can't change it. Other errors are left to the
+		// attempts.
+		if err := checkReplaceable(dst); errors.Is(err, errNotRegularFile) {
+			return err
+		}
+	}
 	try := func() error {
 		if !isGCSURL {
 			return packageHTTP(ctx, pkgURL, dst, chksum, downloader)
 		}
-		if err := oswrap.RemoveAll(dst); err != nil {
+		if err := removeFile(dst); err != nil {
 			return err
 		}
 		return packageGCS(ctx, bucket, object, dst, chksum, downloader)
 	}
 	for attempt := 1; ; attempt++ {
 		err := try()
-		if err == nil || ctx.Err() != nil || attempt == maxAttempts {
+		if err == nil || ctx.Err() != nil || attempt == maxAttempts || isPermanent(err) {
 			return err
 		}
 		d := retryDelay(attempt)
@@ -78,14 +86,64 @@ func Package(ctx context.Context, pkgURL, dst, chksum string, downloader *client
 	}
 }
 
-// packageHTTP downloads a package from an HTTP(S) server.
-func packageHTTP(ctx context.Context, url, dst, chksum string, downloader *client.Downloader) error {
+// statusError is returned by packageHTTP when the server answers a GET with an
+// unexpected HTTP status.
+type statusError struct {
+	url    string
+	code   int
+	status string
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("downloading %s: unexpected status %s", e.url, e.status)
+}
+
+// isPermanent reports whether a failed download attempt would fail the same
+// way if tried again, so Package should not retry it. Only a 4xx status other
+// than 408, 425 or 429, a missing GCS object and a destination that isn't a
+// regular file are permanent. Everything else, including timeouts, stalls, 5xx
+// statuses, network errors and checksum mismatches, is retried.
+func isPermanent(err error) bool {
+	if errors.Is(err, errNotRegularFile) {
+		return true
+	}
+	var sErr *statusError
+	if errors.As(err, &sErr) {
+		switch sErr.code {
+		case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+			return false
+		}
+		return sErr.code >= 400 && sErr.code < 500
+	}
+	return client.IsGCSNotFound(err)
+}
+
+// packageHTTP downloads a package from an HTTP(S) server. A failed download
+// keeps a non-empty partial file so a later attempt can resume it, but never
+// leaves an empty file behind.
+func packageHTTP(ctx context.Context, url, dst, chksum string, downloader *client.Downloader) (err error) {
 	// Try to open any already existing file, otherwise create new file.
 	f, err := os.OpenFile(dst, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// The file is created, or truncated by restart, before the request is
+	// sent, so a failed request can leave it empty. Check the current size
+	// rather than whether the file existed before, since a partial file can
+	// also be truncated before the request fails.
+	defer func() {
+		if err == nil {
+			return
+		}
+		if fi, sErr := f.Stat(); sErr != nil || fi.Size() != 0 {
+			return
+		}
+		f.Close() // Windows cannot delete an open file.
+		if rErr := os.Remove(dst); rErr != nil {
+			logger.Warningf("Failed to remove empty file %s: %v", dst, rErr)
+		}
+	}()
 	// Hash the contents of the existing file.
 	hash := sha256.New()
 	size, err := io.Copy(hash, f)
@@ -153,7 +211,7 @@ func packageHTTP(ctx context.Context, url, dst, chksum string, downloader *clien
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("downloading %s: unexpected status %s", url, resp.Status)
+		return &statusError{url: url, code: resp.StatusCode, status: resp.Status}
 	}
 	if resp.StatusCode == http.StatusOK && size > 0 {
 		// The server is sending the whole file (either it ignored Range or we
@@ -181,8 +239,8 @@ func packageHTTP(ctx context.Context, url, dst, chksum string, downloader *clien
 	bar.Finish()
 	// Verify the checksum of the fully downloaded file.
 	if sum := hex.EncodeToString(hash.Sum(nil)); sum != chksum {
-		f.Close()         // Windows cannot delete an open file.
-		os.RemoveAll(dst) // delete the bad file
+		f.Close()       // Windows cannot delete an open file.
+		removeFile(dst) // delete the bad file
 		return fmt.Errorf("checksum doesn't match: got %s, want %s", sum, chksum)
 	}
 	logger.Infof("Successfully downloaded %s bytes", humanize.IBytes(uint64(n)))
@@ -236,7 +294,8 @@ func Latest(ctx context.Context, pi goolib.PackageInfo, dir string, rm client.Re
 }
 
 // download copies r to dst, verifying the SHA256 checksum, and renders a
-// progress bar when enabled.
+// progress bar when enabled. On any error dst is removed, so a failed download
+// leaves no empty, partial or corrupt file behind.
 func download(r io.Reader, size int64, dst, chksum string) (err error) {
 	f, err := oswrap.Create(dst)
 	if err != nil {
@@ -245,6 +304,12 @@ func download(r io.Reader, size int64, dst, chksum string) (err error) {
 	defer func() {
 		if cErr := f.Close(); cErr != nil && err == nil {
 			err = cErr
+		}
+		if err == nil {
+			return
+		}
+		if rErr := oswrap.Remove(dst); rErr != nil {
+			logger.Warningf("Failed to remove %s after a failed download: %v", dst, rErr)
 		}
 	}()
 
@@ -267,10 +332,51 @@ func download(r io.Reader, size int64, dst, chksum string) (err error) {
 	return nil
 }
 
+// errNotRegularFile is returned when a download destination exists but is not
+// a regular file, so it is left in place rather than replaced.
+var errNotRegularFile = errors.New("not a regular file")
+
+// checkReplaceable reports whether a download may replace dst. It returns nil
+// when dst is missing or is a regular file. When dst is a directory, symlink or
+// anything else other than a regular file, it returns an error wrapping
+// errNotRegularFile. Any other error from Lstat is returned as is.
+func checkReplaceable(dst string) error {
+	fi, err := oswrap.Lstat(dst)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("not replacing download destination %s: %w", dst, errNotRegularFile)
+	}
+	return nil
+}
+
+// removeFile removes dst so a download can replace it. A missing dst is not an
+// error. A dst that checkReplaceable refuses is left in place and its error is
+// returned, so a mistaken destination is never deleted.
+func removeFile(dst string) error {
+	if err := checkReplaceable(dst); err != nil {
+		return err
+	}
+	if err := oswrap.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// ExtractDir returns the directory ExtractPkg extracts the package at src
+// into.
+func ExtractDir(src string) string {
+	return strings.TrimSuffix(src, filepath.Ext(src))
+}
+
 // ExtractPkg takes a path to a package and extracts it to a directory based on the
 // package name, it returns the path to the extracted directory.
 func ExtractPkg(src string) (dst string, err error) {
-	dst = strings.TrimSuffix(src, filepath.Ext(src))
+	dst = ExtractDir(src)
 	if src == "" || dst == "" {
 		return "", fmt.Errorf("package extraction paths are invalid: src %s, dst %s", src, dst)
 	}
@@ -285,12 +391,11 @@ func ExtractPkg(src string) (dst string, err error) {
 	}
 	defer f.Close()
 
-	gr, err := gzip.NewReader(f)
+	gr, err := goolib.NewPackageReader(f)
 	if err != nil {
-		if !os.IsExist(err) {
-			return "", err
-		}
+		return "", err
 	}
+	defer gr.Close()
 	tr := tar.NewReader(gr)
 
 	for {
@@ -302,17 +407,10 @@ func ExtractPkg(src string) (dst string, err error) {
 			return "", fmt.Errorf("error opening file: %v", err)
 		}
 
-		name := filepath.Clean(header.Name)
-		absDst, err := filepath.Abs(dst)
+		path, err := goolib.JoinWithin(dst, header.Name)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("error unpacking package: %v", err)
 		}
-		absPath := filepath.Join(absDst, name)
-		if !strings.HasPrefix(absPath, absDst) {
-			return "", fmt.Errorf("error unpacking package, file contains path traversal: %q", name)
-		}
-
-		path := filepath.Join(dst, name)
 		if header.FileInfo().IsDir() {
 			if err := oswrap.MkdirAll(path, 0755); err != nil {
 				return "", err

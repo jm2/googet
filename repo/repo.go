@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/logger"
@@ -71,17 +73,30 @@ type File struct {
 	Entries []Entry // all of the repo entries in the file
 }
 
-// write writes the repo file to disk as YAML if it has any entries.
-// If there are no entries, the repo file is removed.
+// writeOrDelete writes the repo file to disk as YAML if it has any entries.
+// If there are no entries, the repo file is removed with
+// oswrap.RenameAndRemove. The write replaces the file atomically, so a
+// concurrent reader sees either the old or the new contents and never a
+// partial or empty file.
 func (rf *File) writeOrDelete() error {
 	if len(rf.Entries) == 0 {
-		return os.RemoveAll(rf.Path)
+		// Rename the file aside before deleting it, so a reader holding it
+		// open never leaves its path delete pending for the next write.
+		return oswrap.RenameAndRemove(rf.Path)
 	}
 	d, err := yaml.Marshal(rf.Entries)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(rf.Path, d, 0664)
+	// Keep the permission bits of the file being replaced; a new file gets
+	// 0664.
+	perm := os.FileMode(0664)
+	if fi, err := os.Stat(rf.Path); err == nil {
+		perm = fi.Mode().Perm()
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return oswrap.WriteFileAtomic(rf.Path, d, perm)
 }
 
 // addEntry adds a new entry to the repo file if it doesn't already exist,
@@ -115,7 +130,7 @@ func (rf *File) removeEntry(name string) bool {
 }
 
 func unmarshalRepoFile(p string) (File, error) {
-	b, err := os.ReadFile(p)
+	b, err := oswrap.ReadFileShared(p)
 	if err != nil {
 		return File{Path: p}, err
 	}
@@ -197,8 +212,35 @@ func repoList(dir string) (map[string]priority.Value, error) {
 	return result, nil
 }
 
+// configFileRetryDelay is how long ConfigFiles waits before it reads a repo
+// file again after a transient sharing error. Readers retry only once, and
+// briefly, because reading the repo files must not stall a command for long.
+// Writers such as WriteFileAtomic retry for longer, because a failed write
+// loses the change.
+const configFileRetryDelay = 100 * time.Millisecond
+
+// readConfigFile reads the repo file f with read. If read fails with an error
+// for which transient returns true, readConfigFile waits configFileRetryDelay
+// and calls read once more.
+func readConfigFile(f string, read func(string) (File, error), transient func(error) bool) (File, error) {
+	rf, err := read(f)
+	if err != nil && transient(err) {
+		time.Sleep(configFileRetryDelay)
+		rf, err = read(f)
+	}
+	return rf, err
+}
+
 // ConfigFiles returns the parsed contents of all repo configuration files in
-// the given directory.
+// the given directory. A file that a concurrent writer removes after it is
+// listed is skipped. A file that still fails with a transient sharing error
+// after one retry is skipped and logged at Info level. Other read and parse
+// errors are logged as errors and the file is skipped.
+//
+// On Windows, IsTransientShareError counts every ERROR_ACCESS_DENIED as
+// transient, because a file that is delete pending fails that way. So a
+// persistent permission failure on a repo file is also retried once and then
+// logged only at Info level, which is visible with -verbose.
 func ConfigFiles(dir string) ([]File, error) {
 	fl, err := filepath.Glob(filepath.Join(dir, "*.repo"))
 	if err != nil {
@@ -206,9 +248,16 @@ func ConfigFiles(dir string) ([]File, error) {
 	}
 	var rfs []File
 	for _, f := range fl {
-		rf, err := unmarshalRepoFile(f)
+		rf, err := readConfigFile(f, unmarshalRepoFile, oswrap.IsTransientShareError)
 		if err != nil {
-			logger.Error(err)
+			switch {
+			case os.IsNotExist(err):
+				// A concurrent writer removed f after the Glob.
+			case oswrap.IsTransientShareError(err):
+				logger.Infof("Skipping %s while it is being replaced or removed: %v", f, err)
+			default:
+				logger.Error(err)
+			}
 			continue
 		}
 		if rf.Path != "" {

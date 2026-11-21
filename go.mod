@@ -9,6 +9,7 @@ require (
 	github.com/google/go-cmp v0.7.0
 	github.com/google/logger v1.1.2
 	github.com/google/subcommands v1.2.0
+	github.com/klauspost/compress v1.20.3
 	github.com/olekukonko/tablewriter v1.1.5
 	github.com/yusufpapurcu/wmi v1.2.4
 	golang.org/x/oauth2 v0.37.0
@@ -59,11 +60,12 @@ require (
 	go.opentelemetry.io/contrib/detectors/gcp v1.46.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.71.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
-	go.opentelemetry.io/otel v1.46.0 // indirect
-	go.opentelemetry.io/otel/metric v1.46.0 // indirect
-	go.opentelemetry.io/otel/sdk v1.46.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.46.0 // indirect
-	go.opentelemetry.io/otel/trace v1.46.0 // indirect
+	go.opentelemetry.io/otel v1.47.0 // indirect
+	go.opentelemetry.io/otel/log v1.47.0 // indirect
+	go.opentelemetry.io/otel/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
+	go.opentelemetry.io/otel/sdk/metric v1.47.0 // indirect
+	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect

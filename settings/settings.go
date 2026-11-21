@@ -2,12 +2,15 @@
 package settings
 
 import (
-	"io/ioutil"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/googet/v2/client"
+	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/system"
 	"github.com/google/logger"
 	"gopkg.in/yaml.v3"
@@ -38,11 +41,13 @@ var (
 	Progress = true
 )
 
-// Initialize reads the initial settings.
-func Initialize(rootDir string, confirm bool) {
+// Initialize reads the initial settings. A missing googet.conf leaves the
+// defaults in place; it returns an error if googet.conf exists but can't be
+// read.
+func Initialize(rootDir string, confirm bool) error {
 	RootDir = rootDir
 	Confirm = confirm
-	readConf(ConfFile())
+	return readConf(ConfFile())
 }
 
 // LockFile returns the path to the googet lock file.
@@ -92,27 +97,27 @@ type conf struct {
 	StrictConflicts bool
 	// Progress is a pointer so an absent key keeps the default of true.
 	Progress *bool
+	// InstallTimeout sets goolib.Timeout.
+	InstallTimeout string
+	// InactivityTimeout and InactivityMode set the goolib variables of the
+	// same names.
+	InactivityTimeout string
+	InactivityMode    string
 }
 
-// unmarshalConfFile returns a conf from a YAML configuration file.
-func unmarshalConfFile(filename string) (*conf, error) {
-	b, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return nil, err
-	}
-	var cf conf
-	return &cf, yaml.Unmarshal(b, &cf)
-}
-
-// readConf initializes settings based on the configuration file at cf.
-func readConf(filename string) {
-	gc, err := unmarshalConfFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			gc = &conf{}
-		} else {
-			// TODO: if ReadFile fails for some reason other than the file not existing,
-			// gc is nil and the code below will panic after falling through here.
+// readConf initializes settings based on the configuration file at filename.
+// It returns an error if the file exists but can't be read.
+func readConf(filename string) error {
+	gc := &conf{}
+	b, err := oswrap.ReadFileShared(filename)
+	switch {
+	case os.IsNotExist(err):
+		// A missing file keeps the defaults.
+	case err != nil:
+		return fmt.Errorf("unable to read conf file: %w", err)
+	default:
+		// A parse error keeps the fields that decoded.
+		if err := yaml.Unmarshal(b, gc); err != nil {
 			logger.Errorf("Error unmarshalling conf file: %v", err)
 		}
 	}
@@ -122,7 +127,7 @@ func readConf(filename string) {
 	} else {
 		Archs, err = system.InstallableArchs()
 		if err != nil {
-			logger.Fatal(err)
+			return fmt.Errorf("unable to determine installable architectures: %w", err)
 		}
 	}
 
@@ -161,10 +166,41 @@ func readConf(filename string) {
 		ProxyServer = gc.ProxyServer
 	}
 
+	goolib.Timeout = goolib.DefaultTimeout
+	if gc.InstallTimeout != "" {
+		it, err := time.ParseDuration(gc.InstallTimeout)
+		if err != nil {
+			logger.Errorf("Invalid installtimeout %q: %v", gc.InstallTimeout, err)
+		} else {
+			goolib.Timeout = it
+		}
+	}
+
+	if gc.InactivityTimeout != "" {
+		it, err := time.ParseDuration(gc.InactivityTimeout)
+		if err != nil {
+			logger.Errorf("Invalid inactivitytimeout %q: %v", gc.InactivityTimeout, err)
+		} else {
+			goolib.InactivityTimeout = it
+		}
+	}
+
+	switch m := strings.ToLower(gc.InactivityMode); m {
+	case "":
+	case goolib.InactivityEnforce, goolib.InactivityMonitor, goolib.InactivityOff:
+		goolib.InactivityMode = m
+	default:
+		logger.Errorf("Invalid inactivitymode %q, want %s, %s or %s", gc.InactivityMode, goolib.InactivityEnforce, goolib.InactivityMonitor, goolib.InactivityOff)
+		// An invalid value falls back to monitor rather than leaving enforce in
+		// effect, matching newWatch.
+		goolib.InactivityMode = goolib.InactivityMonitor
+	}
+
 	AllowUnsafeURL = gc.AllowUnsafeURL
 	StrictConflicts = gc.StrictConflicts
 	Progress = true
 	if gc.Progress != nil {
 		Progress = *gc.Progress
 	}
+	return nil
 }

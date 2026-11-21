@@ -19,21 +19,32 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/priority"
+	"github.com/google/googet/v2/testutil"
 	"github.com/google/logger"
+	"google.golang.org/api/googleapi"
 )
 
 const (
@@ -596,6 +607,30 @@ func TestUnmarshalRepoPackagesCache(t *testing.T) {
 	}
 }
 
+func TestIsGCSNotFound(t *testing.T) {
+	for _, tc := range []struct {
+		desc string
+		err  error
+		want bool
+	}{
+		{"object not found", storage.ErrObjectNotExist, true},
+		{"wrapped object not found", fmt.Errorf("%w: %w", ErrStalled, storage.ErrObjectNotExist), true},
+		{"bucket not found", storage.ErrBucketNotExist, false},
+		{"googleapi 404", &googleapi.Error{Code: http.StatusNotFound}, true},
+		{"wrapped googleapi 404", fmt.Errorf("open: %w", &googleapi.Error{Code: http.StatusNotFound}), true},
+		{"googleapi 403", &googleapi.Error{Code: http.StatusForbidden}, false},
+		{"stall", ErrStalled, false},
+		{"other", errors.New("boom"), false},
+		{"nil", nil, false},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if got := IsGCSNotFound(tc.err); got != tc.want {
+				t.Errorf("IsGCSNotFound(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestFindRepoSpec(t *testing.T) {
 	want := goolib.RepoSpec{PackageSpec: &goolib.PkgSpec{Name: "test"}}
 	repo := Repo{Packages: []goolib.RepoSpec{
@@ -823,6 +858,631 @@ func TestFindRepoLatest_LockArch(t *testing.T) {
 			}
 			if spec.Arch != tt.wantArch {
 				t.Errorf("got arch %q, want %q", spec.Arch, tt.wantArch)
+			}
+		})
+	}
+}
+
+func TestNewDownloaderDoesNotModifyDefaultClient(t *testing.T) {
+	defaultClient, defaultTransport := http.DefaultClient, http.DefaultClient.Transport
+	t.Cleanup(func() {
+		http.DefaultClient = defaultClient
+		defaultClient.Transport = defaultTransport
+	})
+	const proxyURL = "http://proxy.example:3128"
+	var clients []*http.Client
+	for _, proxy := range []string{"", proxyURL} {
+		d, err := NewDownloader(proxy)
+		if err != nil {
+			t.Fatalf("NewDownloader(%q) failed: %v", proxy, err)
+		}
+		if http.DefaultClient != defaultClient || http.DefaultClient.Transport != defaultTransport {
+			t.Errorf("NewDownloader(%q) modified http.DefaultClient", proxy)
+		}
+		if d.HTTPClient == http.DefaultClient {
+			t.Errorf("NewDownloader(%q).HTTPClient is http.DefaultClient", proxy)
+		}
+		clients = append(clients, d.HTTPClient)
+	}
+	if clients[0] == clients[1] {
+		t.Error("two Downloaders share an http.Client")
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://repo.example/index", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := clients[1].Transport.(*http.Transport).Proxy(req); err != nil || got.String() != proxyURL {
+		t.Errorf("Proxy() = %v, %v, want %s, nil", got, err, proxyURL)
+	}
+}
+
+// trackedBody records whether a response body was closed.
+type trackedBody struct {
+	io.ReadCloser
+	closed atomic.Bool
+}
+
+func (b *trackedBody) Close() error {
+	b.closed.Store(true)
+	return b.ReadCloser.Close()
+}
+
+// countingTransport counts round trips and wraps response bodies in a
+// trackedBody.
+type countingTransport struct {
+	base   http.RoundTripper
+	trips  atomic.Int32
+	mu     sync.Mutex
+	bodies []*trackedBody
+}
+
+func (c *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.trips.Add(1)
+	resp, err := c.base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	b := &trackedBody{ReadCloser: resp.Body}
+	resp.Body = b
+	c.mu.Lock()
+	c.bodies = append(c.bodies, b)
+	c.mu.Unlock()
+	return resp, nil
+}
+
+func TestUnmarshalRepoPackagesHTTPClosesBodies(t *testing.T) {
+	for _, tc := range []struct {
+		desc        string
+		indexExists bool
+		wantErr     bool
+	}{
+		{"index.gz missing", true, false},
+		{"index.gz and index missing", false, true},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/index" && tc.indexExists {
+					w.Write([]byte("[]"))
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer srv.Close()
+			ct := &countingTransport{base: &http.Transport{}}
+			d := &Downloader{HTTPClient: &http.Client{Transport: ct}, StallTimeout: 5 * time.Second}
+			_, err := d.unmarshalRepoPackagesHTTP(context.Background(), srv.URL)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("unmarshalRepoPackagesHTTP() = %v, want error %t", err, tc.wantErr)
+			}
+			if len(ct.bodies) != 2 {
+				t.Fatalf("unmarshalRepoPackagesHTTP() made %d requests, want 2", len(ct.bodies))
+			}
+			for i, b := range ct.bodies {
+				if !b.closed.Load() {
+					t.Errorf("response %d body not closed", i)
+				}
+			}
+		})
+	}
+}
+
+func TestGetRetry(t *testing.T) {
+	stall := func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }
+	for _, tc := range []struct {
+		desc      string
+		handler   func(first bool, w http.ResponseWriter, r *http.Request)
+		cancel    bool
+		wantTrips int32
+		wantErr   error
+	}{
+		{
+			desc:      "header timeout is not retried",
+			handler:   func(_ bool, w http.ResponseWriter, r *http.Request) { stall(w, r) },
+			wantTrips: 1,
+		},
+		{
+			desc: "dropped connection is retried",
+			handler: func(first bool, w http.ResponseWriter, r *http.Request) {
+				if !first {
+					w.Write([]byte("ok"))
+					return
+				}
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("Hijack() failed: %v", err)
+					return
+				}
+				conn.Close()
+			},
+			wantTrips: 2,
+		},
+		{
+			desc:      "canceled context is not retried",
+			handler:   func(_ bool, w http.ResponseWriter, r *http.Request) { stall(w, r) },
+			cancel:    true,
+			wantTrips: 1,
+			wantErr:   context.Canceled,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var reqs atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				first := reqs.Add(1) == 1
+				if tc.cancel {
+					cancel()
+				}
+				tc.handler(first, w, r)
+			}))
+			defer srv.Close()
+			ct := &countingTransport{base: &http.Transport{ResponseHeaderTimeout: 100 * time.Millisecond}}
+			d := &Downloader{HTTPClient: &http.Client{Transport: ct}}
+			resp, err := d.Get(ctx, srv.URL)
+			if err == nil {
+				resp.Body.Close()
+			}
+			if got := ct.trips.Load(); got != tc.wantTrips {
+				t.Errorf("Get() made %d requests, want %d", got, tc.wantTrips)
+			}
+			if wantOK := tc.wantTrips == 2; (err == nil) != wantOK {
+				t.Errorf("Get() = %v, want success %t", err, wantOK)
+			}
+			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+				t.Errorf("Get() = %v, want it to wrap %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestShouldRetry(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	expired, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	reset := &url.Error{Op: "Get", URL: "http://repo", Err: errors.New("connection reset by peer")}
+	dialTimeout := &url.Error{Op: "Get", URL: "http://repo", Err: &net.OpError{Op: "dial", Err: os.ErrDeadlineExceeded}}
+	for _, tc := range []struct {
+		desc string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"connection reset", context.Background(), reset, true},
+		{"EOF", context.Background(), &url.Error{Op: "Get", URL: "http://repo", Err: io.EOF}, true},
+		{"canceled context", canceled, reset, false},
+		{"expired context", expired, reset, false},
+		{"dial timeout", context.Background(), dialTimeout, false},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if got := shouldRetry(tc.ctx, tc.err); got != tc.want {
+				t.Errorf("shouldRetry(ctx, %v) with ctx.Err() = %v = %t, want %t", tc.err, tc.ctx.Err(), got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewRequestOauthUsesHTTPClient(t *testing.T) {
+	// The token endpoint is only reachable through the Downloader's proxy.
+	var tokenReqs atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Host != "token.invalid" {
+			http.NotFound(w, r)
+			return
+		}
+		tokenReqs.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"access_token": "token", "token_type": "Bearer", "expires_in": 3600}`))
+	}))
+	defer proxy.Close()
+	creds := filepath.Join(t.TempDir(), "creds.json")
+	if err := os.WriteFile(creds, []byte(`{"type": "authorized_user", "client_id": "id", "client_secret": "secret", "refresh_token": "refresh", "token_uri": "http://token.invalid/token"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", creds)
+
+	d, err := NewDownloader(proxy.URL)
+	if err != nil {
+		t.Fatalf("NewDownloader(%q) failed: %v", proxy.URL, err)
+	}
+	req, err := d.NewRequest(context.Background(), http.MethodGet, "oauth-http://repo.invalid/index", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() failed: %v", err)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer token" {
+		t.Errorf("Authorization header = %q, want %q", got, "Bearer token")
+	}
+	if got := tokenReqs.Load(); got != 1 {
+		t.Errorf("got %d token requests through the proxy, want 1", got)
+	}
+}
+
+// writeRepoCache writes specs as the cache entry for url in cacheDir, with
+// the given age, and returns the cache file path.
+func writeRepoCache(t *testing.T, cacheDir, url string, specs []goolib.RepoSpec, age time.Duration) string {
+	t.Helper()
+	cf := repoCacheFile(cacheDir, url)
+	j, err := json.Marshal(specs)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if err := os.WriteFile(cf, j, 0644); err != nil {
+		t.Fatalf("writing cache file: %v", err)
+	}
+	mtime := time.Now().Add(-age)
+	if err := os.Chtimes(cf, mtime, mtime); err != nil {
+		t.Fatalf("setting cache file time: %v", err)
+	}
+	return cf
+}
+
+func TestUnmarshalRepoPackagesCacheClosedAfterRead(t *testing.T) {
+	cacheDir := t.TempDir()
+	url := "http://localhost/test-repo"
+	want := []goolib.RepoSpec{{Source: "foo"}}
+	cf := writeRepoCache(t, cacheDir, url, want, 0)
+
+	d, err := NewDownloader(proxyServer)
+	if err != nil {
+		t.Fatalf("NewDownloader(%s): %v", proxyServer, err)
+	}
+	got, err := d.unmarshalRepoPackages(context.Background(), url, cacheDir, cacheLife)
+	if err != nil {
+		t.Fatalf("unmarshalRepoPackages: %v", err)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("unmarshalRepoPackages diff (-want +got):\n%s", diff)
+	}
+	// On Windows a handle left open would make the writer's replace fail.
+	if err := os.Rename(cf, cf+".old"); err != nil {
+		t.Errorf("renaming the cache file after reading it: %v", err)
+	}
+	if err := os.Remove(cf + ".old"); err != nil {
+		t.Errorf("removing the cache file after reading it: %v", err)
+	}
+}
+
+// TestUnmarshalRepoPackagesReadOnlyCache checks that a Downloader with
+// ReadOnlyCache uses a fresh cache entry without any network request, fetches
+// a stale, missing, empty or truncated entry into memory, and never changes
+// the cache directory: no file is written, replaced or created, and a missing
+// directory isn't created. A writable Downloader is the control: it writes
+// the fetched index into the cache, or, when the directory is missing, logs
+// the failed write, returns the fetched index and creates nothing.
+func TestUnmarshalRepoPackagesReadOnlyCache(t *testing.T) {
+	cached := []goolib.RepoSpec{{Source: "cached"}}
+	served := []goolib.RepoSpec{{Source: "served"}}
+	servedJSON, err := json.Marshal(served)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedJSON, err := json.Marshal(cached)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, transport := range []string{"http", "gcs"} {
+		for _, tc := range []struct {
+			desc      string
+			content   []byte // nil means no cache file.
+			age       time.Duration
+			noDir     bool
+			wantSpecs []goolib.RepoSpec
+			wantHits  int32
+		}{
+			{desc: "fresh", content: cachedJSON, wantSpecs: cached, wantHits: 0},
+			{desc: "stale", content: cachedJSON, age: 2 * cacheLife, wantSpecs: served, wantHits: 1},
+			{desc: "missing", wantSpecs: served, wantHits: 1},
+			{desc: "empty", content: []byte{}, wantSpecs: served, wantHits: 1},
+			{desc: "truncated", content: cachedJSON[:len(cachedJSON)/2], wantSpecs: served, wantHits: 1},
+			{desc: "missing directory", noDir: true, wantSpecs: served, wantHits: 1},
+		} {
+			for _, readOnly := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/ReadOnlyCache=%v", transport, tc.desc, readOnly), func(t *testing.T) {
+					var hits atomic.Int32
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						// HTTP repos and the GCS emulator both ask for an
+						// object named index.gz first, then index.
+						if filepath.Base(r.URL.Path) != "index" {
+							http.NotFound(w, r)
+							return
+						}
+						hits.Add(1)
+						w.Header().Set("Content-Type", "application/json")
+						w.Write(servedJSON)
+					}))
+					defer srv.Close()
+					repo := srv.URL
+					if transport == "gcs" {
+						t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
+						repo = "gs://bkt"
+					}
+					cacheDir := filepath.Join(t.TempDir(), "cache")
+					if !tc.noDir {
+						if err := os.Mkdir(cacheDir, 0755); err != nil {
+							t.Fatal(err)
+						}
+					}
+					cf := repoCacheFile(cacheDir, repo)
+					if tc.content != nil {
+						if err := os.WriteFile(cf, tc.content, 0644); err != nil {
+							t.Fatal(err)
+						}
+						mtime := time.Now().Add(-tc.age)
+						if err := os.Chtimes(cf, mtime, mtime); err != nil {
+							t.Fatal(err)
+						}
+					}
+					before := testutil.TreeSnapshot(t, cacheDir)
+
+					d, err := NewDownloader(proxyServer)
+					if err != nil {
+						t.Fatalf("NewDownloader: %v", err)
+					}
+					d.ReadOnlyCache = readOnly
+					got, err := d.unmarshalRepoPackages(context.Background(), repo, cacheDir, cacheLife)
+					if err != nil {
+						t.Fatalf("unmarshalRepoPackages: %v", err)
+					}
+					if diff := cmp.Diff(tc.wantSpecs, got); diff != "" {
+						t.Errorf("unmarshalRepoPackages diff (-want +got):\n%s", diff)
+					}
+					if n := hits.Load(); n != tc.wantHits {
+						t.Errorf("index requests = %d, want %d", n, tc.wantHits)
+					}
+					after := testutil.TreeSnapshot(t, cacheDir)
+					if readOnly || tc.wantHits == 0 || tc.noDir {
+						if diff := cmp.Diff(before, after); diff != "" {
+							t.Errorf("cache directory changed (-before +after):\n%s", diff)
+						}
+						return
+					}
+					b, err := os.ReadFile(cf)
+					if err != nil || !bytes.Equal(b, servedJSON) {
+						t.Errorf("writable control: cache file holds %q (error %v), want %q", b, err, servedJSON)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestNewDownloaderWritesCache checks that a Downloader from NewDownloader,
+// whose ReadOnlyCache is the zero value, still writes the cache, as library
+// users expect.
+func TestNewDownloaderWritesCache(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[{"Source":"served"}]`))
+	}))
+	defer ts.Close()
+	cacheDir := t.TempDir()
+	d, err := NewDownloader(proxyServer)
+	if err != nil {
+		t.Fatalf("NewDownloader: %v", err)
+	}
+	if d.ReadOnlyCache {
+		t.Error("NewDownloader().ReadOnlyCache = true, want false")
+	}
+	if _, err := d.unmarshalRepoPackages(context.Background(), ts.URL, cacheDir, cacheLife); err != nil {
+		t.Fatalf("unmarshalRepoPackages: %v", err)
+	}
+	if _, err := os.Stat(repoCacheFile(cacheDir, ts.URL)); err != nil {
+		t.Errorf("NewDownloader's Downloader didn't write the cache: %v", err)
+	}
+}
+
+func TestUnmarshalRepoPackagesStaleCacheRefetched(t *testing.T) {
+	cacheDir := t.TempDir()
+	want := []goolib.RepoSpec{{Source: "fresh"}}
+	j, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(j)
+	}))
+	defer ts.Close()
+	cf := writeRepoCache(t, cacheDir, ts.URL, []goolib.RepoSpec{{Source: "stale"}}, 2*cacheLife)
+
+	d, err := NewDownloader(proxyServer)
+	if err != nil {
+		t.Fatalf("NewDownloader(%s): %v", proxyServer, err)
+	}
+	got, err := d.unmarshalRepoPackages(context.Background(), ts.URL, cacheDir, cacheLife)
+	if err != nil {
+		t.Fatalf("unmarshalRepoPackages: %v", err)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("unmarshalRepoPackages with a stale cache diff (-want +got):\n%s", diff)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("index requests = %d, want 1", n)
+	}
+	var cached []goolib.RepoSpec
+	b, err := os.ReadFile(cf)
+	if err != nil {
+		t.Fatalf("reading cache file: %v", err)
+	}
+	if err := json.Unmarshal(b, &cached); err != nil {
+		t.Fatalf("decoding cache file %q: %v", b, err)
+	}
+	if diff := cmp.Diff(want, cached); diff != "" {
+		t.Errorf("cache file after refetch diff (-want +got):\n%s", diff)
+	}
+}
+
+// indexServer serves specs as a JSON repo index at /index and counts the
+// index requests.
+func indexServer(t *testing.T, specs []goolib.RepoSpec) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	j, err := json.Marshal(specs)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(j)
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &requests
+}
+
+// dirNames returns the names of the entries in dir, in sorted order.
+func dirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading %q: %v", dir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
+// TestUnmarshalRepoPackagesBadFreshCacheRefetched checks that a fresh cache
+// entry that is empty or can't be decoded, as left by a crashed or torn
+// write, is a cache miss: the index is fetched again and the entry replaced,
+// rather than the repo being reported empty or failing.
+func TestUnmarshalRepoPackagesBadFreshCacheRefetched(t *testing.T) {
+	for _, tc := range []struct {
+		desc, content string
+	}{
+		{desc: "empty", content: ""},
+		{desc: "whitespace", content: " \n\t\r\n"},
+		{desc: "truncated", content: `[{"Source":"fo`},
+		{desc: "not json", content: "garbage"},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			want := []goolib.RepoSpec{{Source: "fetched"}}
+			ts, requests := indexServer(t, want)
+			cacheDir := t.TempDir()
+			cf := repoCacheFile(cacheDir, ts.URL)
+			if err := os.WriteFile(cf, []byte(tc.content), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			d, err := NewDownloader(proxyServer)
+			if err != nil {
+				t.Fatalf("NewDownloader: %v", err)
+			}
+			got, err := d.unmarshalRepoPackages(context.Background(), ts.URL, cacheDir, cacheLife)
+			if err != nil {
+				t.Fatalf("unmarshalRepoPackages with a %s fresh cache entry: %v", tc.desc, err)
+			}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Errorf("unmarshalRepoPackages with a %s fresh cache entry diff (-want +got):\n%s", tc.desc, diff)
+			}
+			if n := requests.Load(); n != 1 {
+				t.Errorf("index requests = %d, want 1", n)
+			}
+			b, err := os.ReadFile(cf)
+			if err != nil {
+				t.Fatalf("reading cache file: %v", err)
+			}
+			var cached []goolib.RepoSpec
+			if err := json.Unmarshal(b, &cached); err != nil {
+				t.Fatalf("cache file after refetch holds %q: %v", b, err)
+			}
+			if diff := cmp.Diff(want, cached); diff != "" {
+				t.Errorf("cache file after refetch diff (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestUnmarshalRepoPackagesCacheRefreshFiles checks that refreshing a stale
+// cache entry leaves exactly the .rs file and its .url sidecar, which holds
+// the repo URL, in the cache directory.
+func TestUnmarshalRepoPackagesCacheRefreshFiles(t *testing.T) {
+	ts, _ := indexServer(t, []goolib.RepoSpec{{Source: "fresh"}})
+	cacheDir := t.TempDir()
+	cf := writeRepoCache(t, cacheDir, ts.URL, []goolib.RepoSpec{{Source: "stale"}}, 2*cacheLife)
+
+	d, err := NewDownloader(proxyServer)
+	if err != nil {
+		t.Fatalf("NewDownloader: %v", err)
+	}
+	if _, err := d.unmarshalRepoPackages(context.Background(), ts.URL, cacheDir, cacheLife); err != nil {
+		t.Fatalf("unmarshalRepoPackages: %v", err)
+	}
+	urlFile := strings.TrimSuffix(cf, ".rs") + ".url"
+	if b, err := os.ReadFile(urlFile); err != nil || string(b) != ts.URL {
+		t.Errorf(".url file holds %q (error %v), want %q", b, err, ts.URL)
+	}
+	want := []string{filepath.Base(cf), filepath.Base(urlFile)}
+	sort.Strings(want)
+	if diff := cmp.Diff(want, dirNames(t, cacheDir)); diff != "" {
+		t.Errorf("cache directory entries after refresh diff (-want +got):\n%s", diff)
+	}
+}
+
+// TestUnmarshalRepoPackagesCacheWriteFailureIgnored checks that a fetched
+// index is returned even when the cache file can't be written.
+func TestUnmarshalRepoPackagesCacheWriteFailureIgnored(t *testing.T) {
+	want := []goolib.RepoSpec{{Source: "fetched"}}
+	ts, requests := indexServer(t, want)
+	cacheDir := t.TempDir()
+	cf := repoCacheFile(cacheDir, ts.URL)
+	// A stale directory where the cache file belongs makes the cache write
+	// fail after the fetch succeeds.
+	if err := os.Mkdir(cf, 0755); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Now().Add(-2 * cacheLife)
+	if err := os.Chtimes(cf, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := NewDownloader(proxyServer)
+	if err != nil {
+		t.Fatalf("NewDownloader: %v", err)
+	}
+	got, err := d.unmarshalRepoPackages(context.Background(), ts.URL, cacheDir, cacheLife)
+	if err != nil {
+		t.Fatalf("unmarshalRepoPackages with an unwritable cache: %v", err)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("unmarshalRepoPackages with an unwritable cache diff (-want +got):\n%s", diff)
+	}
+	if n := requests.Load(); n != 1 {
+		t.Errorf("index requests = %d, want 1", n)
+	}
+}
+
+func TestIsCacheMiss(t *testing.T) {
+	for _, tc := range []struct {
+		desc string
+		err  error
+		want bool
+	}{
+		{"bad cache", errBadCache, true},
+		{"wrapped bad cache", fmt.Errorf("%w: unexpected EOF", errBadCache), true},
+		{"not exist", &os.PathError{Op: "open", Path: "x", Err: os.ErrNotExist}, true},
+		{"permission", &os.PathError{Op: "open", Path: "x", Err: os.ErrPermission}, false},
+		{"other", errors.New("disk on fire"), false},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			if got := isCacheMiss(tc.err); got != tc.want {
+				t.Errorf("isCacheMiss(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}

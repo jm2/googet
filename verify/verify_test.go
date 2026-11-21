@@ -14,14 +14,29 @@ limitations under the License.
 package verify
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io/ioutil"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
+	"github.com/google/googet/v2/testutil"
 	"github.com/google/logger"
 )
 
@@ -66,6 +81,322 @@ func TestFiles(t *testing.T) {
 		}
 		if verify != tt.verify {
 			t.Errorf("%q: unexpected verification result, want: %t, got: %t", tt.testCase, tt.verify, verify)
+		}
+	}
+}
+
+func TestExtractVerify(t *testing.T) {
+	files := []testutil.File{
+		{Name: "payload.txt", Mode: 0644, Body: []byte("payload")},
+		{Name: "verify.ps1", Mode: 0750, Body: []byte("exit 0")},
+	}
+	for _, format := range goolib.CompressionFormats() {
+		t.Run(format, func(t *testing.T) {
+			var pkg bytes.Buffer
+			testutil.WritePackage(t, &pkg, format, files)
+
+			dir := filepath.Join(t.TempDir(), "verify")
+			if err := extractVerify(bytes.NewReader(pkg.Bytes()), "verify.ps1", dir); err != nil {
+				t.Fatalf("extractVerify: %v", err)
+			}
+			path := filepath.Join(dir, "verify.ps1")
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "exit 0" {
+				t.Errorf("verify file contents = %q, want %q", got, "exit 0")
+			}
+			// Windows does not keep Unix permission bits.
+			if runtime.GOOS != "windows" {
+				fi, err := os.Stat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if fi.Mode().Perm() != 0750 {
+					t.Errorf("verify file mode = %v, want %v", fi.Mode().Perm(), os.FileMode(0750))
+				}
+			}
+
+			err = extractVerify(bytes.NewReader(pkg.Bytes()), "missing.ps1", t.TempDir())
+			want := `verify command "missing.ps1" not found in package`
+			if err == nil || err.Error() != want {
+				t.Errorf("extractVerify with missing command: error = %v, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestCommandLocalPackage(t *testing.T) {
+	// The verify script must be runnable by goolib.Exec on the test OS.
+	if runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		t.Skipf("goolib.Exec does not support %s", runtime.GOOS)
+	}
+	script, body := "verify.sh", "#!/bin/sh\nexit 0\n"
+	if runtime.GOOS == "windows" {
+		script, body = "verify.cmd", "@exit /b 0\r\n"
+	}
+	downloader, err := client.NewDownloader("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range goolib.CompressionFormats() {
+		t.Run(format, func(t *testing.T) {
+			var pkg bytes.Buffer
+			testutil.WritePackage(t, &pkg, format, []testutil.File{
+				{Name: script, Mode: 0755, Body: []byte(body)},
+			})
+			var downloads atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				downloads.Add(1)
+				w.Write(pkg.Bytes())
+			}))
+			t.Cleanup(srv.Close)
+			for _, tc := range []struct {
+				name          string
+				local         []byte // Contents of the cached package; nil means none.
+				wantDownloads int32
+			}{
+				// A cached package whose checksum matches is verified from the
+				// local file.
+				{"cache hit", pkg.Bytes(), 0},
+				// Otherwise the package is downloaded again.
+				{"cache miss", nil, 1},
+				{"stale cache", []byte("not the package"), 1},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					local := filepath.Join(t.TempDir(), "foo.noarch.1.0.0@1.goo")
+					if tc.local != nil {
+						if err := os.WriteFile(local, tc.local, 0644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					ps := client.PackageState{
+						LocalPath:   local,
+						DownloadURL: srv.URL + "/foo.noarch.1.0.0@1.goo",
+						Checksum:    goolib.Checksum(bytes.NewReader(pkg.Bytes())),
+						PackageSpec: &goolib.PkgSpec{
+							Name:    "foo",
+							Arch:    "noarch",
+							Version: "1.0.0@1",
+							Verify:  goolib.ExecFile{Path: script},
+						},
+					}
+					downloads.Store(0)
+					ok, err := Command(context.Background(), ps, downloader)
+					if err != nil {
+						t.Fatalf("Command: %v", err)
+					}
+					if !ok {
+						t.Error("Command = false, want true")
+					}
+					if got := downloads.Load(); got != tc.wantDownloads {
+						t.Errorf("downloads = %d, want %d", got, tc.wantDownloads)
+					}
+				})
+			}
+		})
+	}
+}
+
+func writeVerifyGoo(t *testing.T, gooPath, script string) goolib.PkgSpec {
+	t.Helper()
+	ps := goolib.PkgSpec{
+		Name:    "foo",
+		Arch:    "noarch",
+		Version: "1.0.0@1",
+		Verify:  goolib.ExecFile{Path: "verify.sh"},
+	}
+	specJSON, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(gooPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+	for _, entry := range []struct {
+		name string
+		mode int64
+		body []byte
+	}{
+		{"verify.sh", 0755, []byte(script)},
+		{"extra", 0644, []byte("x")},
+		{"foo.pkgspec", 0644, specJSON},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: entry.name, Mode: entry.mode, Size: int64(len(entry.body))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(entry.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := errors.Join(tw.Close(), gw.Close(), f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	return ps
+}
+
+func TestCommandInterrupted(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux shell script and Unix signal forwarding")
+	}
+	const envKey = "GOOGET_VERIFY_INTERRUPT_MODE"
+	if mode := os.Getenv(envKey); mode != "" {
+		dir := t.TempDir()
+		gooPath := filepath.Join(dir, "foo.noarch.1.0.0@1.goo")
+		script := "#!/bin/sh\nkill -TERM $PPID\nsleep 10\n"
+		switch mode {
+		case "retry":
+			// Fail the initial single-file run so Command extracts the full
+			// package and runs the second system.Verify call.
+			script = "#!/bin/sh\n[ -f \"$(dirname \"$0\")/extra\" ] || exit 1\nkill -TERM $PPID\nsleep 10\n"
+		case "after-exit":
+			// Fail the initial single-file run and signal once Run has reaped
+			// the shell while still draining stdout, so Command aborts before
+			// extracting the full package.
+			script = "#!/bin/sh\n(while kill -0 $$ 2>/dev/null; do sleep 0.01; done; kill -TERM $PPID; sleep 0.5) &\nexit 1\n"
+		}
+		ps := writeVerifyGoo(t, gooPath, script)
+
+		state := client.PackageState{LocalPath: gooPath, PackageSpec: &ps}
+		ok, err := Command(t.Context(), state, nil)
+		if ok || !errors.Is(err, goolib.ErrInterrupted) {
+			t.Fatalf("Command() = %v, %v, want false, %v", ok, err, goolib.ErrInterrupted)
+		}
+		if mode != "retry" {
+			extractDir := strings.TrimSuffix(gooPath, ".goo")
+			if _, serr := os.Stat(filepath.Join(extractDir, "extra")); !os.IsNotExist(serr) {
+				t.Fatalf("Command() extracted full package after interrupt (stat err = %v)", serr)
+			}
+		}
+		// Once interrupted, a later Command call must fail fast before pulling
+		// a missing local package.
+		missing := client.PackageState{LocalPath: filepath.Join(dir, "missing.goo"), PackageSpec: &ps}
+		if ok, err := Command(t.Context(), missing, nil); ok || !errors.Is(err, goolib.ErrInterrupted) {
+			t.Fatalf("second Command() = %v, %v, want false, %v", ok, err, goolib.ErrInterrupted)
+		}
+		return
+	}
+
+	for _, mode := range []string{"first", "retry", "after-exit"} {
+		t.Run(mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestCommandInterrupted$")
+			cmd.Env = append(os.Environ(), envKey+"="+mode, "GORACE=atexit_sleep_ms=0")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("subprocess (%s) failed: %v\n%s", mode, err, out)
+			}
+		})
+	}
+}
+
+func TestCommandTimeout(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux shell script")
+	}
+	orig := goolib.Timeout
+	t.Cleanup(func() { goolib.Timeout = orig })
+	goolib.Timeout = 100 * time.Millisecond
+
+	dir := t.TempDir()
+	runsFile := filepath.Join(dir, "runs")
+	gooPath := filepath.Join(dir, "foo.noarch.1.0.0@1.goo")
+	ps := writeVerifyGoo(t, gooPath, fmt.Sprintf("#!/bin/sh\necho x >> %q\nsleep 10\n", runsFile))
+
+	ok, err := Command(t.Context(), client.PackageState{LocalPath: gooPath, PackageSpec: &ps}, nil)
+	if ok || err != nil {
+		t.Fatalf("Command() = %v, %v, want false, nil", ok, err)
+	}
+	runs, rerr := os.ReadFile(runsFile)
+	if rerr != nil || string(runs) != "x\n" {
+		t.Errorf("verify script runs = %q (err %v), want exactly 1 run", runs, rerr)
+	}
+	extractDir := strings.TrimSuffix(gooPath, ".goo")
+	if _, serr := os.Stat(filepath.Join(extractDir, "extra")); !os.IsNotExist(serr) {
+		t.Errorf("Command() extracted full package after timeout (stat err = %v)", serr)
+	}
+}
+
+func TestRetryFromFullPackage(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"exit failure", errors.New("command exited with error code 1"), true},
+		{"interrupted", fmt.Errorf("wrap: %w", goolib.ErrInterrupted), false},
+		{"timeout", fmt.Errorf("wrap: %w", goolib.ErrTimeout), false},
+		{"inactive", fmt.Errorf("wrap: %w", goolib.ErrInactive), false},
+		{"dialog", fmt.Errorf("wrap: %w", goolib.ErrDialog), false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryFromFullPackage(tt.err); got != tt.want {
+				t.Errorf("retryFromFullPackage(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// openHandles returns how many of this process's file descriptors refer to
+// path, and false when /proc/self/fd isn't available to count them.
+func openHandles(path string) (int, bool) {
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return 0, false
+	}
+	n := 0
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
+		if err == nil && target == path {
+			n++
+		}
+	}
+	return n, true
+}
+
+func TestFilesReleasesDirectoryAndFileHandles(t *testing.T) {
+	// openHandles compares against /proc/self/fd link targets, which are fully
+	// resolved, so resolve symlinks in the temporary directory's path too.
+	tempDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(tempDir, "dir")
+	if err := os.Mkdir(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, []byte("contents"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chksm := goolib.Checksum(f)
+	f.Close()
+
+	ps := client.PackageState{
+		InstalledFiles: map[string]string{dir: "", file: chksm},
+		PackageSpec:    &goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1.0.0@1"},
+	}
+	ok, err := Files(ps)
+	if err != nil || !ok {
+		t.Fatalf("Files(%v) = %t, %v; want true, nil", ps.InstalledFiles, ok, err)
+	}
+	for _, p := range []string{dir, file} {
+		if n, ok := openHandles(p); ok && n != 0 {
+			t.Errorf("%d open handles to %q after Files, want 0", n, p)
+		}
+	}
+	// Windows refuses to remove a file or directory while a handle to it is
+	// open.
+	for _, p := range []string{file, dir} {
+		if err := os.Remove(p); err != nil {
+			t.Errorf("os.Remove(%q) after Files: %v", p, err)
 		}
 	}
 }

@@ -16,15 +16,23 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
 )
@@ -203,5 +211,187 @@ func TestAddFlags(t *testing.T) {
 		if got != value {
 			t.Errorf("flag %q value %q!=%q", fn, got, value)
 		}
+	}
+}
+
+// packageFixture returns a single-folder fileMap, so that writeFiles emits
+// entries in a deterministic order, and a GooSpec for it.
+func packageFixture(t *testing.T) (fileMap, *goolib.GooSpec) {
+	t.Helper()
+	src := t.TempDir()
+	f := filepath.Join(src, "payload.bin")
+	if err := os.WriteFile(f, bytes.Repeat([]byte("goopack payload "), 4096), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gs := &goolib.GooSpec{PackageSpec: &goolib.PkgSpec{Name: "test", Version: "1.2.3@4", Arch: "noarch"}}
+	return fileMap{"bin": []string{f}}, gs
+}
+
+// readPackage returns the contents of the package that packageFiles wrote to
+// dir for gs.
+func readPackage(t *testing.T, gs *goolib.GooSpec, dir string) []byte {
+	t.Helper()
+	pn := goolib.PackageInfo{Name: gs.PackageSpec.Name, Arch: gs.PackageSpec.Arch, Ver: gs.PackageSpec.Version}.PkgName()
+	b, err := os.ReadFile(filepath.Join(dir, pn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestPackageFilesCompression(t *testing.T) {
+	for _, tc := range []struct {
+		format string
+		magic  []byte
+	}{
+		{goolib.CompressionGzip, []byte{0x1f, 0x8b}},
+		{goolib.CompressionZstd, []byte{0x28, 0xb5, 0x2f, 0xfd}},
+	} {
+		t.Run(tc.format, func(t *testing.T) {
+			fm, gs := packageFixture(t)
+			dir := t.TempDir()
+			if err := packageFiles(fm, gs, dir, tc.format); err != nil {
+				t.Fatalf("packageFiles: %v", err)
+			}
+			b := readPackage(t, gs, dir)
+			if !bytes.HasPrefix(b, tc.magic) {
+				t.Errorf("package starts with % x, want prefix % x", b[:min(len(b), 4)], tc.magic)
+			}
+			spec, err := goolib.ExtractPkgSpec(bytes.NewReader(b))
+			if err != nil {
+				t.Fatalf("ExtractPkgSpec: %v", err)
+			}
+			if diff := cmp.Diff(gs.PackageSpec, spec); diff != "" {
+				t.Errorf("package spec mismatch (-want +got):\n%s", diff)
+			}
+
+			rc, err := goolib.NewPackageReader(bytes.NewReader(b))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rc.Close()
+			var names []string
+			tr := tar.NewReader(rc)
+			for {
+				h, err := tr.Next()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				names = append(names, h.Name)
+			}
+			if diff := cmp.Diff([]string{"bin/payload.bin", "test.pkgspec"}, names); diff != "" {
+				t.Errorf("package entries mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestPackageFilesDefaultIsPlainGzip checks that, without -compression,
+// goopack still writes packages that clients older than zstd support read with
+// gzip.NewReader directly.
+func TestPackageFilesDefaultIsPlainGzip(t *testing.T) {
+	def := flag.Lookup("compression").DefValue
+	if def != goolib.CompressionGzip {
+		t.Fatalf("-compression default = %q, want %q", def, goolib.CompressionGzip)
+	}
+	fm, gs := packageFixture(t)
+	dir := t.TempDir()
+	if err := packageFiles(fm, gs, dir, def); err != nil {
+		t.Fatalf("packageFiles: %v", err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(readPackage(t, gs, dir)))
+	if err != nil {
+		t.Fatalf("default package is not gzip: %v", err)
+	}
+	ps, err := goolib.ReadPackageSpec(zr)
+	if err != nil {
+		t.Fatalf("ReadPackageSpec: %v", err)
+	}
+	if diff := cmp.Diff(gs.PackageSpec, ps); diff != "" {
+		t.Errorf("package spec mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestPackageFilesInvalidCompression(t *testing.T) {
+	fm, gs := packageFixture(t)
+	dir := t.TempDir()
+	if err := packageFiles(fm, gs, dir, "xz"); err == nil {
+		t.Fatal("packageFiles with compression \"xz\" succeeded, want error")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("packageFiles left %d entries in the output dir, want none", len(entries))
+	}
+}
+
+func TestMainInterruptedReraises(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux build script and Unix signal forwarding")
+	}
+	const envKey = "GOOPACK_INTERRUPT_SPEC"
+	if spec := os.Getenv(envKey); spec != "" {
+		os.Args = []string{"goopack", "-output_dir=" + filepath.Dir(spec), spec}
+		main()
+		return
+	}
+
+	for _, tt := range []struct {
+		name    string
+		script  string
+		wantGoo bool
+	}{
+		{"during build", "#!/bin/sh\nkill -TERM $PPID\nsleep 10\n", false},
+		// Signal arrives once Run has reaped the build step while draining
+		// stdout, so createPackage succeeds and main's trailing Reraise handles it.
+		{"after build exit", "#!/bin/sh\n(while kill -0 $$ 2>/dev/null; do sleep 0.01; done; kill -TERM $PPID; sleep 0.5) &\nexit 0\n", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "build.sh"), []byte(tt.script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			specPath := filepath.Join(dir, "pkg.goospec")
+			spec := `{"name":"pkg","version":"1.0.0@1","arch":"noarch","build":{"linux":"build.sh"}}`
+			if err := os.WriteFile(specPath, []byte(spec), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(os.Args[0], "-test.run=^TestMainInterruptedReraises$")
+			cmd.Env = append(os.Environ(), envKey+"="+specPath, "GORACE=atexit_sleep_ms=0")
+			out, err := cmd.CombinedOutput()
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) {
+				t.Fatalf("goopack helper Wait() = %v, want *exec.ExitError\noutput:\n%s", err, out)
+			}
+			ws := ee.Sys().(syscall.WaitStatus)
+			if !ws.Signaled() || ws.Signal() != syscall.SIGTERM {
+				t.Fatalf("goopack helper exit status = %v, want killed by SIGTERM\noutput:\n%s", ee, out)
+			}
+			_, serr := os.Stat(filepath.Join(dir, "pkg.noarch.1.0.0@1.goo"))
+			if got := serr == nil; got != tt.wantGoo {
+				t.Errorf(".goo output exists = %v (stat err = %v), want %v", got, serr, tt.wantGoo)
+			}
+		})
+	}
+}
+
+func TestCreatePackageDisablesInactivityWatchdog(t *testing.T) {
+	// createPackage turns the watchdog off before it runs any build step.
+	dir := t.TempDir()
+	orig := goolib.InactivityMode
+	t.Cleanup(func() { goolib.InactivityMode = orig })
+	goolib.InactivityMode = goolib.InactivityEnforce
+	gs := &goolib.GooSpec{PackageSpec: &goolib.PkgSpec{Name: "pkg", Version: "1.0.0@1", Arch: "noarch"}}
+	if err := createPackage(gs, dir, dir, goolib.CompressionGzip); err != nil {
+		t.Fatalf("createPackage() error = %v", err)
+	}
+	if got, want := goolib.InactivityMode, goolib.InactivityOff; got != want {
+		t.Errorf("goolib.InactivityMode after createPackage() = %q, want %q", got, want)
 	}
 }

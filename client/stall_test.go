@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -147,9 +146,6 @@ func setStallTimeout(t *testing.T, d time.Duration) {
 }
 
 func TestNewDownloaderResponseHeaderTimeout(t *testing.T) {
-	oldTransport := http.DefaultClient.Transport
-	t.Cleanup(func() { http.DefaultClient.Transport = oldTransport })
-
 	setStallTimeout(t, 5*time.Minute)
 	d, err := NewDownloader("")
 	if err != nil {
@@ -213,7 +209,8 @@ func TestOpenGCS(t *testing.T) {
 			defer cancel()
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
-			gcs, err := storage.NewClient(ctx, option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+			t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
+			gcs, err := storage.NewClient(ctx, option.WithoutAuthentication())
 			if err != nil {
 				t.Fatalf("storage.NewClient() failed: %v", err)
 			}
@@ -278,14 +275,14 @@ func TestUnmarshalRepoPackagesHTTPStall(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			srv := httptest.NewServer(tc.handler)
 			defer srv.Close()
-			cf := filepath.Join(t.TempDir(), "cache.rs")
+			cacheDir := t.TempDir()
 			d := &Downloader{HTTPClient: &http.Client{}, StallTimeout: 50 * time.Millisecond}
-			_, err := d.unmarshalRepoPackagesHTTP(context.Background(), srv.URL, cf)
+			_, err := d.unmarshalRepoPackages(context.Background(), srv.URL, cacheDir, time.Minute)
 			if !errors.Is(err, ErrStalled) {
-				t.Errorf("unmarshalRepoPackagesHTTP() = %v, want ErrStalled", err)
+				t.Errorf("unmarshalRepoPackages() = %v, want ErrStalled", err)
 			}
-			if _, err := os.Stat(cf); !os.IsNotExist(err) {
-				t.Errorf("os.Stat(%q) after stall = %v, want IsNotExist", cf, err)
+			if entries, err := os.ReadDir(cacheDir); err != nil || len(entries) != 0 {
+				t.Errorf("os.ReadDir(%q) after stall = %v, %v, want no entries", cacheDir, entries, err)
 			}
 		})
 	}
@@ -313,13 +310,13 @@ func TestUnmarshalRepoPackagesHTTPTruncated(t *testing.T) {
 				w.Write(tc.body)
 			}))
 			defer srv.Close()
-			cf := filepath.Join(t.TempDir(), "cache.rs")
+			cacheDir := t.TempDir()
 			d := &Downloader{HTTPClient: &http.Client{}, StallTimeout: 5 * time.Second}
-			if _, err := d.unmarshalRepoPackagesHTTP(context.Background(), srv.URL, cf); !errors.Is(err, io.ErrUnexpectedEOF) {
-				t.Errorf("unmarshalRepoPackagesHTTP() = %v, want io.ErrUnexpectedEOF", err)
+			if _, err := d.unmarshalRepoPackages(context.Background(), srv.URL, cacheDir, time.Minute); !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Errorf("unmarshalRepoPackages() = %v, want io.ErrUnexpectedEOF", err)
 			}
-			if _, err := os.Stat(cf); !os.IsNotExist(err) {
-				t.Errorf("os.Stat(%q) after a truncated index = %v, want IsNotExist", cf, err)
+			if entries, err := os.ReadDir(cacheDir); err != nil || len(entries) != 0 {
+				t.Errorf("os.ReadDir(%q) after a truncated index = %v, %v, want no entries", cacheDir, entries, err)
 			}
 		})
 	}
@@ -335,7 +332,7 @@ func TestUnmarshalRepoPackagesGCS(t *testing.T) {
 		defer srv.Close()
 		t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
 		d := &Downloader{StallTimeout: 50 * time.Millisecond}
-		_, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "", "gs://bkt", filepath.Join(t.TempDir(), "cache.rs"))
+		_, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "")
 		if !errors.Is(err, ErrStalled) {
 			t.Errorf("unmarshalRepoPackagesGCS() = %v, want ErrStalled", err)
 		}
@@ -353,7 +350,7 @@ func TestUnmarshalRepoPackagesGCS(t *testing.T) {
 		defer srv.Close()
 		t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
 		d := &Downloader{StallTimeout: 5 * time.Second}
-		_, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "", "gs://bkt", filepath.Join(t.TempDir(), "cache.rs"))
+		_, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "")
 		if err == nil {
 			t.Error("unmarshalRepoPackagesGCS() = nil, want 403 error")
 		}
@@ -374,14 +371,14 @@ func TestUnmarshalRepoPackagesGCS(t *testing.T) {
 		}))
 		defer srv.Close()
 		t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
-		cf := filepath.Join(t.TempDir(), "cache.rs")
+		cacheDir := t.TempDir()
 		d := &Downloader{StallTimeout: 50 * time.Millisecond}
-		_, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "", "gs://bkt", cf)
+		_, err := d.unmarshalRepoPackages(context.Background(), "gs://bkt", cacheDir, time.Minute)
 		if !errors.Is(err, ErrStalled) {
-			t.Errorf("unmarshalRepoPackagesGCS() = %v, want ErrStalled", err)
+			t.Errorf("unmarshalRepoPackages() = %v, want ErrStalled", err)
 		}
-		if _, err := os.Stat(cf); !os.IsNotExist(err) {
-			t.Errorf("os.Stat(%q) after stall = %v, want IsNotExist", cf, err)
+		if entries, err := os.ReadDir(cacheDir); err != nil || len(entries) != 0 {
+			t.Errorf("os.ReadDir(%q) after stall = %v, %v, want no entries", cacheDir, entries, err)
 		}
 	})
 
@@ -396,7 +393,7 @@ func TestUnmarshalRepoPackagesGCS(t *testing.T) {
 		defer srv.Close()
 		t.Setenv("STORAGE_EMULATOR_HOST", srv.URL)
 		d := &Downloader{StallTimeout: 5 * time.Second}
-		got, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "", "gs://bkt", filepath.Join(t.TempDir(), "cache.rs"))
+		got, err := d.unmarshalRepoPackagesGCS(context.Background(), "bkt", "")
 		if err != nil || len(got) != 0 {
 			t.Errorf("unmarshalRepoPackagesGCS() = %v, %v, want [], nil", got, err)
 		}
