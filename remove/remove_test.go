@@ -46,7 +46,9 @@ func init() {
 }
 
 func TestUninstallPkg(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	src, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatalf("Failed to create temp directory: %v", err)
@@ -230,7 +232,9 @@ type fakePkg struct {
 
 func newRemoveFixture(t *testing.T, spec goolib.PkgSpec, opts ...func(*client.PackageState)) *removeFixture {
 	t.Helper()
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)

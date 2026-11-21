@@ -78,7 +78,9 @@ func TestRemoveOne(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -209,7 +211,9 @@ func TestRemoveOneDryRun(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -289,7 +293,9 @@ func TestMode(t *testing.T) {
 // the database is opened.
 func TestExecuteRejectsDBOnlyWithSkipUninstaller(t *testing.T) {
 	logger.Init("GooGet", true, false, io.Discard)
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	cmd := &removeCmd{}
 	fs := flag.NewFlagSet("remove", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -340,7 +346,9 @@ func TestUnavailableHint(t *testing.T) {
 // without running the uninstall command.
 func TestExecutePrintsUnavailableHint(t *testing.T) {
 	logger.Init("GooGet", false, false, io.Discard)
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -444,7 +452,9 @@ func TestExecuteRequiresPrivilege(t *testing.T) {
 		{desc: "remove with privilege", args: []string{"A"}, privileged: true, wantStatus: subcommands.ExitSuccess, wantKept: false},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)

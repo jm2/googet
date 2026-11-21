@@ -186,7 +186,9 @@ func TestInstall(t *testing.T) {
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			// Set up the installer.
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -388,7 +390,9 @@ func TestInstallDryRun(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -514,7 +518,9 @@ func TestInstallStopsOnInterrupt(t *testing.T) {
 
 	var logBuf bytes.Buffer
 	logger.Init("GooGet", false, false, &logBuf)
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	if err := os.MkdirAll(settings.CacheDir(), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -622,7 +628,9 @@ func TestFromRepoStopsAfterWaitDelayInterrupt(t *testing.T) {
 	const envKey = "GOOGET_FROMREPO_WAITDELAY_MODE"
 	if mode := os.Getenv(envKey); mode != "" {
 		logger.Init("GooGet", false, false, io.Discard)
-		settings.Initialize(t.TempDir(), false)
+		if err := settings.Initialize(t.TempDir(), false); err != nil {
+			t.Fatalf("settings.Initialize: %v", err)
+		}
 		db, err := googetdb.NewDB(settings.DBFile())
 		if err != nil {
 			t.Fatal(err)
@@ -727,7 +735,9 @@ func TestReinstallWrapsTimeout(t *testing.T) {
 		t.Skip("uses Linux shell script")
 	}
 	logger.Init("GooGet", false, false, io.Discard)
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	orig := goolib.Timeout
 	t.Cleanup(func() { goolib.Timeout = orig })
 	goolib.Timeout = 100 * time.Millisecond
