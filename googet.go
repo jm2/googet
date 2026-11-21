@@ -175,6 +175,17 @@ func run(ctx context.Context) int {
 		return int(cmdr.Execute(ctx))
 	}
 
+	// Reject misplaced flags and unexpected arguments before anything is
+	// touched. Unknown commands fall through to cmdr.Execute, which reports
+	// them.
+	if cmd := findCommand(cmdr, cmdName); cmd != nil {
+		if err := cli.CheckArgs(cmd, flag.Args()[1:]); err != nil {
+			fmt.Fprintf(cmdr.Error, "%s: %v\n", cmdName, err)
+			cmdr.ExplainCommand(cmdr.Error, cmd)
+			return int(subcommands.ExitUsageError)
+		}
+	}
+
 	if *rootDir == "" {
 		logger.Errorf("The environment variable %q is not defined and no '-root' flag passed", envVar)
 		return 1
@@ -295,6 +306,18 @@ func needsPrivilege(cmd string, args []string, dbExists bool) bool {
 func isDir(path string) bool {
 	fi, err := os.Stat(path)
 	return err == nil && fi.IsDir()
+}
+
+// findCommand returns the command registered with cmdr under name, or nil if
+// there is none. Like Commander.Execute, it returns the first match.
+func findCommand(cmdr *subcommands.Commander, name string) subcommands.Command {
+	var found subcommands.Command
+	cmdr.VisitCommands(func(_ *subcommands.CommandGroup, cmd subcommands.Command) {
+		if found == nil && cmd.Name() == name {
+			found = cmd
+		}
+	})
+	return found
 }
 
 // wantProgress reports whether progress output should be rendered, given the
