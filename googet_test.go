@@ -16,22 +16,31 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/settings"
+	"github.com/google/googet/v2/testutil"
+	"github.com/google/logger"
 	"github.com/google/subcommands"
 )
 
@@ -775,7 +784,29 @@ func TestClassifyCommands(t *testing.T) {
 		{"listrepos", cli.UnelevatedRun},
 		{"remove -dry_run pkg", cli.UnelevatedRun},
 		{"remove pkg", cli.Privileged},
-		{"install -dry_run pkg", cli.Privileged},
+		{"available", cli.UnelevatedRun},
+		{"available -info pkg", cli.UnelevatedRun},
+		{"latest pkg", cli.UnelevatedRun},
+		{"latest -compare -json pkg", cli.UnelevatedRun},
+		{"update -dry_run", cli.UnelevatedRun},
+		{"update", cli.Privileged},
+		{"install -dry_run pkg", cli.UnelevatedRun},
+		{"install -dry_run -db_only pkg", cli.UnelevatedRun},
+		{"install pkg", cli.Privileged},
+		{"install -dry_run -reinstall pkg", cli.Privileged},
+		{"install -reinstall -dry_run pkg", cli.Privileged},
+		{"install -dry_run -redownload pkg", cli.Privileged},
+		{"install -dry_run -reinstall=false pkg", cli.UnelevatedRun},
+		{"download pkg", cli.Privileged},
+		{"download -download_dir x pkg", cli.Privileged},
+		{"check", cli.Privileged},
+		{"check -dry_run", cli.Privileged},
+		{"verify pkg", cli.Privileged},
+		{"verify -skip_files pkg", cli.Privileged},
+		{"clean", cli.Privileged},
+		{"clean -all", cli.Privileged},
+		{"addrepo name https://example.com/repo", cli.Privileged},
+		{"rmrepo name", cli.Privileged},
 	} {
 		t.Run(tc.args, func(t *testing.T) {
 			if got, _, _ := cli.Classify(subcommands.DefaultCommander, strings.Fields(tc.args)); got != tc.want {
@@ -789,7 +820,7 @@ func TestClassifyCommands(t *testing.T) {
 // implement cli.AllowUnelevated and cli.LockFree, so adding one is a visible,
 // reviewed change.
 func TestAllowUnelevatedAllowlist(t *testing.T) {
-	wantAllow := []string{"installed", "listrepos", "remove"}
+	wantAllow := []string{"available", "install", "installed", "latest", "listrepos", "remove", "update"}
 	wantLockFree := []string{"installed", "listrepos"}
 	var gotAllow, gotLockFree []string
 	subcommands.DefaultCommander.VisitCommands(func(_ *subcommands.CommandGroup, c subcommands.Command) {
@@ -862,27 +893,26 @@ func TestRunUsageOnly(t *testing.T) {
 }
 
 // TestRunElevatedAllowUnelevated checks elevated runs of commands that may
-// run unelevated. A cli.LockFree command still runs without the admin check,
-// the lock and googet.log. Any other command takes the privileged path, so
-// the admin check passes, it takes the lock and it writes googet.log.
+// run unelevated, against a root with a stale repo index cache. A
+// cli.LockFree command still runs without the admin check, the lock and
+// googet.log. Any other command takes the privileged path: the admin check
+// passes, it takes the lock, writes googet.log and, if it reads the index,
+// refreshes the stale cache.
 func TestRunElevatedAllowUnelevated(t *testing.T) {
 	for _, tc := range []struct {
-		args       []string
-		wantOut    string
-		privileged bool
+		args        []string
+		wantOut     string
+		privileged  bool
+		wantRefresh bool
 	}{
 		{args: []string{"remove", "-dry_run", "A"}, wantOut: "Dry run", privileged: true},
+		{args: []string{"latest", "A"}, wantOut: "2.0.0@1", privileged: true, wantRefresh: true},
+		{args: []string{"update", "-dry_run"}, wantOut: "Dry run", privileged: true, wantRefresh: true},
 		{args: []string{"installed"}, wantOut: "A.noarch"},
 		{args: []string{"listrepos"}, wantOut: "test"},
 	} {
 		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
-			root := fixtureRoot(t)
-			if err := os.Mkdir(filepath.Join(root, "repos"), 0774); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(root, "repos", "test.repo"), []byte("- name: test\n  url: https://example.com/repo\n"), 0664); err != nil {
-				t.Fatal(err)
-			}
+			root := readOnlyRoot(t)
 			res := runGooget(t, true, append([]string{"-root", root, "-noconfirm", "-system_log=false"}, tc.args...)...)
 			if res.code != 0 {
 				t.Errorf("elevated googet %q exit code = %d, want 0; output:\n%s", tc.args, res.code, res.output())
@@ -900,6 +930,264 @@ func TestRunElevatedAllowUnelevated(t *testing.T) {
 			_, err := os.Stat(filepath.Join(root, "googet.log"))
 			if gotLog := err == nil; gotLog != tc.privileged {
 				t.Errorf("elevated googet %q wrote googet.log: %v (Stat error: %v), want %v", tc.args, gotLog, err, tc.privileged)
+			}
+			caches, err := filepath.Glob(filepath.Join(root, "cache", "*.rs"))
+			if err != nil || len(caches) != 1 {
+				t.Fatalf("cache files = %q (error %v), want one", caches, err)
+			}
+			b, err := os.ReadFile(caches[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if refreshed := string(b) != "[]"; refreshed != tc.wantRefresh {
+				t.Errorf("elevated googet %q left the cache holding %q; refreshed: %v, want %v", tc.args, b, refreshed, tc.wantRefresh)
+			}
+		})
+	}
+}
+
+// logCapture collects what the logger writes, for in-process tests.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+// take returns what was logged since the last call and clears it.
+func (c *logCapture) take() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.buf.String()
+	c.buf.Reset()
+	return s
+}
+
+var (
+	capturedLogsOnce sync.Once
+	capturedLogs     = &logCapture{}
+)
+
+// captureLogs makes the default logger write to capturedLogs. The logger
+// keeps the first Init, so this works only if nothing in this test process
+// initialized it before.
+func captureLogs() *logCapture {
+	capturedLogsOnce.Do(func() { logger.Init("GooGet", false, false, capturedLogs) })
+	capturedLogs.take()
+	return capturedLogs
+}
+
+// registeredCommand returns the command registered under name, as
+// subcommands.Commander.Execute finds it.
+func registeredCommand(t *testing.T, name string) subcommands.Command {
+	t.Helper()
+	var cmd subcommands.Command
+	subcommands.DefaultCommander.VisitCommands(func(_ *subcommands.CommandGroup, c subcommands.Command) {
+		if cmd == nil && c.Name() == name {
+			cmd = c
+		}
+	})
+	if cmd == nil {
+		t.Fatalf("command %q isn't registered", name)
+	}
+	return cmd
+}
+
+// captureOutput runs f with os.Stdout and os.Stderr redirected to a
+// temporary file, and returns what f wrote to them.
+func captureOutput(t *testing.T, f func()) string {
+	t.Helper()
+	tmp, err := os.CreateTemp(t.TempDir(), "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmp.Close()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = tmp, tmp
+	f()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	b, err := os.ReadFile(tmp.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestExecuteRefusesUnelevatedFirst runs registered commands' Execute
+// without the privileged marker, with flags that their AllowUnelevated
+// doesn't allow or, for a command that doesn't implement it, any flags,
+// against a root that has no database, cache or repos. Each must print
+// exactly one line, its refusal, before it opens the database, builds
+// sources or fetches anything, and create nothing.
+func TestExecuteRefusesUnelevatedFirst(t *testing.T) {
+	logs := captureLogs()
+	for _, args := range [][]string{
+		{"install", "-dry_run", "-reinstall", "pkg"},
+		{"install", "-dry_run", "-redownload", "-reinstall", "pkg"},
+		{"install", "pkg"},
+		{"update"},
+		{"update", "-dry_run=false"},
+		{"download", "pkg"},
+		{"remove", "pkg"},
+		{"check"},
+		{"clean", "-all"},
+		{"verify", "pkg"},
+		{"addrepo", "name", "https://example.com/repo"},
+		{"rmrepo", "name"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := t.TempDir()
+			if err := settings.Initialize(root, false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			cmd := registeredCommand(t, args[0])
+			fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+			cmd.SetFlags(fs)
+			if err := fs.Parse(args[1:]); err != nil {
+				t.Fatalf("parsing %q: %v", args, err)
+			}
+			var got subcommands.ExitStatus
+			printed := captureOutput(t, func() { got = cmd.Execute(context.Background(), fs) })
+			if got != subcommands.ExitFailure {
+				t.Errorf("unprivileged Execute(%q) = %v, want %v", args, got, subcommands.ExitFailure)
+			}
+			// The logger writes to logs and to the stderr it saw at Init,
+			// which captureOutput doesn't capture, so nothing is counted
+			// twice.
+			out := strings.TrimSpace(logs.take() + printed)
+			if lines := strings.Split(out, "\n"); len(lines) != 1 || !strings.Contains(out, "requires administrator privileges") {
+				t.Errorf("unprivileged Execute(%q) printed %q, want exactly one line, the refusal", args, out)
+			}
+			if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+				t.Errorf("unprivileged Execute(%q) left %v in the root (error %v), want nothing", args, entries, err)
+			}
+		})
+	}
+}
+
+// readOnlyRoot returns fixtureRoot's root with a googet.conf that allows HTTP
+// repos, a repos folder naming a repo served by a test server, and a stale
+// cache entry for that repo. The repo
+// has A 2.0.0@1, an update for the installed A, and C 1.0.0@1. Everything
+// under the root is backdated, so any write moves an mtime.
+func readOnlyRoot(t *testing.T) string {
+	t.Helper()
+	specs := []goolib.RepoSpec{
+		{Source: "A.noarch.2.0.0@1.goo", PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "2.0.0@1"}},
+		{Source: "C.noarch.1.0.0@1.goo", PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "1.0.0@1"}},
+	}
+	j, err := json.Marshal(specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(j)
+	}))
+	t.Cleanup(srv.Close)
+
+	root := fixtureRoot(t)
+	for _, d := range []string{"repos", "cache"} {
+		if err := os.Mkdir(filepath.Join(root, d), 0774); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cacheBase := filepath.Join("cache", fmt.Sprintf("%x", sha256.Sum256([]byte(srv.URL))))
+	files := map[string]string{
+		"googet.conf":                       "allowunsafeurl: true\n",
+		filepath.Join("repos", "test.repo"): fmt.Sprintf("- name: test\n  url: %s\n", srv.URL),
+		cacheBase + ".rs":                   "[]",
+		cacheBase + ".url":                  srv.URL,
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0664); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for _, p := range append(slices.Collect(maps.Keys(files)), "repos", "cache", ".") {
+		if err := os.Chtimes(filepath.Join(root, p), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// TestRunUnelevatedReadsLeaveRootUnchanged runs the read-only commands
+// unelevated, with failing admin and lock spies, against a root with a stale
+// repo index cache. Each must succeed without taking the lock, write no
+// googet.log and leave every name, byte and mtime under the root unchanged.
+// Only the cli.LockFree commands skip the admin check too.
+func TestRunUnelevatedReadsLeaveRootUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		args     []string
+		wantOut  string
+		lockFree bool
+	}{
+		{args: []string{"available"}, wantOut: "C.noarch"},
+		{args: []string{"latest", "A"}, wantOut: "2.0.0@1"},
+		{args: []string{"latest", "-compare", "A"}, wantOut: "2.0.0@1"},
+		{args: []string{"update", "-dry_run"}, wantOut: "Dry run"},
+		{args: []string{"install", "-dry_run", "C"}, wantOut: "C.noarch"},
+		{args: []string{"installed"}, wantOut: "A.noarch", lockFree: true},
+		{args: []string{"listrepos"}, wantOut: "test", lockFree: true},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			root := readOnlyRoot(t)
+			before := testutil.TreeSnapshot(t, root)
+			res := runGooget(t, false, append([]string{"-root", root, "-noconfirm"}, tc.args...)...)
+			if res.code != 0 {
+				t.Errorf("unelevated googet %q exit code = %d, want 0; output:\n%s", tc.args, res.code, res.output())
+			}
+			if !strings.Contains(res.stdout, tc.wantOut) {
+				t.Errorf("unelevated googet %q printed %q, want it to contain %q", tc.args, res.stdout, tc.wantOut)
+			}
+			wantAdminCheck := !tc.lockFree
+			if res.spies["isAdmin"] != wantAdminCheck || res.spies["obtainLock"] {
+				t.Errorf("unelevated googet %q called spies %v, want isAdmin: %v and no lock", tc.args, res.spies, wantAdminCheck)
+			}
+			if diff := cmp.Diff(before, testutil.TreeSnapshot(t, root)); diff != "" {
+				t.Errorf("unelevated googet %q changed the root (-before +after):\n%s", tc.args, diff)
+			}
+		})
+	}
+}
+
+// TestRunUnelevatedWritesStayPrivileged checks that commands and flags that
+// write or run package code still go through the admin check unelevated, and
+// that the failed check leaves the root unchanged.
+func TestRunUnelevatedWritesStayPrivileged(t *testing.T) {
+	for _, args := range [][]string{
+		{"update"},
+		{"install", "C"},
+		{"install", "-dry_run", "-reinstall", "A"},
+		{"install", "-dry_run", "-redownload", "-reinstall", "A"},
+		{"download", "C"},
+		{"check"},
+		{"check", "-dry_run"},
+		{"verify", "A"},
+		{"clean"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := readOnlyRoot(t)
+			before := testutil.TreeSnapshot(t, root)
+			res := runGooget(t, false, append([]string{"-root", root, "-noconfirm"}, args...)...)
+			if res.code != 1 {
+				t.Errorf("unelevated googet %q exit code = %d, want 1; output:\n%s", args, res.code, res.output())
+			}
+			if !res.spies["isAdmin"] || res.spies["obtainLock"] {
+				t.Errorf("unelevated googet %q called spies %v, want only isAdmin", args, res.spies)
+			}
+			if diff := cmp.Diff(before, testutil.TreeSnapshot(t, root)); diff != "" {
+				t.Errorf("unelevated googet %q changed the root (-before +after):\n%s", args, diff)
 			}
 		})
 	}

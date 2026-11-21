@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
@@ -543,7 +544,7 @@ func TestInstallStopsOnInterrupt(t *testing.T) {
 	if err := fs.Parse([]string{aGoo, bGoo}); err != nil {
 		t.Fatal(err)
 	}
-	if got := cmd.Execute(t.Context(), fs); got != subcommands.ExitFailure {
+	if got := cmd.Execute(cli.WithPrivileged(t.Context()), fs); got != subcommands.ExitFailure {
 		t.Errorf("Execute() = %v, want %v", got, subcommands.ExitFailure)
 	}
 	if strings.Contains(logBuf.String(), "B.noarch.1.0.0.goo") {
