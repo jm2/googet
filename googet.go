@@ -179,23 +179,26 @@ func run(ctx context.Context) int {
 		logger.Errorf("The environment variable %q is not defined and no '-root' flag passed", envVar)
 		return 1
 	}
-	if err := os.MkdirAll(*rootDir, 0774); err != nil {
-		logger.Errorf("Unable to create root directory: %v", err)
-		return 1
-	}
 	if err := settings.Initialize(*rootDir, !*noConfirm); err != nil {
 		logger.Errorf("Unable to initialize settings: %v", err)
 		return 1
 	}
 
-	// "googet listrepos" may execute without a lock after the root directory and
-	// settings are initialized.
-	if cmdName == "listrepos" {
+	// Commands that skip the admin check must not create anything under the
+	// root, so they only skip it if the root already exists. Otherwise they
+	// take the privileged path below, which creates the root.
+	rootExists := isDir(*rootDir)
+
+	// "googet listrepos" may execute without a lock if the root directory
+	// exists.
+	if rootExists && cmdName == "listrepos" {
 		return (int(cmdr.Execute(context.Background())))
 	}
 
 	dbFile := settings.DBFile()
-	dbExists := googetdb.Exists(dbFile)
+	// The database can only exist inside an existing root; checking both
+	// keeps every unelevated bypass below behind the root check.
+	dbExists := rootExists && googetdb.Exists(dbFile)
 
 	// "googet installed" is allowed to execute without a lock if the googet
 	// database has already been created.
@@ -214,7 +217,17 @@ func run(ctx context.Context) int {
 	}
 
 	if err := isAdmin(); err != nil {
+		if !rootExists {
+			err = fmt.Errorf("%v; googet root %q doesn't exist, run googet elevated first", err, *rootDir)
+		}
 		logger.Errorf("Failed admin check: %v", err)
+		return 1
+	}
+	// The root is created only after the admin check, so an unelevated run
+	// never creates it. It is created before the lock so that it gets this
+	// mode rather than the one obtainLock uses for the lock file's directory.
+	if err := os.MkdirAll(*rootDir, 0774); err != nil {
+		logger.Errorf("Unable to create root directory: %v", err)
 		return 1
 	}
 	cleanup, err := obtainLock(settings.LockFile(), settings.LockFileMaxAge)
@@ -275,6 +288,13 @@ func needsPrivilege(cmd string, args []string, dbExists bool) bool {
 		return true
 	}
 	return !remove.DryRunRequested(args)
+}
+
+// isDir reports whether path exists and is a directory. Any error, including
+// a permission error, counts as not existing.
+func isDir(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
 
 // wantProgress reports whether progress output should be rendered, given the
