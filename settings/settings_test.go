@@ -147,6 +147,23 @@ func TestInitializeUnreadableConf(t *testing.T) {
 	}
 }
 
+func TestLoadConfUnreadableConf(t *testing.T) {
+	rootDir := t.TempDir()
+	// A directory exists but can't be read as a file, like a conf that only
+	// administrators may read.
+	if err := os.Mkdir(filepath.Join(rootDir, "googet.conf"), 0755); err != nil {
+		t.Fatalf("error creating conf directory: %v", err)
+	}
+	settings.SetRoot(rootDir, false)
+	err := settings.LoadConf()
+	if err == nil {
+		t.Fatal("settings.LoadConf with an unreadable googet.conf = nil, want an error")
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("settings.LoadConf with an unreadable googet.conf = %v, want an error other than fs.ErrNotExist", err)
+	}
+}
+
 func TestInitializeMissingConf(t *testing.T) {
 	settings.Archs = []string{"stale"}
 	if err := settings.Initialize(t.TempDir(), false); err != nil {
@@ -195,5 +212,77 @@ func TestInitializeMalformedConf(t *testing.T) {
 				t.Errorf("settings.Archs with %q diff (-want +got):\n%s", tc.conf, diff)
 			}
 		})
+	}
+}
+
+func TestSetRootAndLoadConf(t *testing.T) {
+	oldStall := client.StallTimeout
+	oldRoot, oldConfirm, oldArchs := settings.RootDir, settings.Confirm, settings.Archs
+	oldCacheLife, oldLockAge, oldProxy := settings.CacheLife, settings.LockFileMaxAge, settings.ProxyServer
+	oldUnsafe, oldStrict, oldProgress := settings.AllowUnsafeURL, settings.StrictConflicts, settings.Progress
+	t.Cleanup(func() {
+		client.StallTimeout = oldStall
+		settings.RootDir, settings.Confirm, settings.Archs = oldRoot, oldConfirm, oldArchs
+		settings.CacheLife, settings.LockFileMaxAge, settings.ProxyServer = oldCacheLife, oldLockAge, oldProxy
+		settings.AllowUnsafeURL, settings.StrictConflicts, settings.Progress = oldUnsafe, oldStrict, oldProgress
+	})
+
+	settings.CacheLife = 3 * time.Minute
+	settings.LockFileMaxAge = 24 * time.Hour
+	settings.ProxyServer = ""
+	settings.AllowUnsafeURL = false
+	settings.StrictConflicts = false
+	settings.Progress = true
+
+	rootDir := t.TempDir()
+	conf := "cachelife: 7m\nlockfilemaxage: 5m\nproxyserver: http://proxy.example:8080\nallowunsafeurl: true\nstrictconflicts: true\nprogress: false\n"
+	if err := os.WriteFile(filepath.Join(rootDir, "googet.conf"), []byte(conf), 0644); err != nil {
+		t.Fatalf("error writing conf file: %v", err)
+	}
+
+	// SetRoot must set paths and Confirm without reading googet.conf.
+	settings.SetRoot(rootDir, false)
+	if settings.RootDir != rootDir || settings.Confirm {
+		t.Fatalf("after SetRoot: RootDir=%q Confirm=%v, want %q false", settings.RootDir, settings.Confirm, rootDir)
+	}
+	for name, got := range map[string]string{
+		"LockFile":  settings.LockFile(),
+		"StateFile": settings.StateFile(),
+		"DBFile":    settings.DBFile(),
+		"ConfFile":  settings.ConfFile(),
+		"LogFile":   settings.LogFile(),
+		"CacheDir":  settings.CacheDir(),
+		"RepoDir":   settings.RepoDir(),
+	} {
+		if filepath.Dir(got) != rootDir {
+			t.Errorf("%s() = %q, want path under %q", name, got, rootDir)
+		}
+	}
+	if settings.CacheLife != 3*time.Minute || settings.LockFileMaxAge != 24*time.Hour || settings.ProxyServer != "" || settings.AllowUnsafeURL || settings.StrictConflicts || !settings.Progress {
+		t.Fatalf("SetRoot read googet.conf unexpectedly: CacheLife=%v LockFileMaxAge=%v ProxyServer=%q AllowUnsafeURL=%v StrictConflicts=%v Progress=%v",
+			settings.CacheLife, settings.LockFileMaxAge, settings.ProxyServer, settings.AllowUnsafeURL, settings.StrictConflicts, settings.Progress)
+	}
+
+	// LoadConf reads googet.conf from the directory set by SetRoot.
+	if err := settings.LoadConf(); err != nil {
+		t.Fatalf("settings.LoadConf() = %v, want nil", err)
+	}
+	if settings.CacheLife != 7*time.Minute {
+		t.Errorf("CacheLife = %v, want 7m", settings.CacheLife)
+	}
+	if settings.LockFileMaxAge != 5*time.Minute {
+		t.Errorf("LockFileMaxAge = %v, want 5m", settings.LockFileMaxAge)
+	}
+	if settings.ProxyServer != "http://proxy.example:8080" {
+		t.Errorf("ProxyServer = %q, want http://proxy.example:8080", settings.ProxyServer)
+	}
+	if !settings.AllowUnsafeURL {
+		t.Errorf("AllowUnsafeURL = false, want true")
+	}
+	if !settings.StrictConflicts {
+		t.Errorf("StrictConflicts = false, want true")
+	}
+	if settings.Progress {
+		t.Errorf("Progress = true, want false")
 	}
 }

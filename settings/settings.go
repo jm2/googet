@@ -15,9 +15,9 @@ import (
 )
 
 var (
-	// RootDir is the googet root directory; set by Initialize.
+	// RootDir is the googet root directory; set by SetRoot or Initialize.
 	RootDir string
-	// Confirm tracks whether we should prompt user; set by Initialize.
+	// Confirm tracks whether we should prompt user; set by SetRoot or Initialize.
 	Confirm bool
 	// CacheLife is how long cached indexes are considered valid.
 	// The default value can be overridden by googet.conf.
@@ -39,12 +39,25 @@ var (
 	Progress = true
 )
 
-// Initialize reads the initial settings. A missing googet.conf leaves the
-// defaults in place; it returns an error if googet.conf exists but can't be
-// read.
+// Initialize sets the root directory and reads googet.conf. It is SetRoot
+// followed by LoadConf. A missing googet.conf leaves the defaults in place;
+// it returns an error if googet.conf exists but can't be read.
 func Initialize(rootDir string, confirm bool) error {
+	SetRoot(rootDir, confirm)
+	return LoadConf()
+}
+
+// SetRoot sets the root directory, which the paths below depend on, and
+// whether to prompt the user. It doesn't read any file.
+func SetRoot(rootDir string, confirm bool) {
 	RootDir = rootDir
 	Confirm = confirm
+}
+
+// LoadConf reads the settings in googet.conf under the root directory. A
+// missing googet.conf leaves the defaults in place; it returns an error if
+// googet.conf exists but can't be read.
+func LoadConf() error {
 	return readConf(ConfFile())
 }
 
