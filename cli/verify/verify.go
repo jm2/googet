@@ -78,6 +78,9 @@ func (cmd *verifyCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 	}
 
 	for _, arg := range flags.Args() {
+		if goolib.Interrupted() != nil {
+			return subcommands.ExitFailure
+		}
 		pi := goolib.PkgNameSplit(arg)
 		ps, err := db.FetchPkg(pi)
 		if err != nil {
@@ -100,6 +103,9 @@ func (cmd *verifyCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 			exitCode = subcommands.ExitFailure
 			continue
 		}
+		if goolib.Interrupted() != nil {
+			return subcommands.ExitFailure
+		}
 
 		if v && !cmd.skipFiles {
 			v, err = verify.Files(ps)
@@ -115,6 +121,8 @@ func (cmd *verifyCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 			fmt.Println(msg)
 			if err := install.Reinstall(ctx, ps, false, false, downloader, db); err != nil {
 				logger.Errorf("Error reinstalling %s, %v", pi.Name, err)
+				exitCode = subcommands.ExitFailure
+				continue
 			}
 		} else if !v {
 			logger.Errorf("Verification failed for %s, reinstall or run verify again with the '-reinstall' flag.", pkg)

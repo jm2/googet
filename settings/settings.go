@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/googet/v2/client"
+	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/oswrap"
 	"github.com/google/googet/v2/system"
 	"github.com/google/logger"
@@ -108,6 +109,8 @@ type conf struct {
 	StrictConflicts bool
 	// Progress is a pointer so an absent key keeps the default of true.
 	Progress *bool
+	// InstallTimeout sets goolib.Timeout.
+	InstallTimeout string
 }
 
 // readConf initializes settings based on the configuration file at filename.
@@ -169,6 +172,16 @@ func readConf(filename string) error {
 
 	if gc.ProxyServer != "" {
 		ProxyServer = gc.ProxyServer
+	}
+
+	goolib.Timeout = goolib.DefaultTimeout
+	if gc.InstallTimeout != "" {
+		it, err := time.ParseDuration(gc.InstallTimeout)
+		if err != nil {
+			logger.Errorf("Invalid installtimeout %q: %v", gc.InstallTimeout, err)
+		} else {
+			goolib.Timeout = it
+		}
 	}
 
 	AllowUnsafeURL = gc.AllowUnsafeURL

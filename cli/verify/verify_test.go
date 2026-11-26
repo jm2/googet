@@ -14,10 +14,17 @@ limitations under the License.
 package verify
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"flag"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -128,5 +135,91 @@ func insertCorruptRows(t *testing.T, dbFile string, names []string) {
 		if _, err := db.Exec(`INSERT INTO InstalledPackages (pkg_name, pkg_arch, pkg_ver, pkg_json) VALUES (?, 'noarch', '1', ?)`, name, []byte("not json")); err != nil {
 			t.Fatalf("inserting corrupt row for %q: %v", name, err)
 		}
+	}
+}
+
+func TestExecuteStopsAfterWaitDelayInterrupt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux shell script and Unix signal forwarding")
+	}
+	const envKey = "GOOGET_CLI_VERIFY_INTERRUPT"
+	if os.Getenv(envKey) == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestExecuteStopsAfterWaitDelayInterrupt$")
+		cmd.Env = append(os.Environ(), envKey+"=1", "GORACE=atexit_sleep_ms=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("subprocess failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	// TestMain has pointed the package logger at logs; the logger keeps its
+	// first Init.
+	logs.Reset()
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
+	db, err := googetdb.NewDB(settings.DBFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The verify script succeeds, then signals googet while Run drains stdout;
+	// Execute must stop before verify.Files sees the missing installed file
+	// and triggers -reinstall.
+	dir := t.TempDir()
+	gooPath := filepath.Join(dir, "foo.noarch.1.0.0.goo")
+	ps := goolib.PkgSpec{Name: "foo", Arch: "noarch", Version: "1.0.0", Verify: goolib.ExecFile{Path: "verify.sh"}}
+	specJSON, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(gooPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+	script := []byte("#!/bin/sh\n(while kill -0 $$ 2>/dev/null; do sleep 0.01; done; kill -TERM $PPID; sleep 0.5) &\nexit 0\n")
+	for _, e := range []struct {
+		name string
+		mode int64
+		body []byte
+	}{
+		{"verify.sh", 0755, script},
+		{"foo.pkgspec", 0644, specJSON},
+	} {
+		if err := tw.WriteHeader(&tar.Header{Name: e.name, Mode: e.mode, Size: int64(len(e.body))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(e.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := errors.Join(tw.Close(), gw.Close(), f.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddPkg(client.PackageState{
+		LocalPath:      gooPath,
+		PackageSpec:    &ps,
+		InstalledFiles: map[string]string{filepath.Join(dir, "missing"): "deadbeef"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	cmd := verifyCmd{}
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	cmd.SetFlags(fs)
+	if err := fs.Parse([]string{"-reinstall", "foo"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := cmd.Execute(cli.WithPrivileged(t.Context()), fs); got != subcommands.ExitFailure {
+		t.Errorf("Execute() = %v, want %v", got, subcommands.ExitFailure)
+	}
+	if strings.Contains(logs.String(), "Error running verify command") {
+		t.Errorf("verify.Command reported an error instead of post-exit success:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "reinstalling") {
+		t.Errorf("Execute() proceeded to reinstall after interrupt:\n%s", logs.String())
 	}
 }

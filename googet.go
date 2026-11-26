@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/googetdb"
+	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/progress"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/system"
@@ -142,7 +143,12 @@ func rotateLog(logPath string, maxSize int64, keep int) []error {
 }
 
 func main() {
-	os.Exit(run(context.Background()))
+	code := run(context.Background())
+	// goolib.Run catches a terminal signal while an installer runs, so that the
+	// cleanup in run (database, lock) still happens. Die from it now, as
+	// googet would have without the installer.
+	goolib.Reraise(goolib.Interrupted())
+	os.Exit(code)
 }
 
 func run(ctx context.Context) int {

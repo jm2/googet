@@ -160,6 +160,9 @@ func removeInstalledFiles(files map[string]string) {
 
 // uninstallPkg removes a package as mode describes.
 func uninstallPkg(ctx context.Context, pi goolib.PackageInfo, mode Mode, downloader *client.Downloader, db *googetdb.GooDB) error {
+	if goolib.Interrupted() != nil {
+		return goolib.ErrInterrupted
+	}
 	if !mode.valid() {
 		return fmt.Errorf("invalid removal mode %v", mode)
 	}
@@ -258,6 +261,9 @@ func EnumerateDeps(pi goolib.PackageInfo, db *googetdb.GooDB) (DepMap, []string,
 func All(ctx context.Context, pi goolib.PackageInfo, deps DepMap, mode Mode, downloader *client.Downloader, db *googetdb.GooDB) error {
 	if !mode.valid() {
 		return fmt.Errorf("invalid removal mode %v", mode)
+	}
+	if goolib.Interrupted() != nil {
+		return goolib.ErrInterrupted
 	}
 	// deps includes an entry for pi itself, but we don't need to iterate over it
 	// because pi is always uninstalled at the end.

@@ -51,7 +51,7 @@ func Install(dir string, ps *goolib.PkgSpec) error {
 		}
 	}()
 	if err := goolib.Exec(s, in.Args, in.ExitCodes, out); err != nil {
-		return fmt.Errorf("error running install: %v", err)
+		return fmt.Errorf("error running install: %w", err)
 	}
 	return nil
 }
