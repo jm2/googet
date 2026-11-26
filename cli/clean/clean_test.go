@@ -55,7 +55,9 @@ func TestCleanPackages(t *testing.T) {
 // cache files, their .url files and unpack directories, keeps excluded
 // entries, and leaves no renamed copies behind.
 func TestCleanDirectoryRemovesCacheEntries(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	cache := settings.CacheDir()
 	if err := os.MkdirAll(filepath.Join(cache, "pkg.x86_64.1.0.0", "sub"), 0755); err != nil {
 		t.Fatal(err)

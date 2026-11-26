@@ -37,6 +37,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -200,7 +201,9 @@ func putPayload(t *testing.T, dst string, files map[string][]byte) {
 // newDB returns a database in a fresh googet root.
 func newDB(t *testing.T) *googetdb.GooDB {
 	t.Helper()
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	db, err := googetdb.NewDB(settings.DBFile())
 	if err != nil {
 		t.Fatalf("googetdb.NewDB: %v", err)
@@ -519,7 +522,9 @@ func TestInstallPkgRollback(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -629,7 +634,9 @@ func TestInstallAddPkg(t *testing.T) {
 				// HKLM.
 				t.Skip("install scripts run only on Linux")
 			}
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -824,7 +831,9 @@ func TestReinstallRollback(t *testing.T) {
 		{desc: "installer fails", installer: "missing-installer", want: before},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -1428,7 +1437,9 @@ func TestFromRepo_SatisfiedByUninstalledProvider(t *testing.T) {
 }
 
 func TestListDeps_SatisfiedByProvider(t *testing.T) {
-	settings.Initialize(t.TempDir(), false)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	db, err := googetdb.NewDB(settings.DBFile())
 	if err != nil {
 		t.Fatalf("googetdb.NewDB: %v", err)
@@ -1490,7 +1501,9 @@ func TestListDeps_SelfDependency(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -1554,7 +1567,9 @@ func TestInstallDeps_SelfDependency(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -1637,7 +1652,9 @@ func TestListDeps_VersionRequirement(t *testing.T) {
 		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -1890,7 +1907,7 @@ func TestDBOnlyRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client.NewDownloader: %v", err)
 	}
-	if err := remove.All(context.Background(), pi, deps, false, downloader, db); err != nil {
+	if err := remove.All(context.Background(), pi, deps, remove.RunUninstaller, downloader, db); err != nil {
 		t.Fatalf("remove.All() = %v, want nil", err)
 	}
 	for f := range wantFiles(dst, testPayload) {
@@ -1900,5 +1917,73 @@ func TestDBOnlyRemove(t *testing.T) {
 	}
 	if ps, err := db.FetchPkg(pi); err != nil || ps.PackageSpec != nil {
 		t.Errorf("db.FetchPkg after removal = %v, %v; want no package", ps.PackageSpec, err)
+	}
+}
+
+// A replaced package is removed as dbOnly says: with dbOnly only its database
+// entry goes, otherwise its uninstall command runs. A's uninstall script needs
+// the package, which is not cached and can't be downloaded.
+func TestResolveReplacementsMode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dbOnly  bool
+		wantErr error
+	}{
+		{"db_only", true, nil},
+		{"run uninstaller", false, remove.ErrPackageUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			var requests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				http.NotFound(w, r)
+			}))
+			t.Cleanup(srv.Close)
+			d, err := client.NewDownloader("")
+			if err != nil {
+				t.Fatalf("NewDownloader: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+			file := filepath.Join(t.TempDir(), "a.exe")
+			if err := os.WriteFile(file, []byte("a"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.WriteStateToDB(client.GooGetState{{
+				PackageSpec:    &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1.0.0@1", Uninstall: goolib.ExecFile{Path: "uninstall.sh"}},
+				InstalledFiles: map[string]string{file: "chksum"},
+				LocalPath:      filepath.Join(t.TempDir(), "A.noarch.1.0.0@1.goo"),
+				DownloadURL:    srv.URL + "/A.noarch.1.0.0@1.goo",
+				Checksum:       "0000",
+			}}); err != nil {
+				t.Fatalf("WriteStateToDB: %v", err)
+			}
+
+			ps := &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1.0.0@1", Replaces: []string{"A"}}
+			err = resolveReplacements(t.Context(), ps, tc.dbOnly, d, db)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("resolveReplacements(dbOnly=%v) = %v, want %v", tc.dbOnly, err, tc.wantErr)
+			}
+			a, err := db.FetchPkg(goolib.PackageInfo{Name: "A", Arch: "noarch"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := a.PackageSpec != nil, tc.wantErr != nil; got != want {
+				t.Errorf("A still installed = %v, want %v", got, want)
+			}
+			// db_only and a failed uninstall both leave A's files in place.
+			if _, err := os.Stat(file); err != nil {
+				t.Errorf("A's installed file was removed: %v", err)
+			}
+			if gotRequests := requests.Load() > 0; gotRequests != !tc.dbOnly {
+				t.Errorf("download requested = %v, want %v", gotRequests, !tc.dbOnly)
+			}
+		})
 	}
 }
