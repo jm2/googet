@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/google/googet/v2/cli"
@@ -76,6 +77,21 @@ func unavailableHint(arg string, err error) string {
 	return fmt.Sprintf("To remove %s without running uninstall commands, run 'googet remove -skip_uninstaller %s'. This also skips the uninstall commands of the packages that depend on it, which are removed with it.", arg, arg)
 }
 
+// DryRunRequested reports whether args, the arguments that follow "remove" on
+// the command line, ask for a dry run. It parses args with the same flags as
+// the remove subcommand and returns false if they don't parse, so a caller
+// that uses it to skip the admin check fails closed.
+func DryRunRequested(args []string) bool {
+	var cmd removeCmd
+	f := flag.NewFlagSet(cmd.Name(), flag.ContinueOnError)
+	f.SetOutput(io.Discard)
+	cmd.SetFlags(f)
+	if err := f.Parse(args); err != nil {
+		return false
+	}
+	return cmd.dryRun
+}
+
 func (cmd *removeCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
 	mode, err := cmd.mode()
 	if err != nil {
@@ -85,6 +101,11 @@ func (cmd *removeCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 	}
 	if flags.NArg() == 0 {
 		fmt.Printf("%s\nUsage: %s\n", cmd.Synopsis(), cmd.Usage())
+		return subcommands.ExitFailure
+	}
+	// Only a dry run may proceed without the admin check and the lock.
+	if !cmd.dryRun && !cli.IsPrivileged(ctx) {
+		logger.Error("Removing packages requires administrator privileges; use -dry_run to preview the removal.")
 		return subcommands.ExitFailure
 	}
 

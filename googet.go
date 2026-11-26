@@ -19,10 +19,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/google/googet/v2/cli"
+	"github.com/google/googet/v2/cli/remove"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/progress"
 	"github.com/google/googet/v2/settings"
@@ -39,7 +41,6 @@ import (
 	_ "github.com/google/googet/v2/cli/installed"
 	_ "github.com/google/googet/v2/cli/latest"
 	_ "github.com/google/googet/v2/cli/listrepos"
-	_ "github.com/google/googet/v2/cli/remove"
 	_ "github.com/google/googet/v2/cli/rmrepo"
 	_ "github.com/google/googet/v2/cli/update"
 	_ "github.com/google/googet/v2/cli/verify"
@@ -200,16 +201,32 @@ func run(ctx context.Context) int {
 	// take the privileged path below, which creates the root.
 	rootExists := isDir(*rootDir)
 	dbFile := settings.DBFile()
+	dbExists := googetdb.Exists(dbFile)
 
 	// "googet listrepos" may execute without a lock if the root directory
 	// exists, and "googet installed" if the googet database has also already
 	// been created. They read googet.conf first, as before. The privileged
 	// path reads it only after it has checked the files in the root.
-	if rootExists && (cmdName == "listrepos" || (cmdName == "installed" && googetdb.Exists(dbFile))) {
+	if rootExists && (cmdName == "listrepos" || (cmdName == "installed" && dbExists)) {
 		if err := loadConf(); err != nil {
 			logger.Errorf("Unable to initialize settings: %v", err)
 			return 1
 		}
+		return executeCommand(ctx)
+	}
+
+	// "googet remove -dry_run" only reads the database, so it is allowed to
+	// execute without admin rights or a lock on the same terms. Like the
+	// commands above, it reads googet.conf first and doesn't check the files in
+	// the root. It doesn't write googet.log or the system log; with -verbose,
+	// info logs still go to stdout.
+	if rootExists && !needsPrivilege(cmdName, flag.Args()[1:], dbExists) {
+		if err := loadConf(); err != nil {
+			logger.Errorf("Unable to initialize settings: %v", err)
+			return 1
+		}
+		logger.Init("GooGet", *verbose, false, io.Discard)
+		defer logger.Close()
 		return executeCommand(ctx)
 	}
 
@@ -281,6 +298,7 @@ func run(ctx context.Context) int {
 	if cleanup != nil {
 		defer cleanup()
 	}
+	ctx = cli.WithPrivileged(ctx)
 	entryReport, err = checkEntries(*rootDir, entryRules(), rootReport)
 	if err != nil {
 		logger.Errorf("Unable to check the files in the googet root: %v", err)
@@ -389,6 +407,19 @@ func findCommand(cmdr *subcommands.Commander, name string) subcommands.Command {
 		}
 	})
 	return found
+}
+
+// needsPrivilege reports whether the subcommand cmd, run with the arguments
+// args that follow it, needs the admin check, the lock and the log file.
+// dbExists reports whether the googet database already exists. It fails
+// closed: only a remove whose flags parse and request a dry run, against an
+// existing database, may run without privileges. Install and update dry runs
+// still write repo indexes, so they stay privileged.
+func needsPrivilege(cmd string, args []string, dbExists bool) bool {
+	if cmd != "remove" || !dbExists {
+		return true
+	}
+	return !remove.DryRunRequested(args)
 }
 
 // wantProgress reports whether progress output should be rendered, given the

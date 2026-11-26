@@ -14,6 +14,7 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,7 +30,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
+	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/repo"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/system"
@@ -529,6 +532,25 @@ func runGooget(t *testing.T, admin bool, args ...string) (int, string) {
 // runGoogetEnv is runGooget with extra environment variables for the child.
 func runGoogetEnv(t *testing.T, admin bool, extraEnv []string, args ...string) (int, string) {
 	t.Helper()
+	cmd := childCommand(admin, extraEnv, args...)
+	out, err := cmd.CombinedOutput()
+	return childExitCode(t, err, args), string(out)
+}
+
+// runGoogetSplit is runGoogetEnv with the child's stdout and stderr returned
+// separately.
+func runGoogetSplit(t *testing.T, admin bool, extraEnv []string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
+	cmd := childCommand(admin, extraEnv, args...)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
+	err := cmd.Run()
+	return childExitCode(t, err, args), outBuf.String(), errBuf.String()
+}
+
+// childCommand returns the command that runs googet with args in a child
+// process, as runGooget describes.
+func childCommand(admin bool, extraEnv []string, args ...string) *exec.Cmd {
 	cmd := exec.Command(os.Args[0], args...)
 	for _, kv := range os.Environ() {
 		if !strings.HasPrefix(strings.ToUpper(kv), strings.ToUpper(envVar)+"=") {
@@ -541,16 +563,22 @@ func runGoogetEnv(t *testing.T, admin bool, extraEnv []string, args ...string) (
 		cmd.Env = append(cmd.Env, childAdminEnv+"=1")
 	}
 	cmd.Env = append(cmd.Env, extraEnv...)
-	out, err := cmd.CombinedOutput()
+	return cmd
+}
+
+// childExitCode returns the exit code of a child started by childCommand,
+// given the error from running it.
+func childExitCode(t *testing.T, err error, args []string) int {
+	t.Helper()
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:
-		return 0, string(out)
+		return 0
 	case errors.As(err, &exitErr):
-		return exitErr.ExitCode(), string(out)
+		return exitErr.ExitCode()
 	default:
 		t.Fatalf("running googet %q: %v", args, err)
-		return 0, ""
+		return 0
 	}
 }
 
@@ -1370,5 +1398,172 @@ func TestRunRejectsMisplacedFlags(t *testing.T) {
 				t.Errorf("googet %q created the root %q (Lstat error: %v), want it untouched", tc.args, root, err)
 			}
 		})
+	}
+}
+
+// fixtureRoot returns a googet root whose database has package A and package
+// B, which depends on A.
+func fixtureRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	db, err := googetdb.NewDB(filepath.Join(root, "googet.db"))
+	if err != nil {
+		t.Fatalf("googetdb.NewDB: %v", err)
+	}
+	state := client.GooGetState{
+		{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1.0.0@1"}},
+		{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1.0.0@1", PkgDependencies: map[string]string{"A": "1.0.0@1"}}},
+	}
+	if err := db.WriteStateToDB(state); err != nil {
+		db.Close()
+		t.Fatalf("db.WriteStateToDB: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close: %v", err)
+	}
+	// Backdate the database so that any later write moves its mtime forward,
+	// whatever the filesystem's timestamp granularity.
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(root, "googet.db"), old, old); err != nil {
+		t.Fatalf("os.Chtimes: %v", err)
+	}
+	return root
+}
+
+// rootSnapshot records the googet root's file names and the database's
+// bytes and modification time.
+type rootSnapshot struct {
+	names   []string
+	db      []byte
+	dbMtime time.Time
+}
+
+func snapshotRoot(t *testing.T, root string) rootSnapshot {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s rootSnapshot
+	for _, e := range entries {
+		s.names = append(s.names, e.Name())
+	}
+	dbFile := filepath.Join(root, "googet.db")
+	if s.db, err = os.ReadFile(dbFile); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(dbFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.dbMtime = fi.ModTime()
+	return s
+}
+
+// installed reports whether package name is in the database under root.
+func installed(t *testing.T, root, name string) bool {
+	t.Helper()
+	db, err := googetdb.NewDB(filepath.Join(root, "googet.db"))
+	if err != nil {
+		t.Fatalf("googetdb.NewDB: %v", err)
+	}
+	defer db.Close()
+	ps, err := db.FetchPkg(goolib.PackageInfo{Name: name, Arch: "noarch"})
+	if err != nil {
+		t.Fatalf("db.FetchPkg: %v", err)
+	}
+	return ps.PackageSpec != nil
+}
+
+func TestNeedsPrivilege(t *testing.T) {
+	for _, tc := range []struct {
+		cmd      string
+		args     string
+		dbExists bool
+		want     bool
+	}{
+		{"remove", "-dry_run pkg", true, false},
+		{"remove", "pkg", true, true},
+		{"remove", "-dry_run pkg", false, true},
+		{"install", "-dry_run pkg", true, true},
+	} {
+		t.Run(fmt.Sprintf("%s %s dbExists=%v", tc.cmd, tc.args, tc.dbExists), func(t *testing.T) {
+			if got := needsPrivilege(tc.cmd, strings.Fields(tc.args), tc.dbExists); got != tc.want {
+				t.Errorf("needsPrivilege(%q, %q, %v) = %v, want %v", tc.cmd, tc.args, tc.dbExists, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunRemoveDryRunUnprivileged checks that remove -dry_run runs without
+// the admin check or the lock and leaves the googet root untouched.
+func TestRunRemoveDryRunUnprivileged(t *testing.T) {
+	root := fixtureRoot(t)
+	before := snapshotRoot(t, root)
+
+	trace := filepath.Join(t.TempDir(), "trace")
+	code, stdout, stderr := runGoogetSplit(t, false, []string{childTraceEnv + "=" + trace}, "-root", root, "remove", "-dry_run", "A")
+
+	if code != 0 {
+		t.Errorf("googet remove -dry_run A exited %d, want 0; stderr:\n%s", code, stderr)
+	}
+	if !strings.Contains(stdout, "B.noarch") || !strings.Contains(stdout, "Dry run") {
+		t.Errorf("googet remove -dry_run A printed %q, want the dry-run list naming B", stdout)
+	}
+	for _, step := range readTrace(t, trace) {
+		if step == "isAdmin" || step == "obtainLock" || strings.HasPrefix(step, "prepareRoot") || strings.HasPrefix(step, "checkEntries") {
+			t.Errorf("run() called %s, want no admin check, lock, root preparation or entry checks", step)
+		}
+	}
+	after := snapshotRoot(t, root)
+	if !slices.Equal(after.names, before.names) {
+		t.Errorf("root files changed from %q to %q; want no log, lock, journal, cache or repo files", before.names, after.names)
+	}
+	if !bytes.Equal(after.db, before.db) || !after.dbMtime.Equal(before.dbMtime) {
+		t.Error("googet.db changed, want its bytes and mtime unchanged")
+	}
+}
+
+// TestRunRemoveUnprivileged checks that a remove that isn't a dry run still
+// goes through the admin check and stops when it fails.
+func TestRunRemoveUnprivileged(t *testing.T) {
+	root := fixtureRoot(t)
+
+	trace := filepath.Join(t.TempDir(), "trace")
+	code, out := runGoogetEnv(t, false, []string{childTraceEnv + "=" + trace}, "-root", root, "remove", "A")
+
+	if code != 1 {
+		t.Errorf("googet remove A exited %d, want 1; output:\n%s", code, out)
+	}
+	steps := readTrace(t, trace)
+	if !slices.Contains(steps, "isAdmin") {
+		t.Error("isAdmin was not called, want the admin check")
+	}
+	if slices.Contains(steps, "obtainLock") {
+		t.Error("obtainLock was called after a failed admin check")
+	}
+	if !installed(t, root, "A") {
+		t.Error("package A was removed, want it still installed")
+	}
+}
+
+// TestRunRemovePrivileged checks that run() marks the context as privileged
+// once the admin check and the lock succeed, so remove still removes.
+func TestRunRemovePrivileged(t *testing.T) {
+	skipUnlessElevatedOnWindows(t)
+	root := fixtureRoot(t)
+
+	trace := filepath.Join(t.TempDir(), "trace")
+	code, out := runGoogetEnv(t, true, []string{childTraceEnv + "=" + trace}, "-root", root, "-noconfirm", "-system_log=false", "remove", "-db_only", "B")
+
+	if code != 0 {
+		t.Errorf("googet remove -db_only B with privileges exited %d, want 0; output:\n%s", code, out)
+	}
+	steps := readTrace(t, trace)
+	if !slices.Contains(steps, "isAdmin") || !slices.Contains(steps, "obtainLock") {
+		t.Errorf("run() steps = %q, want isAdmin and obtainLock", steps)
+	}
+	if installed(t, root, "B") {
+		t.Error("package B is still installed, want it removed")
 	}
 }
