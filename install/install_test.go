@@ -48,6 +48,7 @@ import (
 	"github.com/google/googet/v2/priority"
 	"github.com/google/googet/v2/remove"
 	"github.com/google/googet/v2/settings"
+	"github.com/google/googet/v2/testutil"
 	"github.com/google/googet/v2/verify"
 	"github.com/google/logger"
 )
@@ -1983,6 +1984,43 @@ func TestResolveReplacementsMode(t *testing.T) {
 			}
 			if gotRequests := requests.Load() > 0; gotRequests != !tc.dbOnly {
 				t.Errorf("download requested = %v, want %v", gotRequests, !tc.dbOnly)
+			}
+		})
+	}
+}
+
+func TestFromDiskCompressed(t *testing.T) {
+	for _, format := range goolib.CompressionFormats() {
+		t.Run(format, func(t *testing.T) {
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			db, err := googetdb.NewDB(settings.DBFile())
+			if err != nil {
+				t.Fatalf("googetdb.NewDB: %v", err)
+			}
+			defer db.Close()
+
+			src, dst, cache := t.TempDir(), t.TempDir(), t.TempDir()
+			ps := goolib.PkgSpec{Name: "zpkg", Version: "1.0.0@1", Arch: "noarch"}
+			rs := testutil.GenGooCompressed(t, src, dst, ps, format)
+			if err := FromDisk(filepath.Join(src, rs.Source), cache, false, false, false, db); err != nil {
+				t.Fatalf("FromDisk: %v", err)
+			}
+
+			got, err := os.ReadFile(filepath.Join(dst, ps.Name))
+			if err != nil {
+				t.Fatalf("installed file: %v", err)
+			}
+			if want := ps.String(); string(got) != want {
+				t.Errorf("installed file contents = %q, want %q", got, want)
+			}
+			state, err := db.FetchPkg(goolib.PackageInfo{Name: ps.Name, Arch: ps.Arch})
+			if err != nil {
+				t.Fatalf("FetchPkg: %v", err)
+			}
+			if state.PackageSpec == nil || state.PackageSpec.Version != ps.Version {
+				t.Errorf("database entry = %+v, want version %s", state.PackageSpec, ps.Version)
 			}
 		})
 	}
