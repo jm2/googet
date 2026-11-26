@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
@@ -102,7 +103,7 @@ func TestExecuteNotInstalled(t *testing.T) {
 			if err := fs.Parse(tc.args); err != nil {
 				t.Fatalf("fs.Parse(%v): %v", tc.args, err)
 			}
-			if got := cmd.Execute(t.Context(), fs); got != subcommands.ExitFailure {
+			if got := cmd.Execute(cli.WithPrivileged(t.Context()), fs); got != subcommands.ExitFailure {
 				t.Errorf("Execute(%v) = %v, want %v", tc.args, got, subcommands.ExitFailure)
 			}
 			for _, want := range tc.wantLogs {

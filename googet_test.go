@@ -16,16 +16,22 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io/fs"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,6 +43,8 @@ import (
 	"github.com/google/googet/v2/repo"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/system"
+	"github.com/google/googet/v2/testutil"
+	"github.com/google/logger"
 	"github.com/google/subcommands"
 )
 
@@ -340,6 +348,11 @@ func TestWantProgress(t *testing.T) {
 }
 
 // Environment variables that runGooget sets for the child process.
+// childEnvPrefix starts the name of every environment variable below.
+const childEnvPrefix = "GOOGET_TEST_"
+
+// Environment variables that configure a child process of the tests. Every
+// name starts with childEnvPrefix, so that childEnv can drop inherited ones.
 const (
 	// runChildEnv, when set to "1", makes the test binary run googet's run()
 	// with its arguments instead of the tests. run() registers flags on
@@ -368,13 +381,95 @@ const (
 	// maxAge argument prefixed by lockAgePrefix.
 	childRecordLockAgeEnv = "GOOGET_TEST_CHILD_RECORD_LOCK_AGE"
 	lockAgePrefix         = "googet-test-lock-age: "
+	// confineEnv, when set, makes the child deny itself every filesystem
+	// write outside the directories listed below before it runs googet,
+	// where the OS supports that. reexecGuardEnv marks the child after it has
+	// confined itself and re-executed.
+	confineEnv     = childEnvPrefix + "CONFINE_WRITES"
+	reexecGuardEnv = childEnvPrefix + "CONFINE_REEXECED"
+	// scratchEnv names the scratch tree that holds an unelevated child's
+	// temporary, home and working directories, and rootEnv names the googet
+	// root it was given with -root. Writes under both, and in the directory
+	// of the childTraceEnv file, stay allowed (under the root's nearest
+	// existing ancestor while the root doesn't exist), so that runGooget's
+	// snapshot of the scratch tree and the callers' snapshots of the root
+	// show them, even when googet ignores the error that a denied write would
+	// return.
+	scratchEnv = childEnvPrefix + "SCRATCH"
+	rootEnv    = childEnvPrefix + "ROOT"
+	// writeProbeEnv, when set, makes the child write an empty file at the
+	// path it holds instead of running googet. The child exits 0 if the write
+	// works, probeDeniedCode if it fails with a permission error and 1 if it
+	// fails otherwise. TestWriteConfinement uses it.
+	writeProbeEnv = childEnvPrefix + "WRITE_PROBE"
 )
 
+// Exit codes and messages that a child uses to report its result.
+const (
+	probeDeniedCode = 3
+	// confineFailCode and confineFailPrefix mark a child that couldn't
+	// confine its writes.
+	confineFailCode   = 125
+	confineFailPrefix = "confining writes: "
+)
+
+// confineFailed reports whether a child exited because it couldn't confine
+// its writes.
+func confineFailed(code int, stderr string) bool {
+	return code == confineFailCode && strings.Contains(stderr, confineFailPrefix)
+}
+
+// TestMain serves all tests in package main. When runChildEnv or
+// writeProbeEnv is set, the test binary acts as a child process for
+// runGooget or TestWriteConfinement instead of running the tests.
 func TestMain(m *testing.M) {
-	if os.Getenv(runChildEnv) == "1" {
-		os.Exit(runChild())
+	child, probe := os.Getenv(runChildEnv) == "1", os.Getenv(writeProbeEnv)
+	if !child && probe == "" {
+		os.Exit(m.Run())
 	}
-	os.Exit(m.Run())
+	if os.Getenv(confineEnv) != "" && os.Getenv(reexecGuardEnv) == "" {
+		var allow []string
+		if p := os.Getenv(childTraceEnv); p != "" {
+			allow = append(allow, filepath.Dir(p))
+		}
+		if d := os.Getenv(scratchEnv); d != "" {
+			allow = append(allow, d)
+		}
+		if d := os.Getenv(rootEnv); d != "" {
+			// The root may not exist yet. Allow its nearest existing
+			// ancestor, normally a test's own temporary
+			// directory, so that creating the root shows up too.
+			for !isDir(d) && filepath.Dir(d) != d {
+				d = filepath.Dir(d)
+			}
+			// Never allow a whole volume.
+			if filepath.Dir(d) != d {
+				allow = append(allow, d)
+			}
+		}
+		// A binary built with coverage writes its counters to GOCOVERDIR
+		// when it exits.
+		if d := os.Getenv("GOCOVERDIR"); d != "" {
+			allow = append(allow, d)
+		}
+		err := confineWritesAndExec(allow, append(os.Environ(), reexecGuardEnv+"=1"))
+		fmt.Fprintf(os.Stderr, "%s%v\n", confineFailPrefix, err)
+		os.Exit(confineFailCode)
+	}
+	if probe != "" {
+		err := os.WriteFile(probe, nil, 0644)
+		switch {
+		case err == nil:
+			os.Exit(0)
+		case errors.Is(err, fs.ErrPermission):
+			fmt.Fprintf(os.Stderr, "write probe: %v\n", err)
+			os.Exit(probeDeniedCode)
+		default:
+			fmt.Fprintf(os.Stderr, "write probe: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	os.Exit(runChild())
 }
 
 func appendTrace(line string) {
@@ -526,6 +621,19 @@ func runChild() int {
 // runGooget runs googet with args in a child process and returns its exit
 // code and combined output. The GooGetRoot environment variable is unset, so
 // only -root sets the root.
+//
+// An unelevated run (admin unset) must not write any file, inside the googet
+// root or anywhere else. Callers check the root. runGooget points the
+// child's temporary, home and application data directories and its working
+// directory into a scratch tree and fails the test if that tree changes.
+// Where the kernel supports Landlock, the child also denies itself every
+// filesystem write outside the scratch tree, the root (or the root's nearest
+// existing ancestor while the root doesn't exist) and the directory of the
+// childTraceEnv file, so that a write anywhere else fails in the child. On
+// Linux without Landlock only the snapshots run, and the test fails instead
+// when CI is set. A denied write whose error googet ignores goes unreported,
+// and Landlock doesn't cover changes to a file's mode, owner, times or
+// extended attributes.
 func runGooget(t *testing.T, admin bool, args ...string) (int, string) {
 	t.Helper()
 	return runGoogetEnv(t, admin, nil, args...)
@@ -534,53 +642,238 @@ func runGooget(t *testing.T, admin bool, args ...string) (int, string) {
 // runGoogetEnv is runGooget with extra environment variables for the child.
 func runGoogetEnv(t *testing.T, admin bool, extraEnv []string, args ...string) (int, string) {
 	t.Helper()
-	cmd := childCommand(admin, extraEnv, args...)
-	out, err := cmd.CombinedOutput()
-	return childExitCode(t, err, args), string(out)
+	c := newChild(t, admin, extraEnv, args)
+	out, err := c.cmd.CombinedOutput()
+	return c.finish(t, err, string(out)), string(out)
 }
 
 // runGoogetSplit is runGoogetEnv with the child's stdout and stderr returned
 // separately.
 func runGoogetSplit(t *testing.T, admin bool, extraEnv []string, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
-	cmd := childCommand(admin, extraEnv, args...)
+	c := newChild(t, admin, extraEnv, args)
 	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &outBuf, &errBuf
-	err := cmd.Run()
-	return childExitCode(t, err, args), outBuf.String(), errBuf.String()
+	c.cmd.Stdout, c.cmd.Stderr = &outBuf, &errBuf
+	err := c.cmd.Run()
+	return c.finish(t, err, errBuf.String()), outBuf.String(), errBuf.String()
 }
 
-// childCommand returns the command that runs googet with args in a child
-// process, as runGooget describes.
-func childCommand(admin bool, extraEnv []string, args ...string) *exec.Cmd {
-	cmd := exec.Command(os.Args[0], args...)
+// childEnv returns this process's environment with the variables in set
+// replaced by their values in set. GooGetRoot and every inherited variable
+// whose name starts with childEnvPrefix are dropped unless set has them, so
+// the parent's environment can't change how a child runs. Names are compared
+// without regard to case, as Windows does.
+func childEnv(set map[string]string) []string {
+	skip := map[string]bool{strings.ToUpper(envVar): true}
+	for k := range set {
+		skip[strings.ToUpper(k)] = true
+	}
+	var env []string
 	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(strings.ToUpper(kv), strings.ToUpper(envVar)+"=") {
-			cmd.Env = append(cmd.Env, kv)
+		k, _, _ := strings.Cut(kv, "=")
+		if uk := strings.ToUpper(k); !skip[uk] && !strings.HasPrefix(uk, childEnvPrefix) {
+			env = append(env, kv)
 		}
 	}
-	// The race detector otherwise sleeps for a second before each exit.
-	cmd.Env = append(cmd.Env, runChildEnv+"=1", "GORACE="+strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
-	if admin {
-		cmd.Env = append(cmd.Env, childAdminEnv+"=1")
+	for k, v := range set {
+		env = append(env, k+"="+v)
 	}
-	cmd.Env = append(cmd.Env, extraEnv...)
-	return cmd
+	return env
 }
 
-// childExitCode returns the exit code of a child started by childCommand,
-// given the error from running it.
-func childExitCode(t *testing.T, err error, args []string) int {
+// child is a googet child process set up as runGooget describes.
+type child struct {
+	cmd     *exec.Cmd
+	args    []string
+	scratch string            // Empty for an elevated child.
+	before  map[string]string // Snapshot of scratch before the run.
+}
+
+// newChild returns a child that runs googet with args and the extra "K=V"
+// environment variables in extraEnv, which may also override the ones below.
+func newChild(t *testing.T, admin bool, extraEnv, args []string) *child {
 	t.Helper()
+	env := map[string]string{
+		runChildEnv: "1",
+		// The race detector otherwise sleeps for a second before each exit.
+		"GORACE": strings.TrimSpace(os.Getenv("GORACE") + " atexit_sleep_ms=0"),
+	}
+	c := &child{cmd: exec.Command(os.Args[0], args...), args: args}
+	if admin {
+		env[childAdminEnv] = "1"
+	} else {
+		c.scratch = t.TempDir()
+		env[scratchEnv] = c.scratch
+		tmp, home, cwd := filepath.Join(c.scratch, "tmp"), filepath.Join(c.scratch, "home"), filepath.Join(c.scratch, "cwd")
+		for _, d := range []string{tmp, home, cwd} {
+			if err := os.Mkdir(d, 0755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, k := range []string{"TMPDIR", "TMP", "TEMP"} {
+			env[k] = tmp
+		}
+		for _, k := range []string{"HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"} {
+			env[k] = home
+		}
+		c.cmd.Dir = cwd
+		if root, ok := rootArg(args); ok {
+			env[rootEnv] = root
+		}
+		if writeConfinementSupported() {
+			env[confineEnv] = "1"
+		} else if runtime.GOOS == "linux" && os.Getenv("CI") != "" {
+			t.Fatal("Landlock is not available, so unelevated runs can't be checked for writes outside the googet root")
+		}
+	}
+	for _, kv := range extraEnv {
+		k, v, _ := strings.Cut(kv, "=")
+		env[k] = v
+	}
+	c.cmd.Env = childEnv(env)
+	if c.scratch != "" {
+		c.before = testutil.TreeSnapshot(t, c.scratch)
+	}
+	return c
+}
+
+// finish returns the child's exit code, given the error from running it and
+// its stderr. It fails the test if the child couldn't confine its writes or,
+// for an unelevated child, if the scratch tree changed.
+func (c *child) finish(t *testing.T, err error, stderr string) int {
+	t.Helper()
+	var code int
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:
-		return 0
 	case errors.As(err, &exitErr):
-		return exitErr.ExitCode()
+		code = exitErr.ExitCode()
 	default:
-		t.Fatalf("running googet %q: %v", args, err)
-		return 0
+		t.Fatalf("running googet %q: %v", c.args, err)
+	}
+	if confineFailed(code, stderr) {
+		t.Fatalf("googet %q: %s", c.args, stderr)
+	}
+	if c.scratch != "" {
+		if diff := cmp.Diff(c.before, testutil.TreeSnapshot(t, c.scratch)); diff != "" {
+			t.Errorf("unelevated googet %q wrote outside the googet root (-before +after):\n%s", c.args, diff)
+		}
+	}
+	return code
+}
+
+// rootArg returns the value of the global -root flag in args, the last one
+// if it is repeated, as the flag package keeps. It handles the forms these
+// tests use: one or two leading dashes, the value either after '=' or in the
+// next argument, and it stops at "--" or at the first argument that isn't a
+// flag. Unlike the flag package, it skips malformed flags such as "---root"
+// instead of rejecting them.
+func rootArg(args []string) (root string, ok bool) {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" || len(a) < 2 || a[0] != '-' {
+			break
+		}
+		name, val, hasVal := strings.Cut(strings.TrimPrefix(a[1:], "-"), "=")
+		if name != "root" {
+			continue
+		}
+		if !hasVal {
+			if i+1 >= len(args) {
+				return "", false
+			}
+			i++
+			val = args[i]
+		}
+		root, ok = val, true
+	}
+	return root, ok
+}
+
+func TestRootArg(t *testing.T) {
+	for _, tc := range []struct {
+		args   []string
+		want   string
+		wantOK bool
+	}{
+		{[]string{"-root", "r", "installed"}, "r", true},
+		{[]string{"--root", "r", "installed"}, "r", true},
+		{[]string{"-root=r", "installed"}, "r", true},
+		{[]string{"--root=r", "installed"}, "r", true},
+		{[]string{"-noconfirm", "-root", "r", "installed"}, "r", true},
+		{[]string{"-root", "a", "--root=b", "installed"}, "b", true},
+		{[]string{"--root=a", "-root", "b", "installed"}, "b", true},
+		{[]string{"-root"}, "", false},
+		{[]string{"installed", "-root", "r"}, "", false},
+		{[]string{"install", "root"}, "", false},
+		{[]string{"install", "root=r"}, "", false},
+		{[]string{"--", "-root", "r"}, "", false},
+		{[]string{"---root", "r"}, "", false},
+	} {
+		if got, ok := rootArg(tc.args); got != tc.want || ok != tc.wantOK {
+			t.Errorf("rootArg(%q) = %q, %v, want %q, %v", tc.args, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+// TestWriteConfinement checks that the write confinement runGooget uses for
+// unelevated runs allows writes only in the trace file's directory and under
+// the root, or under the root's nearest existing ancestor while the root
+// doesn't exist, and never under a whole volume.
+func TestWriteConfinement(t *testing.T) {
+	if !writeConfinementSupported() {
+		t.Skip("write confinement is not supported on this system")
+	}
+	traceDir := t.TempDir()
+	existingRoot := t.TempDir()
+	missingRootParent := t.TempDir()
+	missingRoot := filepath.Join(missingRootParent, "googet")
+	volumeChildRoot := filepath.Join(string(filepath.Separator), "nonexistent-googet-test", "googet")
+	for _, tc := range []struct {
+		name      string
+		path      string
+		root      string
+		wantWrite bool
+	}{
+		{"outside the trace directory", filepath.Join(t.TempDir(), "probe"), "", false},
+		{"in the trace directory", filepath.Join(traceDir, "probe"), "", true},
+		{"under an existing root", filepath.Join(existingRoot, "probe"), existingRoot, true},
+		{"beside an existing root", filepath.Join(filepath.Dir(existingRoot), "probe-beside-root"), existingRoot, false},
+		{"beside a missing root", filepath.Join(missingRootParent, "probe"), missingRoot, true},
+		{"outside a missing root's parent", filepath.Join(t.TempDir(), "probe"), missingRoot, false},
+		{"missing root whose only existing ancestor is the volume", filepath.Join(t.TempDir(), "probe"), volumeChildRoot, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set := map[string]string{childTraceEnv: filepath.Join(traceDir, "trace.txt"), confineEnv: "1", writeProbeEnv: tc.path}
+			if tc.root != "" {
+				set[rootEnv] = tc.root
+			}
+			cmd := exec.Command(os.Args[0])
+			cmd.Env = childEnv(set)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			code := 0
+			var exitErr *exec.ExitError
+			if err := cmd.Run(); errors.As(err, &exitErr) {
+				code = exitErr.ExitCode()
+			} else if err != nil {
+				t.Fatalf("running the write probe: %v", err)
+			}
+			if confineFailed(code, stderr.String()) {
+				t.Fatalf("child failed to confine writes: %s", stderr.String())
+			}
+			wantCode := probeDeniedCode
+			if tc.wantWrite {
+				wantCode = 0
+			}
+			if code != wantCode {
+				t.Errorf("write probe of %q exit code = %d, want %d (0: written, %d: permission denied); stderr: %s", tc.path, code, wantCode, probeDeniedCode, stderr.String())
+			}
+			_, statErr := os.Stat(tc.path)
+			if wrote := statErr == nil; wrote != tc.wantWrite {
+				t.Errorf("probe file %q exists: %v (Stat error %v), want %v", tc.path, wrote, statErr, tc.wantWrite)
+			}
+		})
 	}
 }
 
@@ -1512,7 +1805,29 @@ func TestClassifyCommands(t *testing.T) {
 		{"listrepos", cli.UnelevatedRun},
 		{"remove -dry_run pkg", cli.UnelevatedRun},
 		{"remove pkg", cli.Privileged},
-		{"install -dry_run pkg", cli.Privileged},
+		{"available", cli.UnelevatedRun},
+		{"available -info pkg", cli.UnelevatedRun},
+		{"latest pkg", cli.UnelevatedRun},
+		{"latest -compare -json pkg", cli.UnelevatedRun},
+		{"update -dry_run", cli.UnelevatedRun},
+		{"update", cli.Privileged},
+		{"install -dry_run pkg", cli.UnelevatedRun},
+		{"install -dry_run -db_only pkg", cli.UnelevatedRun},
+		{"install pkg", cli.Privileged},
+		{"install -dry_run -reinstall pkg", cli.Privileged},
+		{"install -reinstall -dry_run pkg", cli.Privileged},
+		{"install -dry_run -redownload pkg", cli.Privileged},
+		{"install -dry_run -reinstall=false pkg", cli.UnelevatedRun},
+		{"download pkg", cli.Privileged},
+		{"download -download_dir x pkg", cli.Privileged},
+		{"check", cli.Privileged},
+		{"check -dry_run", cli.Privileged},
+		{"verify pkg", cli.Privileged},
+		{"verify -skip_files pkg", cli.Privileged},
+		{"clean", cli.Privileged},
+		{"clean -all", cli.Privileged},
+		{"addrepo name https://example.com/repo", cli.Privileged},
+		{"rmrepo name", cli.Privileged},
 	} {
 		t.Run(tc.args, func(t *testing.T) {
 			if got, _, _ := cli.Classify(subcommands.DefaultCommander, strings.Fields(tc.args)); got != tc.want {
@@ -1526,7 +1841,7 @@ func TestClassifyCommands(t *testing.T) {
 // implement cli.AllowUnelevated and cli.LockFree, so adding one is a visible,
 // reviewed change.
 func TestAllowUnelevatedAllowlist(t *testing.T) {
-	wantAllow := []string{"installed", "listrepos", "remove"}
+	wantAllow := []string{"available", "install", "installed", "latest", "listrepos", "remove", "update"}
 	wantLockFree := []string{"installed", "listrepos"}
 	var gotAllow, gotLockFree []string
 	subcommands.DefaultCommander.VisitCommands(func(_ *subcommands.CommandGroup, c subcommands.Command) {
@@ -1677,17 +1992,278 @@ func TestRunRemovePrivileged(t *testing.T) {
 	}
 }
 
+// logCapture collects what the logger writes, for in-process tests.
+type logCapture struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (c *logCapture) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.Write(p)
+}
+
+// take returns what was logged since the last call and clears it.
+func (c *logCapture) take() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.buf.String()
+	c.buf.Reset()
+	return s
+}
+
+var (
+	capturedLogsOnce sync.Once
+	capturedLogs     = &logCapture{}
+)
+
+// captureLogs makes the default logger write to capturedLogs. The logger
+// keeps the first Init, so this works only if nothing in this test process
+// initialized it before.
+func captureLogs() *logCapture {
+	capturedLogsOnce.Do(func() { logger.Init("GooGet", false, false, capturedLogs) })
+	capturedLogs.take()
+	return capturedLogs
+}
+
+// registeredCommand returns the command registered under name, as
+// subcommands.Commander.Execute finds it.
+func registeredCommand(t *testing.T, name string) subcommands.Command {
+	t.Helper()
+	var cmd subcommands.Command
+	subcommands.DefaultCommander.VisitCommands(func(_ *subcommands.CommandGroup, c subcommands.Command) {
+		if cmd == nil && c.Name() == name {
+			cmd = c
+		}
+	})
+	if cmd == nil {
+		t.Fatalf("command %q isn't registered", name)
+	}
+	return cmd
+}
+
+// captureOutput runs f with os.Stdout and os.Stderr redirected to a
+// temporary file, and returns what f wrote to them.
+func captureOutput(t *testing.T, f func()) string {
+	t.Helper()
+	tmp, err := os.CreateTemp(t.TempDir(), "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmp.Close()
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = tmp, tmp
+	f()
+	os.Stdout, os.Stderr = oldOut, oldErr
+	b, err := os.ReadFile(tmp.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestExecuteRefusesUnelevatedFirst runs registered commands' Execute
+// without the privileged marker, with flags that their AllowUnelevated
+// doesn't allow or, for a command that doesn't implement it, any flags,
+// against a root that has no database, cache or repos. Each must print
+// exactly one line, its refusal, before it opens the database, builds
+// sources or fetches anything, and create nothing.
+func TestExecuteRefusesUnelevatedFirst(t *testing.T) {
+	logs := captureLogs()
+	for _, args := range [][]string{
+		{"install", "-dry_run", "-reinstall", "pkg"},
+		{"install", "-dry_run", "-redownload", "-reinstall", "pkg"},
+		{"install", "pkg"},
+		{"update"},
+		{"update", "-dry_run=false"},
+		{"download", "pkg"},
+		{"remove", "pkg"},
+		{"check"},
+		{"clean", "-all"},
+		{"verify", "pkg"},
+		{"addrepo", "name", "https://example.com/repo"},
+		{"rmrepo", "name"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := t.TempDir()
+			if err := settings.Initialize(root, false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
+			cmd := registeredCommand(t, args[0])
+			fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+			cmd.SetFlags(fs)
+			if err := fs.Parse(args[1:]); err != nil {
+				t.Fatalf("parsing %q: %v", args, err)
+			}
+			var got subcommands.ExitStatus
+			printed := captureOutput(t, func() { got = cmd.Execute(context.Background(), fs) })
+			if got != subcommands.ExitFailure {
+				t.Errorf("unprivileged Execute(%q) = %v, want %v", args, got, subcommands.ExitFailure)
+			}
+			// The logger writes to logs and to the stderr it saw at Init,
+			// which captureOutput doesn't capture, so nothing is counted
+			// twice.
+			out := strings.TrimSpace(logs.take() + printed)
+			if lines := strings.Split(out, "\n"); len(lines) != 1 || !strings.Contains(out, "requires administrator privileges") {
+				t.Errorf("unprivileged Execute(%q) printed %q, want exactly one line, the refusal", args, out)
+			}
+			if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+				t.Errorf("unprivileged Execute(%q) left %v in the root (error %v), want nothing", args, entries, err)
+			}
+		})
+	}
+}
+
+// readOnlyRoot returns fixtureRoot's root with a googet.conf that allows HTTP
+// repos, a repos folder naming a repo served by a test server, and a stale
+// cache entry for that repo. The repo
+// has A 2.0.0@1, an update for the installed A, and C 1.0.0@1. Everything
+// under the root is backdated, so any write moves an mtime.
+func readOnlyRoot(t *testing.T) string {
+	t.Helper()
+	specs := []goolib.RepoSpec{
+		{Source: "A.noarch.2.0.0@1.goo", PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "2.0.0@1"}},
+		{Source: "C.noarch.1.0.0@1.goo", PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "1.0.0@1"}},
+	}
+	j, err := json.Marshal(specs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/index" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(j)
+	}))
+	t.Cleanup(srv.Close)
+
+	root := fixtureRoot(t)
+	for _, d := range []string{"repos", "cache"} {
+		if err := os.Mkdir(filepath.Join(root, d), 0774); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cacheBase := filepath.Join("cache", fmt.Sprintf("%x", sha256.Sum256([]byte(srv.URL))))
+	files := map[string]string{
+		"googet.conf":                       "allowunsafeurl: true\n",
+		filepath.Join("repos", "test.repo"): fmt.Sprintf("- name: test\n  url: %s\n", srv.URL),
+		cacheBase + ".rs":                   "[]",
+		cacheBase + ".url":                  srv.URL,
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0664); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for _, p := range append(slices.Collect(maps.Keys(files)), "repos", "cache", ".") {
+		if err := os.Chtimes(filepath.Join(root, p), old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// TestRunUnelevatedReadsLeaveRootUnchanged runs the read-only commands
+// unelevated, with a failing admin check, against a root with a stale repo
+// index cache. Each must succeed without taking the lock, preparing or
+// checking the root, write no googet.log and leave every name, byte and
+// mtime under the root unchanged. Only the cli.LockFree commands skip the
+// admin check too.
+func TestRunUnelevatedReadsLeaveRootUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		args     []string
+		wantOut  string
+		lockFree bool
+	}{
+		{args: []string{"available"}, wantOut: "C.noarch"},
+		{args: []string{"latest", "A"}, wantOut: "2.0.0@1"},
+		{args: []string{"latest", "-compare", "A"}, wantOut: "2.0.0@1"},
+		{args: []string{"update", "-dry_run"}, wantOut: "Dry run"},
+		{args: []string{"install", "-dry_run", "C"}, wantOut: "C.noarch"},
+		{args: []string{"installed"}, wantOut: "A.noarch", lockFree: true},
+		{args: []string{"listrepos"}, wantOut: "test", lockFree: true},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			root := readOnlyRoot(t)
+			before := testutil.TreeSnapshot(t, root)
+			trace := filepath.Join(t.TempDir(), "trace")
+			code, stdout, stderr := runGoogetSplit(t, false, []string{childTraceEnv + "=" + trace}, append([]string{"-root", root, "-noconfirm"}, tc.args...)...)
+			if code != 0 {
+				t.Errorf("unelevated googet %q exit code = %d, want 0; output:\n%s%s", tc.args, code, stdout, stderr)
+			}
+			if !strings.Contains(stdout, tc.wantOut) {
+				t.Errorf("unelevated googet %q printed %q, want it to contain %q", tc.args, stdout, tc.wantOut)
+			}
+			steps := readTrace(t, trace)
+			wantAdminCheck := !tc.lockFree
+			if slices.Contains(steps, "isAdmin") != wantAdminCheck || slices.Contains(steps, "obtainLock") {
+				t.Errorf("unelevated googet %q run() steps = %q, want isAdmin: %v and no lock", tc.args, steps, wantAdminCheck)
+			}
+			for _, step := range steps {
+				if strings.HasPrefix(step, "prepareRoot") || strings.HasPrefix(step, "checkEntries") {
+					t.Errorf("unelevated googet %q called %s, want no root preparation or entry checks", tc.args, step)
+				}
+			}
+			if diff := cmp.Diff(before, testutil.TreeSnapshot(t, root)); diff != "" {
+				t.Errorf("unelevated googet %q changed the root (-before +after):\n%s", tc.args, diff)
+			}
+		})
+	}
+}
+
+// TestRunUnelevatedWritesStayPrivileged checks that commands and flags that
+// write or run package code still go through the admin check unelevated, and
+// that the failed check leaves the root unchanged.
+func TestRunUnelevatedWritesStayPrivileged(t *testing.T) {
+	for _, args := range [][]string{
+		{"update"},
+		{"install", "C"},
+		{"install", "-dry_run", "-reinstall", "A"},
+		{"install", "-dry_run", "-redownload", "-reinstall", "A"},
+		{"download", "C"},
+		{"check"},
+		{"check", "-dry_run"},
+		{"verify", "A"},
+		{"clean"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			root := readOnlyRoot(t)
+			before := testutil.TreeSnapshot(t, root)
+			trace := filepath.Join(t.TempDir(), "trace")
+			code, out := runGoogetEnv(t, false, []string{childTraceEnv + "=" + trace}, append([]string{"-root", root, "-noconfirm"}, args...)...)
+			if code != 1 {
+				t.Errorf("unelevated googet %q exit code = %d, want 1; output:\n%s", args, code, out)
+			}
+			if steps := readTrace(t, trace); !slices.Equal(steps, []string{"isAdmin"}) {
+				t.Errorf("unelevated googet %q run() steps = %q, want only isAdmin", args, steps)
+			}
+			if diff := cmp.Diff(before, testutil.TreeSnapshot(t, root)); diff != "" {
+				t.Errorf("unelevated googet %q changed the root (-before +after):\n%s", args, diff)
+			}
+		})
+	}
+}
+
 // TestRunElevatedAllowUnelevated checks elevated runs of commands that may
-// run unelevated. A cli.LockFree command still runs without the admin check,
-// the lock and googet.log. Any other command takes the privileged path, so
-// the admin check passes, it takes the lock and it writes googet.log.
+// run unelevated, against a root with a stale repo index cache. A
+// cli.LockFree command still runs without the admin check, the lock and
+// googet.log. Any other command takes the privileged path: the admin check
+// passes, it takes the lock, writes googet.log and, if it reads the index,
+// refreshes the stale cache.
 func TestRunElevatedAllowUnelevated(t *testing.T) {
 	for _, tc := range []struct {
-		args       []string
-		wantOut    string
-		privileged bool
+		args        []string
+		wantOut     string
+		privileged  bool
+		wantRefresh bool
 	}{
 		{args: []string{"remove", "-dry_run", "A"}, wantOut: "Dry run", privileged: true},
+		{args: []string{"latest", "A"}, wantOut: "2.0.0@1", privileged: true, wantRefresh: true},
+		{args: []string{"update", "-dry_run"}, wantOut: "Dry run", privileged: true, wantRefresh: true},
 		{args: []string{"installed"}, wantOut: "A.noarch"},
 		{args: []string{"listrepos"}, wantOut: "test"},
 	} {
@@ -1695,13 +2271,7 @@ func TestRunElevatedAllowUnelevated(t *testing.T) {
 			if tc.privileged {
 				skipUnlessElevatedOnWindows(t)
 			}
-			root := fixtureRoot(t)
-			if err := os.Mkdir(filepath.Join(root, "repos"), 0774); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(root, "repos", "test.repo"), []byte("- name: test\n  url: https://example.com/repo\n"), 0664); err != nil {
-				t.Fatal(err)
-			}
+			root := readOnlyRoot(t)
 			trace := filepath.Join(t.TempDir(), "trace")
 			code, stdout, stderr := runGoogetSplit(t, true, []string{childTraceEnv + "=" + trace}, append([]string{"-root", root, "-noconfirm", "-system_log=false"}, tc.args...)...)
 			if code != 0 {
@@ -1719,6 +2289,17 @@ func TestRunElevatedAllowUnelevated(t *testing.T) {
 			_, err := os.Stat(filepath.Join(root, "googet.log"))
 			if gotLog := err == nil; gotLog != tc.privileged {
 				t.Errorf("elevated googet %q wrote googet.log: %v (Stat error: %v), want %v", tc.args, gotLog, err, tc.privileged)
+			}
+			caches, err := filepath.Glob(filepath.Join(root, "cache", "*.rs"))
+			if err != nil || len(caches) != 1 {
+				t.Fatalf("cache files = %q (error %v), want one", caches, err)
+			}
+			b, err := os.ReadFile(caches[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if refreshed := string(b) != "[]"; refreshed != tc.wantRefresh {
+				t.Errorf("elevated googet %q left the cache holding %q; refreshed: %v, want %v", tc.args, b, refreshed, tc.wantRefresh)
 			}
 		})
 	}

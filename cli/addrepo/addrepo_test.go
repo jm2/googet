@@ -24,6 +24,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/logger"
 	"github.com/google/subcommands"
@@ -64,7 +65,7 @@ func runAddRepoWithSetup(t *testing.T, setup func(parent, repoDir string), args 
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parsing %q: %v", args, err)
 	}
-	return cmd.Execute(context.Background(), fs), parent, repoDir
+	return cmd.Execute(cli.WithPrivileged(context.Background()), fs), parent, repoDir
 }
 
 // filesUnder returns the paths of all regular files under dir, relative to

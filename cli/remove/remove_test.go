@@ -446,7 +446,9 @@ func TestExecuteRequiresPrivilege(t *testing.T) {
 		{desc: "remove with privilege", args: []string{"A"}, privileged: true, wantStatus: subcommands.ExitSuccess, wantKept: false},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
