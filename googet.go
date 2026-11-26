@@ -138,14 +138,20 @@ func run(ctx context.Context) int {
 	// "googet listrepos" may execute without a lock if the root directory
 	// exists.
 	if rootExists && cmdName == "listrepos" {
-		settings.Initialize(*rootDir, !*noConfirm)
+		if err := settings.Initialize(*rootDir, !*noConfirm); err != nil {
+			logger.Errorf("Unable to initialize settings: %v", err)
+			return 1
+		}
 		return (int(cmdr.Execute(context.Background())))
 	}
 
 	// "googet installed" is allowed to execute without a lock if the googet
 	// database has already been created.
 	if rootExists && cmdName == "installed" && googetdb.Exists(filepath.Join(*rootDir, rootDBName)) {
-		settings.Initialize(*rootDir, !*noConfirm)
+		if err := settings.Initialize(*rootDir, !*noConfirm); err != nil {
+			logger.Errorf("Unable to initialize settings: %v", err)
+			return 1
+		}
 		return int(cmdr.Execute(ctx))
 	}
 
@@ -167,7 +173,10 @@ func run(ctx context.Context) int {
 		logger.Errorf("Unable to prepare the googet root: %v", err)
 		return 1
 	}
-	settings.Initialize(*rootDir, !*noConfirm)
+	if err := settings.Initialize(*rootDir, !*noConfirm); err != nil {
+		logger.Errorf("Unable to initialize settings: %v", err)
+		return 1
+	}
 	cleanup, err := obtainLock(settings.LockFile(), settings.LockFileMaxAge)
 	if err != nil {
 		logger.Errorf("Failed to obtain lock: %v", err)
