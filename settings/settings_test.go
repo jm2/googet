@@ -21,7 +21,7 @@ func TestInitialize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error creating conf file: %v", err)
 	}
-	content := []byte("archs: [noarch, x86_64, arm64]\ncachelife: 10m\nlockfilemaxage: 1x\nallowunsafeurl: true\nprogress: false\ninstalltimeout: 90m\ninactivitytimeout: 2m\ninactivitymode: Enforce")
+	content := []byte("archs: [noarch, x86_64, arm64]\ncachelife: 10m\nlockfilemaxage: 1x\nallowunsafeurl: true\nprogress: false\ninstalltimeout: 90m\ninactivitytimeout: 2m\ninactivitymode: Monitor")
 	if _, err := f.Write(content); err != nil {
 		t.Fatalf("error writing conf file: %v", err)
 	}
@@ -88,26 +88,28 @@ func TestInitialize(t *testing.T) {
 	})
 
 	t.Run("Parsing InactivityMode", func(t *testing.T) {
-		if got, want := goolib.InactivityMode, goolib.InactivityEnforce; got != want {
+		if got, want := goolib.InactivityMode, goolib.InactivityMonitor; got != want {
 			t.Errorf("goolib.InactivityMode got: %q, want: %q", got, want)
 		}
 	})
 }
 
 func TestInactivitySettings(t *testing.T) {
-	// Each row starts from values other than the defaults, so that a value
-	// left unchanged is told apart from one reset to its default.
+	// Each row starts from values that tell a setting left unchanged apart
+	// from one reset or updated.
 	for _, tt := range []struct {
-		name     string
-		conf     string
-		wantTime time.Duration
-		wantMode string
+		name      string
+		conf      string
+		startMode string
+		wantTime  time.Duration
+		wantMode  string
 	}{
-		{"zero timeout disables", "inactivitytimeout: 0", 0, goolib.InactivityEnforce},
-		{"invalid timeout", "inactivitytimeout: 1x", 7 * time.Minute, goolib.InactivityEnforce},
-		{"upper case mode", "inactivitymode: OFF", 7 * time.Minute, goolib.InactivityOff},
+		{"zero timeout disables", "inactivitytimeout: 0", goolib.InactivityOff, 0, goolib.InactivityOff},
+		{"invalid timeout", "inactivitytimeout: 1x", goolib.InactivityOff, 7 * time.Minute, goolib.InactivityOff},
+		{"upper case enforce", "inactivitymode: ENFORCE", goolib.InactivityOff, 7 * time.Minute, goolib.InactivityEnforce},
+		{"upper case off", "inactivitymode: OFF", goolib.InactivityEnforce, 7 * time.Minute, goolib.InactivityOff},
 		// A typo must not leave enforce in effect.
-		{"invalid mode", "inactivitymode: kill", 7 * time.Minute, goolib.InactivityMonitor},
+		{"invalid mode", "inactivitymode: kill", goolib.InactivityEnforce, 7 * time.Minute, goolib.InactivityMonitor},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			rootDir := t.TempDir()
@@ -116,8 +118,10 @@ func TestInactivitySettings(t *testing.T) {
 			}
 			origTime, origMode := goolib.InactivityTimeout, goolib.InactivityMode
 			t.Cleanup(func() { goolib.InactivityTimeout, goolib.InactivityMode = origTime, origMode })
-			goolib.InactivityTimeout, goolib.InactivityMode = 7*time.Minute, goolib.InactivityEnforce
-			settings.Initialize(rootDir, true)
+			goolib.InactivityTimeout, goolib.InactivityMode = 7*time.Minute, tt.startMode
+			if err := settings.Initialize(rootDir, true); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			if got := goolib.InactivityTimeout; got != tt.wantTime {
 				t.Errorf("goolib.InactivityTimeout with %q got: %v, want: %v", tt.conf, got, tt.wantTime)
 			}
@@ -138,7 +142,9 @@ func TestInactivityModeDefault(t *testing.T) {
 	orig := goolib.InactivityMode
 	t.Cleanup(func() { goolib.InactivityMode = orig })
 	goolib.InactivityMode = "sentinel"
-	settings.Initialize(rootDir, true)
+	if err := settings.Initialize(rootDir, true); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
 	if got, want := goolib.InactivityMode, "sentinel"; got != want {
 		t.Errorf("goolib.InactivityMode without inactivitymode = %q, want %q", got, want)
 	}
