@@ -22,8 +22,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/google/googet/v2/client"
-	"github.com/google/googet/v2/googetdb"
+	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/install"
 	"github.com/google/googet/v2/settings"
@@ -34,6 +33,11 @@ import (
 
 func init() { subcommands.Register(&verifyCmd{}, "package management") }
 
+// verifyCmd doesn't implement cli.AllowUnelevated, so verify always needs
+// administrator privileges: it runs the package's verify command, can
+// download the package into the cache and can reinstall it. Even reading the
+// installed files could make a package installer that opens them without
+// sharing fail.
 type verifyCmd struct {
 	reinstall bool
 	skipFiles bool
@@ -51,29 +55,44 @@ func (cmd *verifyCmd) SetFlags(f *flag.FlagSet) {
 }
 
 func (cmd *verifyCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+	if cli.RefuseUnlessPrivileged(ctx) {
+		logger.Error("Verifying packages requires administrator privileges.")
+		return subcommands.ExitFailure
+	}
 	if len(flags.Args()) == 0 {
 		fmt.Printf("%s\nUsage: %s\n", cmd.Synopsis(), cmd.Usage())
 		return subcommands.ExitFailure
 	}
 	exitCode := subcommands.ExitSuccess
 
-	db, err := googetdb.NewDB(settings.DBFile())
+	db, err := cli.OpenDB(ctx)
 	if err != nil {
 		logger.Errorf("Failed to open database: %v", err)
 		return subcommands.ExitFailure
 	}
 	defer db.Close()
-	downloader, err := client.NewDownloader(settings.ProxyServer)
+	downloader, err := cli.NewDownloader(ctx, settings.ProxyServer)
 	if err != nil {
 		logger.Errorf("Failed to initialize downloader: %v", err)
 		return subcommands.ExitFailure
 	}
 
 	for _, arg := range flags.Args() {
+		if goolib.Interrupted() != nil {
+			return subcommands.ExitFailure
+		}
 		pi := goolib.PkgNameSplit(arg)
 		ps, err := db.FetchPkg(pi)
 		if err != nil {
+			logger.Errorf("Unable to look up package %q: %v", arg, err)
+			exitCode = subcommands.ExitFailure
+			continue
+		}
+		// FetchPkg returns a nil error and a zero PackageState when no installed
+		// package has this name.
+		if ps.PackageSpec == nil {
 			logger.Errorf("Package %q not installed, cannot verify.", arg)
+			exitCode = subcommands.ExitFailure
 			continue
 		}
 		pkg := fmt.Sprintf("%s.%s.%s", ps.PackageSpec.Name, ps.PackageSpec.Arch, ps.PackageSpec.Version)
@@ -83,6 +102,9 @@ func (cmd *verifyCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 			logger.Errorf("Error running verify command for %s: %v", pkg, err)
 			exitCode = subcommands.ExitFailure
 			continue
+		}
+		if goolib.Interrupted() != nil {
+			return subcommands.ExitFailure
 		}
 
 		if v && !cmd.skipFiles {
@@ -99,6 +121,8 @@ func (cmd *verifyCmd) Execute(ctx context.Context, flags *flag.FlagSet, _ ...int
 			fmt.Println(msg)
 			if err := install.Reinstall(ctx, ps, false, false, downloader, db); err != nil {
 				logger.Errorf("Error reinstalling %s, %v", pi.Name, err)
+				exitCode = subcommands.ExitFailure
+				continue
 			}
 		} else if !v {
 			logger.Errorf("Verification failed for %s, reinstall or run verify again with the '-reinstall' flag.", pkg)

@@ -19,9 +19,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
+	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/googetdb"
+	"github.com/google/googet/v2/goolib"
 	"github.com/google/googet/v2/progress"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/system"
@@ -46,8 +50,10 @@ import (
 const (
 	// envVar is the environment variable which stores the googet root directory.
 	envVar = "GooGetRoot"
-	// logSize is the max allowed size of the log file.
-	logSize = 10 * 1024 * 1024
+	// logSize is the size at which the log file is rotated.
+	logSize = 25 * 1024 * 1024
+	// logKeep is the number of rotated log files to keep.
+	logKeep = 5
 )
 
 var (
@@ -55,32 +61,98 @@ var (
 	version string
 	// Optional function to handle flag parsing. If unset, we use flag.Parse.
 	flagParse func()
+	// isAdmin returns an error if the process lacks administrator rights. It
+	// is a variable so that tests can replace it.
+	isAdmin = system.IsAdmin
+	// obtainLock takes the googet lock file. It is a variable so that tests
+	// can replace it.
+	obtainLock = system.ObtainLock
+	// The other steps of run() are variables so that tests can record the
+	// order in which run() calls them.
+	prepareRoot    = system.PrepareRoot
+	checkEntries   = system.CheckEntries
+	loadConf       = settings.LoadConf
+	rotateLogFile  = rotateLog
+	createDB       = googetdb.CreateIfMissing
+	mkdirAll       = os.MkdirAll
+	executeCommand = func(ctx context.Context) int { return int(subcommands.DefaultCommander.Execute(ctx)) }
+
+	// rotateRename and rotateRemove are used by rotateLog so tests can
+	// simulate files that can't be moved or deleted, such as files locked
+	// on Windows.
+	rotateRename = os.Rename
+	rotateRemove = os.Remove
 )
 
-func rotateLog(logPath string, ls int64) error {
+// logGeneration returns the name of rotated log generation n of logPath. The
+// newest generation, 1, is logPath.old and older ones are logPath.old.2 and up.
+func logGeneration(logPath string, n int) string {
+	if n <= 1 {
+		return logPath + ".old"
+	}
+	return fmt.Sprintf("%s.old.%d", logPath, n)
+}
+
+// rotateLog moves logPath to logPath.old once it reaches maxSize bytes, and
+// keeps up to keep rotated generations (at least one). Each older generation
+// moves up one place and the oldest is deleted. Rotation is best effort: it
+// skips missing generations and continues past files that can't be moved or
+// deleted, such as files locked on Windows. If an older generation can't be
+// moved, a neighboring generation may be overwritten instead; which one
+// depends on whether the platform can rename over a locked file. It never
+// moves the live log onto a logPath.old that is still in place, so if
+// logPath.old can't be moved the live log isn't rotated and the caller keeps
+// appending to it. rotateLog runs before the logger is set up, so it returns
+// any problems as warnings for the caller to log instead of logging them
+// itself.
+func rotateLog(logPath string, maxSize int64, keep int) []error {
 	fi, err := os.Stat(logPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return []error{fmt.Errorf("unable to check log file size, not rotating: %v", err)}
 	}
-	if fi.Size() < ls {
+	if fi.Size() < maxSize {
 		return nil
 	}
-	oldLog := logPath + ".old"
-	if err := os.Rename(logPath, oldLog); err != nil {
-		return fmt.Errorf("error moving log file: %v", err)
+	if keep < 1 {
+		keep = 1
 	}
-	return nil
+
+	var warnings []error
+	oldest := logGeneration(logPath, keep)
+	if err := rotateRemove(oldest); err != nil && !os.IsNotExist(err) {
+		warnings = append(warnings, fmt.Errorf("unable to delete old log file %q: %v", oldest, err))
+	}
+	for n := keep - 1; n >= 1; n-- {
+		src, dst := logGeneration(logPath, n), logGeneration(logPath, n+1)
+		if err := rotateRename(src, dst); err != nil && !os.IsNotExist(err) {
+			warnings = append(warnings, fmt.Errorf("unable to move old log file %q to %q: %v", src, dst, err))
+		}
+	}
+
+	newest := logGeneration(logPath, 1)
+	if _, err := os.Lstat(newest); !os.IsNotExist(err) {
+		return append(warnings, fmt.Errorf("%q is still in place, not rotating log file %q", newest, logPath))
+	}
+	if err := rotateRename(logPath, newest); err != nil {
+		warnings = append(warnings, fmt.Errorf("unable to move log file %q to %q, appending to it instead: %v", logPath, newest, err))
+	}
+	return warnings
 }
 
 func main() {
-	os.Exit(run(context.Background()))
+	code := run(context.Background())
+	// goolib.Run catches a terminal signal while an installer runs, so that the
+	// cleanup in run (database, lock) still happens. Die from it now, as
+	// googet would have without the installer.
+	goolib.Reraise(goolib.Interrupted())
+	os.Exit(code)
 }
 
 func run(ctx context.Context) int {
-	rootDir := flag.String("root", os.Getenv(envVar), "googet root directory")
+	rootDir := flag.String("root", os.Getenv(envVar), "googet root directory; on Windows, it must be on a volume that supports file permissions, and no part of its path may be a junction or symbolic link")
 	noConfirm := flag.Bool("noconfirm", false, "skip confirmation")
 	verbose := flag.Bool("verbose", false, "print info level logs to stdout")
 	systemLog := flag.Bool("system_log", true, "log to Linux Syslog or Windows Event Log")
@@ -113,35 +185,132 @@ func run(ctx context.Context) int {
 		return int(cmdr.Execute(ctx))
 	}
 
+	// Decide how to run before anything is touched. Usage-only runs never
+	// reach a command's Execute, so they need no root, admin check, lock or
+	// log; Execute prints the usage or the parse error.
+	class, cmd, argsErr := cli.Classify(cmdr, flag.Args())
+	if class == cli.UsageOnly {
+		if argsErr != nil {
+			fmt.Fprintf(cmdr.Error, "%s: %v\n", cmdName, argsErr)
+			cmdr.ExplainCommand(cmdr.Error, cmd)
+			return int(subcommands.ExitUsageError)
+		}
+		return int(cmdr.Execute(ctx))
+	}
+
 	if *rootDir == "" {
 		logger.Errorf("The environment variable %q is not defined and no '-root' flag passed", envVar)
 		return 1
 	}
-	if err := os.MkdirAll(*rootDir, 0774); err != nil {
-		logger.Errorf("Unable to create root directory: %v", err)
-		return 1
-	}
-	settings.Initialize(*rootDir, !*noConfirm)
+	settings.SetRoot(*rootDir, !*noConfirm)
 
-	// "googet listrepos" may execute without a lock after the root directory and
-	// settings are initialized.
-	if cmdName == "listrepos" {
-		return (int(cmdr.Execute(context.Background())))
+	initProgress := func() {
+		progressSet := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "progress" {
+				progressSet = true
+			}
+		})
+		progress.Init(wantProgress(settings.Progress, progressSet, *progressFlag, *verbose))
 	}
 
+	// Unelevated runs must not create anything under the root, so they run
+	// only if the root and the database already exist. Otherwise they take
+	// the privileged path below, which creates them after the admin check.
+	// A LockFree command runs unelevated even in an elevated process. Any
+	// other command runs unelevated only if the admin check fails, so an
+	// elevated run keeps the lock, the log and the cache refresh.
+	rootExists := isDir(*rootDir)
 	dbFile := settings.DBFile()
-
-	// "googet installed" is allowed to execute without a lock if the googet
-	// database has already been created.
-	if googetdb.Exists(dbFile) && cmdName == "installed" {
-		return int(cmdr.Execute(ctx))
+	canUnelevated := class == cli.UnelevatedRun && rootExists && googetdb.Exists(dbFile)
+	_, lockFree := cmd.(cli.LockFree)
+	runUnelevated := func() int {
+		// An unelevated run reads googet.conf first, as before, and never
+		// prepares or checks the root, takes the lock or writes anything. The
+		// privileged path reads googet.conf only after it has checked the
+		// files in the root.
+		if err := loadConf(); err != nil {
+			logger.Errorf("Unable to initialize settings: %v", err)
+			return 1
+		}
+		// No lock, no googet.log and no system log, which on Windows would
+		// register an event source under HKLM. Errors go to stderr; with
+		// -verbose, info logs go to stdout. The context isn't marked
+		// privileged, so the command refuses anything its AllowUnelevated
+		// doesn't allow.
+		logger.Init("GooGet", *verbose, false, io.Discard)
+		defer logger.Close()
+		initProgress()
+		return executeCommand(ctx)
 	}
-
-	if err := system.IsAdmin(); err != nil {
+	if canUnelevated && lockFree {
+		return runUnelevated()
+	}
+	adminErr := isAdmin()
+	if canUnelevated && adminErr != nil {
+		return runUnelevated()
+	}
+	if err := adminErr; err != nil {
+		if !rootExists {
+			err = fmt.Errorf("%v; googet root %q doesn't exist, run googet elevated first", err, *rootDir)
+		}
 		logger.Errorf("Failed admin check: %v", err)
 		return 1
 	}
-	cleanup, err := system.ObtainLock(settings.LockFile(), settings.LockFileMaxAge)
+	var rootReport system.RootReport
+	var lockReport, entryReport system.EntryReport
+	reportsLogged := false
+	logReports := func() {
+		if reportsLogged {
+			return
+		}
+		reportsLogged = true
+		if rootReport.Changed() {
+			logger.Warningf("Reset the permissions of the googet root %q: %s", *rootDir, rootReport.Summary())
+		}
+		for _, w := range rootReport.Warnings {
+			logger.Warning(w)
+		}
+		checked := lockReport.Merge(entryReport)
+		if checked.Changed() {
+			logger.Warningf("Removed or renamed entries in the googet root %q that failed permission, link or ownership checks: %s", *rootDir, checked.Summary())
+		}
+		for _, f := range checked.Failures {
+			logger.Error(f)
+		}
+	}
+	// Flush partial repair and entry reports on any early-return error path
+	// before logger.Init runs.
+	defer logReports()
+
+	// The root is created only after the admin check, so an unelevated run
+	// never creates it. It is created, or on Windows checked and repaired,
+	// before loadConf so that googet.conf isn't read from an unchecked or
+	// restricted-ACL root, and before the lock so that it gets its own mode
+	// or ACL rather than the ones obtainLock gives the lock file's directory.
+	var err error
+	rootReport, err = prepareRoot(*rootDir, rootSubdirs())
+	if err != nil {
+		logger.Errorf("Unable to prepare the googet root: %v", err)
+		return 1
+	}
+
+	// The lock file, the logs and googet.conf are checked before the lock is
+	// taken, because obtainLock reads the lock file, and lockfilemaxage from
+	// googet.conf. If googet.conf isn't trusted, it has been renamed, so the
+	// defaults apply, and the run fails once the failure is logged.
+	lockReport, err = checkEntries(*rootDir, lockEntryRules(), rootReport)
+	if err != nil {
+		logger.Errorf("Unable to check the files in the googet root: %v", err)
+		return 1
+	}
+	if !lockReport.Failed() {
+		if err := loadConf(); err != nil {
+			logger.Errorf("Unable to initialize settings: %v", err)
+			return 1
+		}
+	}
+	cleanup, err := obtainLock(settings.LockFile(), settings.LockFileMaxAge)
 	if err != nil {
 		logger.Errorf("Failed to obtain lock: %v", err)
 		return 1
@@ -149,12 +318,15 @@ func run(ctx context.Context) int {
 	if cleanup != nil {
 		defer cleanup()
 	}
-
-	logFile := settings.LogFile()
-	if err := rotateLog(logFile, logSize); err != nil {
-		logger.Errorf("Failed to rotate log file %q: %v", logFile, err)
+	ctx = cli.WithPrivileged(ctx)
+	entryReport, err = checkEntries(*rootDir, entryRules(), rootReport)
+	if err != nil {
+		logger.Errorf("Unable to check the files in the googet root: %v", err)
 		return 1
 	}
+
+	logFile := settings.LogFile()
+	rotateWarnings := rotateLogFile(logFile, logSize, logKeep)
 	lf, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
 		logger.Errorf("failed to open log file %q: %v", logFile, err)
@@ -163,28 +335,80 @@ func run(ctx context.Context) int {
 	defer lf.Close()
 	logger.Init("GooGet", *verbose, *systemLog, lf)
 	defer logger.Close()
+	// Log reports explicitly while lf and logger are still open; the earlier
+	// defer would run after LIFO defer logger.Close() and miss googet.log.
+	logReports()
+	for _, w := range rotateWarnings {
+		logger.Warningf("Log rotation: %v", w)
+	}
+	if lockReport.Failed() || entryReport.Failed() {
+		return 1
+	}
 
-	progressSet := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "progress" {
-			progressSet = true
-		}
-	})
-	progress.Init(wantProgress(settings.Progress, progressSet, *progressFlag, *verbose))
+	initProgress()
 
-	if err := googetdb.CreateIfMissing(dbFile); err != nil {
+	if err := createDB(dbFile); err != nil {
 		logger.Errorf("Unable to create initial db file; if db is not created, run again as admin: %v", err)
 		return 1
 	}
-	if err := os.MkdirAll(settings.CacheDir(), 0774); err != nil {
+	if err := mkdirAll(settings.CacheDir(), 0774); err != nil {
 		logger.Errorf("Unable to create cache directory: %v", err)
 		return 1
 	}
-	if err := os.MkdirAll(settings.RepoDir(), 0774); err != nil {
+	if err := mkdirAll(settings.RepoDir(), 0774); err != nil {
 		logger.Errorf("Unable to create repo directory: %v", err)
 		return 1
 	}
-	return int(cmdr.Execute(ctx))
+	return executeCommand(ctx)
+}
+
+// rootSubdirs returns the names of the directories in the root that
+// system.PrepareRoot checks.
+func rootSubdirs() []string {
+	return []string{"repos", "cache"}
+}
+
+// lockEntryRules are the rules for the files in the googet root that run()
+// checks before it takes the lock.
+func lockEntryRules() []system.EntryRule {
+	log := filepath.Base(settings.LogFile())
+	return []system.EntryRule{
+		{Pattern: filepath.Base(settings.LockFile()), Action: system.EntryRemove},
+		{Pattern: log, Action: system.EntryRemove},
+		// rotateLog renames the log to googet.log.old and keeps older
+		// generations as googet.log.old.2 through googet.log.old.<logKeep>.
+		{Pattern: log + ".old*", Action: system.EntryRemove},
+		{Pattern: filepath.Base(settings.ConfFile()), Action: system.EntryQuarantine},
+	}
+}
+
+// entryRules are the rules for the other files in the googet root, which
+// run() checks once it holds the lock.
+func entryRules() []system.EntryRule {
+	db := filepath.Base(settings.DBFile())
+	state := filepath.Base(settings.StateFile())
+	repos := filepath.Base(settings.RepoDir())
+	var rules []system.EntryRule
+	// SQLite replays its journal files, and googetdb.CreateIfMissing imports
+	// googet.state (or falls back to googet.state.bak) into a new database,
+	// so an administrator decides what to do with them.
+	for _, name := range []string{db, db + "-journal", db + "-wal", db + "-shm", state, state + ".bak"} {
+		rules = append(rules, system.EntryRule{Pattern: name, Action: system.EntryFail})
+	}
+	return append(rules,
+		system.EntryRule{Dir: repos, Pattern: "*.repo", Action: system.EntryQuarantine},
+		// googet only reads the *.repo files in repos.
+		system.EntryRule{Dir: repos, Pattern: "*", Action: system.EntryRemoveLink},
+		// googet downloads cached files again.
+		system.EntryRule{Dir: filepath.Base(settings.CacheDir()), Pattern: "*", Action: system.EntryRemove},
+	)
+}
+
+// isDir reports whether path exists and is a directory. Any error, including
+// a permission error, counts as not existing.
+func isDir(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.IsDir()
 }
 
 // wantProgress reports whether progress output should be rendered, given the

@@ -1,27 +1,38 @@
 package install
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"maps"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/google/googet/v2/cli"
 	"github.com/google/googet/v2/client"
 	"github.com/google/googet/v2/googetdb"
 	"github.com/google/googet/v2/goolib"
+	"github.com/google/googet/v2/install"
 	"github.com/google/googet/v2/priority"
+	"github.com/google/googet/v2/remove"
 	"github.com/google/googet/v2/settings"
 	"github.com/google/googet/v2/testutil"
 	"github.com/google/logger"
+	"github.com/google/subcommands"
 )
 
 // checkInstalled returns true if the test package identified by ps was
@@ -143,10 +154,42 @@ func TestInstall(t *testing.T) {
 			wantInstalled: []string{"B.noarch.2"},
 			wantState:     []string{"B.noarch.2"},
 		},
+		{
+			desc: "install-dep-satisfied-by-provider",
+			args: []string{"A"},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1", PkgDependencies: map[string]string{"virt": "0.0.0"}},
+				{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}},
+			},
+			wantInstalled: []string{"A.noarch.1", "B.noarch.2"},
+			wantState:     []string{"A.noarch.1", "B.noarch.2"},
+		},
+		{
+			desc: "install-by-provided-name",
+			args: []string{"virt"},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}},
+			},
+			wantInstalled: []string{"B.noarch.2"},
+			wantState:     []string{"B.noarch.2"},
+		},
+		{
+			desc: "no-reinstall-by-provided-name-when-provider-installed",
+			args: []string{"virt"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2", Provides: []string{"virt"}},
+			},
+			wantState: []string{"B.noarch.2"},
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			// Set up the installer.
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -262,7 +305,7 @@ func TestInstallDryRun(t *testing.T) {
 				"A.noarch.1.0.0",
 				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
 			},
-			notStrs: []string{"Installing "},
+			notStrs: []string{"Installing ", "Note: selecting"},
 		},
 		{
 			desc: "package already installed",
@@ -290,9 +333,67 @@ func TestInstallDryRun(t *testing.T) {
 				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
 			},
 		},
+		{
+			desc: "dependency satisfied by provider",
+			args: []string{"A"},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1.0.0", PkgDependencies: map[string]string{"virt": "0.0.0"}},
+				{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}},
+			},
+			wantStrs: []string{
+				"The following packages will be installed:",
+				"A.noarch.1.0.0",
+				"B.noarch.2.0.0",
+				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
+			},
+		},
+		{
+			desc: "dependency satisfied by versioned provides",
+			args: []string{"A"},
+			packages: []goolib.PkgSpec{
+				{Name: "A", Arch: "noarch", Version: "1.0.0", PkgDependencies: map[string]string{"virt": "3.0.0"}},
+				{Name: "B", Arch: "noarch", Version: "1.0.0", Provides: []string{"virt=5.0.0"}},
+			},
+			wantStrs: []string{
+				"The following packages will be installed:",
+				"A.noarch.1.0.0",
+				"B.noarch.1.0.0",
+				"Dry run: Would install A.noarch.1.0.0 and its dependencies if not already installed.",
+			},
+		},
+		{
+			desc: "provided name",
+			args: []string{"virt"},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}},
+			},
+			wantStrs: []string{
+				"Note: selecting B.noarch.2.0.0, which provides virt",
+				"The following packages will be installed:",
+				"B.noarch.2.0.0",
+				"Dry run: Would install B.noarch.2.0.0 and its dependencies if not already installed.",
+			},
+		},
+		{
+			desc: "provided name, provider already installed",
+			args: []string{"virt"},
+			state: client.GooGetState{
+				{PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}}},
+			},
+			packages: []goolib.PkgSpec{
+				{Name: "B", Arch: "noarch", Version: "2.0.0", Provides: []string{"virt"}},
+			},
+			wantStrs: []string{
+				"Note: selecting B.noarch.2.0.0, which provides virt",
+				"B.noarch.2.0.0 or a newer version is already installed",
+			},
+			notStrs: []string{"The following packages will be installed:"},
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
-			settings.Initialize(t.TempDir(), false)
+			if err := settings.Initialize(t.TempDir(), false); err != nil {
+				t.Fatalf("settings.Initialize: %v", err)
+			}
 			db, err := googetdb.NewDB(settings.DBFile())
 			if err != nil {
 				t.Fatalf("googetdb.NewDB: %v", err)
@@ -356,5 +457,396 @@ func TestInstallDryRun(t *testing.T) {
 				t.Errorf("DB state changed unexpectedly in dry_run (-got +want):\n%s", diff)
 			}
 		})
+	}
+}
+
+// newReinstallDB returns a database holding an installed package A and the
+// bytes of its file after setup.
+func newReinstallDB(t *testing.T) (*googetdb.GooDB, string, []byte) {
+	t.Helper()
+	dbFile := filepath.Join(t.TempDir(), "googet.db")
+	db, err := googetdb.NewDB(dbFile)
+	if err != nil {
+		t.Fatalf("googetdb.NewDB: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	state := client.GooGetState{
+		{PackageSpec: &goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1.0.0"}, InstallDate: 1700000000},
+	}
+	if err := db.WriteStateToDB(state); err != nil {
+		t.Fatalf("WriteStateToDB: %v", err)
+	}
+	before, err := os.ReadFile(dbFile)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dbFile, err)
+	}
+	return db, dbFile, before
+}
+
+// withStdin runs f with os.Stdin reading input.
+func withStdin(t *testing.T, input string, f func()) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	if _, err := io.WriteString(w, input); err != nil {
+		t.Fatalf("writing stdin: %v", err)
+	}
+	w.Close()
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+	f()
+}
+
+// TestInstallReinstallNoOpKeepsDB checks that an install -reinstall that
+// doesn't reinstall, because it is declined or a dry run, leaves the database
+// file unchanged.
+func TestInstallReinstallNoOpKeepsDB(t *testing.T) {
+	for _, tc := range []struct {
+		desc    string
+		confirm bool
+		dryRun  bool
+		stdin   string
+		want    string
+	}{
+		{desc: "declined", confirm: true, stdin: "n\n", want: "Not reinstalling A"},
+		{desc: "dry run", dryRun: true, want: "Dry run: Would reinstall A"},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			db, dbFile, before := newReinstallDB(t)
+			i := &installer{
+				db:              db,
+				cache:           t.TempDir(),
+				shouldReinstall: true,
+				confirm:         tc.confirm,
+				dryRun:          tc.dryRun,
+			}
+			var runErr error
+			var output string
+			withStdin(t, tc.stdin, func() {
+				output = captureStdout(func() {
+					runErr = i.installFromRepo(context.Background(), "A", []string{"noarch"})
+				})
+			})
+			if runErr != nil {
+				t.Fatalf("installFromRepo(A) = %v, want nil", runErr)
+			}
+			if !strings.Contains(output, tc.want) {
+				t.Errorf("stdout = %q, want it to contain %q", output, tc.want)
+			}
+
+			// Comparing the file catches any write, including one that
+			// rewrites a row with identical content.
+			after, err := os.ReadFile(dbFile)
+			if err != nil {
+				t.Fatalf("reading %s: %v", dbFile, err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Error("the database file changed")
+			}
+		})
+	}
+}
+
+func writeTestGoo(t *testing.T, dir string, ps goolib.PkgSpec, files map[string][]byte, modes map[string]int64) string {
+	t.Helper()
+	specJSON, err := json.Marshal(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gooPath := filepath.Join(dir, ps.String()+".goo")
+	f, err := os.Create(gooPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	tw := tar.NewWriter(gw)
+	for name, body := range files {
+		mode := modes[name]
+		if mode == 0 {
+			mode = 0644
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: mode, Size: int64(len(body))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: ps.Name + ".pkgspec", Mode: 0644, Size: int64(len(specJSON))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(specJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return gooPath
+}
+
+func TestInstallStopsOnInterrupt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux shell script and Unix signal forwarding")
+	}
+	const envKey = "GOOGET_CLI_INSTALL_INTERRUPT"
+	if os.Getenv(envKey) == "" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestInstallStopsOnInterrupt$")
+		cmd.Env = append(os.Environ(), envKey+"=1", "GORACE=atexit_sleep_ms=0")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("subprocess failed: %v\n%s", err, out)
+		}
+		return
+	}
+
+	var logBuf bytes.Buffer
+	logger.Init("GooGet", false, false, &logBuf)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
+	if err := os.MkdirAll(settings.CacheDir(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	gooDir, dstDir := t.TempDir(), t.TempDir()
+	aGoo := writeTestGoo(t, gooDir,
+		goolib.PkgSpec{Name: "A", Arch: "noarch", Version: "1.0.0", Install: goolib.ExecFile{Path: "install.sh"}},
+		map[string][]byte{"install.sh": []byte("#!/bin/sh\nkill -TERM $PPID\nsleep 10\n")},
+		map[string]int64{"install.sh": 0755},
+	)
+	bTarget := filepath.Join(dstDir, "bfile")
+	bGoo := writeTestGoo(t, gooDir,
+		goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1.0.0", Files: map[string]string{"bfile": bTarget}},
+		map[string][]byte{"bfile": []byte("payload")},
+		nil,
+	)
+
+	cmd := installCmd{}
+	fs := flag.NewFlagSet("install", flag.ContinueOnError)
+	cmd.SetFlags(fs)
+	if err := fs.Parse([]string{aGoo, bGoo}); err != nil {
+		t.Fatal(err)
+	}
+	if got := cmd.Execute(cli.WithPrivileged(t.Context()), fs); got != subcommands.ExitFailure {
+		t.Errorf("Execute() = %v, want %v", got, subcommands.ExitFailure)
+	}
+	if strings.Contains(logBuf.String(), "B.noarch.1.0.0.goo") {
+		t.Errorf("Execute() attempted second package after interrupt:\n%s", logBuf.String())
+	}
+	if _, err := os.Stat(filepath.Join(settings.CacheDir(), "B.noarch.1.0.0.goo")); !os.IsNotExist(err) {
+		t.Errorf("second package cached after interrupt (stat err = %v)", err)
+	}
+	if _, err := os.Stat(bTarget); !os.IsNotExist(err) {
+		t.Errorf("second package file %q created after interrupt (stat err = %v)", bTarget, err)
+	}
+
+	db, err := googetdb.NewDB(settings.DBFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if state, err := db.FetchPkgs(""); err != nil || len(state) != 0 {
+		t.Errorf("FetchPkgs() = %v, %v, want empty state", state, err)
+	}
+
+	// Direct package-level calls must also fail fast without copying files,
+	// downloading, or removing installed packages once goolib.Interrupted() is set.
+	t.Run("FromDisk", func(t *testing.T) {
+		diskCache := t.TempDir()
+		if err := install.FromDisk(bGoo, diskCache, false, false, false, db); !errors.Is(err, goolib.ErrInterrupted) {
+			t.Errorf("FromDisk() after interrupt = %v, want %v", err, goolib.ErrInterrupted)
+		}
+		if entries, err := os.ReadDir(diskCache); err != nil || len(entries) != 0 {
+			t.Errorf("FromDisk() populated cache after interrupt: entries = %v, err = %v", entries, err)
+		}
+		if _, err := os.Stat(bTarget); !os.IsNotExist(err) {
+			t.Errorf("FromDisk() copied %q after interrupt (stat err = %v)", bTarget, err)
+		}
+	})
+	t.Run("FromRepo", func(t *testing.T) {
+		rm := client.RepoMap{
+			"http://127.0.0.1:0": client.Repo{
+				Packages: []goolib.RepoSpec{{
+					PackageSpec: &goolib.PkgSpec{Name: "C", Arch: "noarch", Version: "1.0.0"},
+				}},
+			},
+		}
+		if err := install.FromRepo(t.Context(), goolib.PackageInfo{Name: "C", Arch: "noarch", Ver: "1.0.0"}, "http://127.0.0.1:0", t.TempDir(), rm, []string{"noarch"}, false, false, nil, db); !errors.Is(err, goolib.ErrInterrupted) {
+			t.Errorf("FromRepo() after interrupt = %v, want %v", err, goolib.ErrInterrupted)
+		}
+	})
+	t.Run("Reinstall", func(t *testing.T) {
+		reinstallState := client.PackageState{
+			LocalPath:   filepath.Join(gooDir, "missing.goo"),
+			DownloadURL: "http://127.0.0.1:0/B.goo",
+			PackageSpec: &goolib.PkgSpec{Name: "B", Arch: "noarch", Version: "1.0.0"},
+		}
+		if err := install.Reinstall(t.Context(), reinstallState, true, false, nil, db); !errors.Is(err, goolib.ErrInterrupted) {
+			t.Errorf("Reinstall() after interrupt = %v, want %v", err, goolib.ErrInterrupted)
+		}
+	})
+	t.Run("RemoveAll", func(t *testing.T) {
+		pFile := filepath.Join(dstDir, "pfile")
+		if err := os.WriteFile(pFile, []byte("keep"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.AddPkg(client.PackageState{
+			PackageSpec:    &goolib.PkgSpec{Name: "P", Arch: "noarch", Version: "1.0.0"},
+			InstalledFiles: map[string]string{pFile: "sum"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := remove.All(t.Context(), goolib.PackageInfo{Name: "P", Arch: "noarch"}, remove.DepMap{"P.noarch": nil}, remove.RunUninstaller, nil, db); !errors.Is(err, goolib.ErrInterrupted) {
+			t.Errorf("remove.All() after interrupt = %v, want %v", err, goolib.ErrInterrupted)
+		}
+		if _, err := os.Stat(pFile); err != nil {
+			t.Errorf("remove.All() removed %q after interrupt: %v", pFile, err)
+		}
+	})
+}
+
+func TestFromRepoStopsAfterWaitDelayInterrupt(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux shell script and Unix signal forwarding")
+	}
+	const envKey = "GOOGET_FROMREPO_WAITDELAY_MODE"
+	if mode := os.Getenv(envKey); mode != "" {
+		logger.Init("GooGet", false, false, io.Discard)
+		if err := settings.Initialize(t.TempDir(), false); err != nil {
+			t.Fatalf("settings.Initialize: %v", err)
+		}
+		db, err := googetdb.NewDB(settings.DBFile())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.Close() })
+		downloader, err := client.NewDownloader("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gooDir, cache := t.TempDir(), t.TempDir()
+		srv := testutil.ServeGoo(t, gooDir)
+		defer srv.Close()
+
+		drainSig := []byte("#!/bin/sh\n(while kill -0 $$ 2>/dev/null; do sleep 0.01; done; kill -TERM $PPID; sleep 0.5) &\nexit 0\n")
+		parentSpec := goolib.PkgSpec{Name: "Parent", Arch: "noarch", Version: "1.0.0"}
+		var specs []goolib.RepoSpec
+
+		switch mode {
+		case "after-dep":
+			depSpec := goolib.PkgSpec{Name: "Dep", Arch: "noarch", Version: "1.0.0", Install: goolib.ExecFile{Path: "install.sh"}}
+			depGoo := writeTestGoo(t, gooDir, depSpec, map[string][]byte{"install.sh": drainSig}, map[string]int64{"install.sh": 0755})
+			f, err := os.Open(depGoo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			depSum := goolib.Checksum(f)
+			f.Close()
+			parentSpec.PkgDependencies = map[string]string{"Dep": "1.0.0"}
+			specs = append(specs, goolib.RepoSpec{
+				PackageSpec: &depSpec,
+				Source:      filepath.Base(depGoo),
+				Checksum:    depSum,
+			})
+			t.Cleanup(func() {
+				if st, err := db.FetchPkg(goolib.PackageInfo{Name: "Dep", Arch: "noarch"}); err != nil || st.PackageSpec == nil {
+					t.Errorf("Dep was not recorded before post-exit interrupt: state=%v, err=%v", st, err)
+				}
+			})
+		case "during-replacements":
+			rep1Spec := goolib.PkgSpec{Name: "Rep1", Arch: "noarch", Version: "1.0.0", Uninstall: goolib.ExecFile{Path: "uninstall.sh"}}
+			rep1Goo := writeTestGoo(t, cache, rep1Spec, map[string][]byte{"uninstall.sh": drainSig}, map[string]int64{"uninstall.sh": 0755})
+			rep2File := filepath.Join(t.TempDir(), "rep2file")
+			if err := os.WriteFile(rep2File, []byte("keep"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			for _, st := range []client.PackageState{
+				{LocalPath: rep1Goo, PackageSpec: &rep1Spec},
+				{PackageSpec: &goolib.PkgSpec{Name: "Rep2", Arch: "noarch", Version: "1.0.0"}, InstalledFiles: map[string]string{rep2File: "sum"}},
+			} {
+				if err := db.AddPkg(st); err != nil {
+					t.Fatal(err)
+				}
+			}
+			parentSpec.Replaces = []string{"Rep1", "Rep2"}
+			t.Cleanup(func() {
+				if st, err := db.FetchPkg(goolib.PackageInfo{Name: "Rep1", Arch: "noarch"}); err != nil || st.PackageSpec != nil {
+					t.Errorf("Rep1 was not removed before post-exit interrupt: state=%v, err=%v", st, err)
+				}
+				if _, err := os.Stat(rep2File); err != nil {
+					t.Errorf("Rep2 file %q removed after interrupt: %v", rep2File, err)
+				}
+			})
+		}
+
+		parentGoo := writeTestGoo(t, gooDir, parentSpec, nil, nil)
+		f, err := os.Open(parentGoo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parentSum := goolib.Checksum(f)
+		f.Close()
+		specs = append(specs, goolib.RepoSpec{
+			PackageSpec: &parentSpec,
+			Source:      filepath.Base(parentGoo),
+			Checksum:    parentSum,
+		})
+		rm := client.RepoMap{srv.URL + "/repo": client.Repo{Packages: specs}}
+
+		err = install.FromRepo(t.Context(), goolib.PackageInfo{Name: "Parent", Arch: "noarch", Ver: "1.0.0"}, srv.URL+"/repo", cache, rm, []string{"noarch"}, false, false, downloader, db)
+		if !errors.Is(err, goolib.ErrInterrupted) {
+			t.Errorf("FromRepo(Parent) = %v, want %v", err, goolib.ErrInterrupted)
+		}
+		if _, serr := os.Stat(filepath.Join(cache, filepath.Base(parentGoo))); !os.IsNotExist(serr) {
+			t.Errorf("Parent package downloaded to cache after interrupt (stat err = %v)", serr)
+		}
+		return
+	}
+
+	for _, mode := range []string{"after-dep", "during-replacements"} {
+		t.Run(mode, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestFromRepoStopsAfterWaitDelayInterrupt$")
+			cmd.Env = append(os.Environ(), envKey+"="+mode, "GORACE=atexit_sleep_ms=0")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("subprocess (%s) failed: %v\n%s", mode, err, out)
+			}
+		})
+	}
+}
+
+func TestReinstallWrapsTimeout(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("uses Linux shell script")
+	}
+	logger.Init("GooGet", false, false, io.Discard)
+	if err := settings.Initialize(t.TempDir(), false); err != nil {
+		t.Fatalf("settings.Initialize: %v", err)
+	}
+	orig := goolib.Timeout
+	t.Cleanup(func() { goolib.Timeout = orig })
+	goolib.Timeout = 100 * time.Millisecond
+
+	db, err := googetdb.NewDB(settings.DBFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	ps := goolib.PkgSpec{Name: "H", Arch: "noarch", Version: "1.0.0", Install: goolib.ExecFile{Path: "install.sh"}}
+	goo := writeTestGoo(t, t.TempDir(), ps,
+		map[string][]byte{"install.sh": []byte("#!/bin/sh\nsleep 10\n")},
+		map[string]int64{"install.sh": 0755},
+	)
+	err = install.Reinstall(t.Context(), client.PackageState{LocalPath: goo, PackageSpec: &ps}, false, false, nil, db)
+	if !errors.Is(err, goolib.ErrTimeout) {
+		t.Fatalf("Reinstall() error = %v, want it to wrap %v", err, goolib.ErrTimeout)
 	}
 }

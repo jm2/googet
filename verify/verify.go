@@ -16,8 +16,8 @@ package verify
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -37,10 +37,15 @@ const (
 )
 
 func extractVerify(r io.Reader, verify, dir string) error {
-	zr, err := gzip.NewReader(r)
+	path, err := goolib.JoinWithin(dir, verify)
+	if err != nil {
+		return fmt.Errorf("invalid verify command: %v", err)
+	}
+	zr, err := goolib.NewPackageReader(r)
 	if err != nil {
 		return err
 	}
+	defer zr.Close()
 	tr := tar.NewReader(zr)
 	for {
 		header, err := tr.Next()
@@ -54,10 +59,10 @@ func extractVerify(r io.Reader, verify, dir string) error {
 			continue
 		}
 
-		if err := oswrap.MkdirAll(dir, 0755); err != nil {
+		if err := oswrap.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
-		f, err := oswrap.OpenFile(filepath.Join(dir, verify), os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(header.Mode))
+		f, err := oswrap.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(header.Mode))
 		if err != nil {
 			return err
 		}
@@ -79,7 +84,7 @@ func Files(ps client.PackageState) (bool, error) {
 	logger.Infof("Running file verification for %s", pkg)
 	fmt.Printf("Running file verification for %s...\n", pkg)
 	for file, wantChksm := range ps.InstalledFiles {
-		f, err := os.Open(file)
+		fstat, err := os.Stat(file)
 		if os.IsNotExist(err) {
 			logger.Errorf("%q: verify file %q failed, file does not exist", pkg, file)
 			return false, nil
@@ -87,13 +92,14 @@ func Files(ps client.PackageState) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		fstat, err := os.Stat(file)
-		if err != nil {
-			return false, err
-		}
-		// Only calculate/ check the checksum for file, not folder.
+		// Only calculate/ check the checksum for file, not folder. Directories
+		// are never opened, so no handle to them can leak.
 		if fstat.IsDir() {
 			continue
+		}
+		f, err := os.Open(file)
+		if err != nil {
+			return false, err
 		}
 		chksm := goolib.Checksum(f)
 		f.Close()
@@ -112,12 +118,20 @@ func Command(ctx context.Context, ps client.PackageState, downloader *client.Dow
 	if ps.PackageSpec.Verify.Path == "" {
 		return true, nil
 	}
+	if goolib.Interrupted() != nil {
+		return false, goolib.ErrInterrupted
+	}
 	pkg := fmt.Sprintf("%s.%s.%s", ps.PackageSpec.Name, ps.PackageSpec.Arch, ps.PackageSpec.Version)
 	logger.Infof("Running verification command for %s", pkg)
 	fmt.Printf("Running verification command for %s...\n", pkg)
 	f, err := os.Open(ps.LocalPath)
 	if err != nil && !os.IsNotExist(err) {
 		return false, err
+	}
+	if err == nil {
+		// f is also closed explicitly before re-extraction so Windows does not
+		// keep the package locked; this covers the early returns.
+		defer f.Close()
 	}
 	var rd bool
 	if os.IsNotExist(err) {
@@ -129,6 +143,12 @@ func Command(ctx context.Context, ps client.PackageState, downloader *client.Dow
 	if !rd && ps.Checksum != "" && goolib.Checksum(f) != ps.Checksum {
 		logger.Info("Local package checksum does not match, pulling from repo...")
 		rd = true
+	}
+	// goolib.Checksum may already have read f; extraction needs it at offset 0.
+	if !rd {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return false, err
+		}
 	}
 
 	dir := strings.TrimSuffix(ps.LocalPath, filepath.Ext(ps.LocalPath))
@@ -153,26 +173,40 @@ func Command(ctx context.Context, ps client.PackageState, downloader *client.Dow
 	}
 	f.Close()
 
-	// Try just running the extracted command, re-extract the full package on any error.
-	if err := system.Verify(dir, ps.PackageSpec); err == nil {
-		return true, nil
-	}
-
-	if rd {
-		if err := download.Package(ctx, ps.DownloadURL, ps.LocalPath, ps.Checksum, downloader); err != nil {
-			return false, fmt.Errorf("error redownloading package: %v", err)
+	// Try running just the extracted verify command, and run it again from the
+	// full package if that is worth it.
+	err = system.Verify(dir, ps.PackageSpec)
+	if retryFromFullPackage(err) {
+		if goolib.Interrupted() != nil {
+			return false, goolib.ErrInterrupted
 		}
+		if rd {
+			if err := download.Package(ctx, ps.DownloadURL, ps.LocalPath, ps.Checksum, downloader); err != nil {
+				return false, fmt.Errorf("error redownloading package: %v", err)
+			}
+		}
+		dir, err = download.ExtractPkg(ps.LocalPath)
+		if err != nil {
+			return false, err
+		}
+		err = system.Verify(dir, ps.PackageSpec)
 	}
-
-	dir, err = download.ExtractPkg(ps.LocalPath)
-	if err != nil {
+	if errors.Is(err, goolib.ErrInterrupted) {
 		return false, err
 	}
-
-	// Any error is deemed a verification failure.
-	if err := system.Verify(dir, ps.PackageSpec); err != nil {
+	// Any other error is deemed a verification failure.
+	if err != nil {
 		logger.Errorf("%q: verify command failed: %v", pkg, err)
 		return false, nil
 	}
 	return true, nil
+}
+
+// retryFromFullPackage reports whether a verify command that failed with err
+// when run alone should run again from the full package, for example because
+// it needs other files from it. A command that timed out, went inactive or
+// blocked on a dialog would likely hang again, and one that was interrupted
+// must not run again since googet is stopping.
+func retryFromFullPackage(err error) bool {
+	return err != nil && !errors.Is(err, goolib.ErrInterrupted) && !errors.Is(err, goolib.ErrTimeout) && !errors.Is(err, goolib.ErrInactive) && !errors.Is(err, goolib.ErrDialog)
 }
